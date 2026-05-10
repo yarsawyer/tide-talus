@@ -14,7 +14,6 @@ serde-wire = []
 test-dealer = []
 bench = []
 fips204-adapter = ["talus-core/fips204-adapter"]
-tidecoin-local = ["talus-core/tidecoin-local"]
 
 [dependencies]
 talus-core = { path = "../talus-core", default-features = false }

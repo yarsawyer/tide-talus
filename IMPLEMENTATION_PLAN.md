@@ -201,9 +201,9 @@ Pinned product instantiation:
 ## Review Notes From `talus.md`
 
 - The document is implementation-oriented and has a sensible order: `fips204` reuse/adapters first, TALUS arithmetic second, MPC backend third, then local protocol, signing, malicious tests, and productionization.
-- Do not rewrite standard ML-DSA from scratch. Use `fips204` and Tidecoin's existing wrappers for standard keygen/sign/verify/encoding behavior, and expose/fork/vendor only the narrow internals TALUS needs.
+- Do not rewrite standard ML-DSA from scratch. Use `fips204` for standard keygen/sign/verify/encoding behavior, and expose/fork/vendor only the narrow internals TALUS needs.
 - The initial implementation should avoid networking and full DKG. Start with deterministic, in-process protocols and test transports.
-- The final signature verification gate is non-negotiable: no API may return a signature unless the standard `fips204`/Tidecoin verifier path accepts it outside the TALUS assembly code.
+- The final signature verification gate is non-negotiable: no API may return a signature unless the standard `fips204` verifier path accepts it outside the TALUS assembly code.
 - The CEF formula is inconsistent in the document. Section 6 says `... - c - delta`, while Section 11.6 says `... - c + delta`. Treat this as a spec erratum: implement `+ delta` only, and add boundary tests that fail if `delta` is subtracted.
 - Do not name the CEF carry bit `c` in code, because ML-DSA already uses `c` for the challenge polynomial. Use `kappa`, `rho_carry`, or `mask_carry`; the plan uses `kappa`.
 - TALUS-MPC cannot offline-check BCC without reconstructing `Ay`. Implementation should model this as retry/verify-failure behavior for MPC signing, while still implementing `bcc_holds` for tests, local oracle flows, and theorem checks.
@@ -215,7 +215,7 @@ These are the decisions that affect implementation shape:
 
 - Minimum supported Rust version and edition policy.
 - Whether crates should be publishable independently or kept as private workspace crates.
-- Preferred ML-DSA implementation: reuse the local Tidecoin production path first (`../rust-tidecoin/tidecoin/src/crypto/pq.rs` and `../rust-tidecoin/consensus-core/src/pq.rs`, backed by `fips204 = 0.4`), then direct `fips204` and ACVP vectors. TALUS-owned ML-DSA code should be limited to adapters and missing internal hooks.
+- Preferred ML-DSA implementation: depend directly on `fips204` and ACVP-shaped vectors. TALUS-owned ML-DSA code should be limited to adapters and missing internal hooks. Tidecoin consensus-wrapper compatibility belongs in downstream integration tests, not in the TALUS crate dependency graph.
 - Supported API surface for the first release: library only, CLI, or daemon/service.
 - Target runtime for async protocol APIs: runtime-agnostic traits, Tokio, or sync-first deterministic engine.
 - Persistence backend for session counters and consumed tokens: file, SQLite, sled/redb, or caller-provided trait.
@@ -314,7 +314,7 @@ Verification:
 Implementation steps:
 
 - [x] Define `MlDsaParams` and suites `MlDsa44`, `MlDsa65`, `MlDsa87`.
-- [x] Add `fips204` as the standard ML-DSA dependency, aligned with the local Tidecoin-tested version.
+- [x] Add `fips204` as the standard ML-DSA dependency.
 - [x] Decide the internal-hook strategy: use a narrow vendored adapter copied from `fips204` internals with attribution and parity tests.
 - [ ] Expose or adapt `Coeff`, `Poly`, `PolyVecL`, `PolyVecK`, and `MatrixA` only to the extent needed for TALUS `A*y`, `A*z`, BCC, hints, and CEF tests.
   Current status: a FIPS-sized `Poly`/`PolyVec` adapter is present for coefficient-wise arithmetic, sparse challenge multiplication in `Z_q[x]/(x^256+1)`, infinity norm, `z` bound checks, public-key `t1` decoding, `t1*2^d`, `c*t1*2^d`, `ExpandA`, NTT/inverse NTT, NTT-backed `A*z`, and `w'_approx = A*z - c*t1*2^d`. Typed `PolyVecL`/`PolyVecK` wrappers remain pending.
@@ -323,8 +323,8 @@ Implementation steps:
 - [x] Implement unsigned TALUS decomposition: `high_bits_unsigned` and `low_bits_unsigned`.
 - [ ] Reuse/expose FIPS encodings, `ExpandA`, challenge hash, `SampleInBall`, `mu`, public `r`, and verifier from `fips204` where possible.
   Current status: FIPS Algorithm 23 public-key decode, Algorithm 28 `w1Encode`, SHAKE256 `mu`, SHAKE256 variable-length `ctilde`, Algorithm 29 `SampleInBall`, Algorithm 32 `ExpandA`, FIPS NTT/inverse NTT, NTT-backed `A*z`, and Algorithm 26-compatible signature encoding are implemented in the narrow adapter.
-- [ ] Add independent oracle cross-checks against local Tidecoin ML-DSA wrappers, `fips204`, and ACVP-shaped vectors where APIs expose enough internals.
-  Current status: direct `fips204` public API and local `tidecoin-consensus-core` verifier parity tests are present; high-level `tidecoin` crate and ACVP-shaped vector hooks remain pending.
+- [ ] Add independent oracle cross-checks against `fips204` and ACVP-shaped vectors where APIs expose enough internals.
+  Current status: direct `fips204` public API tests are present; ACVP-shaped vector hooks remain pending.
 
 Verification:
 
@@ -332,7 +332,7 @@ Verification:
 - [x] Parameter constants match FIPS 204 for all three suites.
 - [x] `fips204_adapter_matches_upstream_verify_all_params`.
 - [x] `fips204_adapter_matches_upstream_signature_encoding_all_params`.
-- [x] `fips204_signatures_verify_through_tidecoin_consensus_core` behind the `tidecoin-local` feature.
+- [x] `fips204_verifier_wrapper_uses_public_key`.
 - [ ] `poly_mul_ntt_matches_schoolbook_for_random_inputs` for any local/vendored arithmetic.
 - [ ] `ntt_inverse_ntt_roundtrip` for any local/vendored NTT.
 - [x] Sparse challenge multiplication handles identity and negacyclic boundary shifts.
@@ -347,8 +347,8 @@ Verification:
 - [x] FIPS `w1Encode` output lengths match all three suites.
 - [x] `ctilde` length is `lambda / 4` for ML-DSA-44/65/87, and `SampleInBall` returns exactly `tau` nonzero coefficients in `{-1, 1}`.
 - [ ] ACVP-compatible `keyGen`, `sigGen`, and `sigVer` hooks compile and parse vector-shaped JSON.
-- [ ] Valid signatures verify internally, through local Tidecoin `PqSignature::verify_msg32` / `verify_msg64`, through `tidecoin-consensus-core`, and directly with `fips204`.
-  Current status: `fips204` direct verification, a reusable `Fips204Verifier` helper, and `tidecoin-consensus-core` `PqSignature::verify_msg32` / `verify_msg64` pass; final emitted TALUS signatures and the high-level `tidecoin` crate path remain pending.
+- [ ] Valid signatures verify internally and directly with `fips204`.
+  Current status: `fips204` direct verification and a reusable `Fips204Verifier` helper pass; final emitted TALUS signatures remain pending.
 
 ## Milestone 2: TALUS Arithmetic, BCC, Hints, And CEF
 
@@ -617,7 +617,7 @@ Start with Milestone 0 and the `fips204` adapter subset of Milestone 1:
 - [x] Create workspace and crate skeletons.
 - [x] Implement `MlDsaParams` and suites.
 - [x] Add the pinned `fips204` dependency.
-- [x] Add local Tidecoin verification dev-dependency path or test harness.
+- [x] Add direct `fips204` verification test harness.
 - [x] Decide whether to patch/fork `fips204` or vendor a narrow adapter for internals currently marked `pub(crate)`: chosen narrow vendored adapter.
 - [x] Expose/adapt FIPS `Decompose`, `HighBits`, `LowBits`, `UseHint` from `fips204` internals.
 - [x] Implement TALUS unsigned decomposition.
@@ -652,10 +652,7 @@ This slice is small enough to complete before committing to broader MPC implemen
   all-suite DKG -> TALUS signing verifier tests.
 
 - `talus.md` in this repository.
-- Local Tidecoin ML-DSA wrappers: `../rust-tidecoin/tidecoin/src/crypto/pq.rs`.
-- Local Tidecoin consensus verifier: `../rust-tidecoin/consensus-core/src/pq.rs`.
-- Local Tidecoin consensus verifier facade: `../rust-tidecoin/consensus-core/src/pq.rs`.
-- Local Tidecoin ML-DSA dependency declaration: `../rust-tidecoin/tidecoin/Cargo.toml` uses `fips204 = 0.4` with `ml-dsa-44`, `ml-dsa-65`, and `ml-dsa-87`.
+- Direct TALUS ML-DSA dependency: `fips204 = 0.4.6` with `ml-dsa-44`, `ml-dsa-65`, and `ml-dsa-87`.
 - Local Cargo source for `fips204`: `~/.cargo/registry/src/.../fips204-0.4.6/src`, whose relevant internal modules are currently `pub(crate)`.
 - FIPS 204 PDF from NIST: https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.204.pdf
 - ACVP ML-DSA draft: https://pages.nist.gov/ACVP/draft-celi-acvp-ml-dsa.html

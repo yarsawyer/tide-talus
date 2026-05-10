@@ -155,7 +155,7 @@ talus-wire/
 
 talus-tests/
   integration tests, adversarial tests, Monte Carlo tests,
-  cross-verification against the standard fips204/Tidecoin verifier path.
+  cross-verification against the standard fips204 verifier path.
 
 talus-bench/
   Criterion benchmarks and communication accounting.
@@ -165,7 +165,8 @@ Suggested dependency policy:
 
 ```text
 Allowed:
-  fips204, pinned to the Tidecoin-tested version unless intentionally upgraded
+  fips204, pinned unless intentionally upgraded
+  ml-kem for PQ channel/session tests and application transport evidence
   zeroize
   subtle
   rand_core
@@ -195,15 +196,17 @@ Only implement TALUS-specific math and protocol logic directly.
 Do not clean-room rewrite standard ML-DSA internals from the paper unless fips204 cannot reasonably be adapted.
 ```
 
-The local Tidecoin production reference is the ML-DSA integration in:
+Tidecoin integration remains a downstream compatibility target, but TALUS crates
+must not depend on local Tidecoin crates for ML-DSA behavior. The direct
+dependency authority is:
 
 ```text
-../rust-tidecoin/tidecoin/Cargo.toml
-../rust-tidecoin/tidecoin/src/crypto/pq.rs
-../rust-tidecoin/consensus-core/src/pq.rs
+fips204 = 0.4.6 with ml-dsa-44, ml-dsa-65, and ml-dsa-87 features
+ml-kem = 0.3 for PQ channel/session conformance tests and evidence
 ```
 
-That code currently uses `fips204 = 0.4` with `ml-dsa-44`, `ml-dsa-65`, and `ml-dsa-87` features. TALUS should use this local Tidecoin path as the preferred verifier/signature-size/reference oracle in tests, including the consensus-core verifier facade.
+If Tidecoin wants an additional consensus-wrapper parity suite, keep it outside
+the normal TALUS dependency graph or behind a downstream integration harness.
 
 The upstream `fips204` crate has useful internal modules for high/low bits, NTT, encodings, hashing, and ML-DSA signing flow, but many of these are `pub(crate)` in the published crate.
 
@@ -322,11 +325,6 @@ Use fips204 directly for:
   - standard verification
   - signature encoding checks
   - ACVP-compatible behavior
-
-Use local Tidecoin wrappers for:
-  - product signature-size constants
-  - production verification behavior
-  - consensus verifier cross-checks
 
 Expose/fork/vendor fips204 internals for:
   - HighBits/LowBits/UseHint
@@ -3068,24 +3066,18 @@ pre-hash mode if supported
 
 NIST’s ACVP ML-DSA schema covers `keyGen`, `sigGen`, and `sigVer` test groups and specifies the expected test vector fields. ([NIST Pages][5])
 
-Use Tidecoin's local ML-DSA integration as the first code oracle:
-
-```text
-../rust-tidecoin/tidecoin/src/crypto/pq.rs
-../rust-tidecoin/consensus-core/src/pq.rs
-```
-
 Cross-check TALUS signatures against:
 
 ```text
-tidecoin::crypto::pq::PqSignature::verify_msg32 / verify_msg64
-tidecoin-consensus-core::PqSignature::verify_msg32 / verify_msg64
 fips204::ml_dsa_44::PublicKey::verify
 fips204::ml_dsa_65::PublicKey::verify
 fips204::ml_dsa_87::PublicKey::verify
 ```
 
-The Tidecoin wrappers use an empty FIPS context (`&[]`) for the current message-digest verification paths; TALUS tests must explicitly cover empty context, non-empty context where exposed by TALUS, and reject accidental context mismatches.
+TALUS tests must explicitly cover empty context, non-empty context where exposed
+by TALUS, and reject accidental context mismatches. Tidecoin consensus-wrapper
+checks belong in downstream integration tests, not in the TALUS crate dependency
+graph.
 
 ### 17.2 TALUS arithmetic tests
 
@@ -3391,7 +3383,7 @@ Milestone 1:
   fips204 dependency and TALUS adapter layer
   minimal fips204 extension/fork or vendored adapter for required internals
   HighBits/LowBits/UseHint exposure
-  standard ML-DSA verify through fips204/Tidecoin wrappers
+  standard ML-DSA verify through fips204
   adapter parity tests and standard verifier cross-checks
 
 Milestone 2:
@@ -3516,7 +3508,7 @@ No production release until:
 
 10. Never serialize secrets through Debug/logging.
 
-11. Always verify final σ with the standard fips204/Tidecoin verifier path before returning.
+11. Always verify final σ with the standard fips204 verifier path before returning.
 
 12. Always bind every message to suite, pk, session id, signer set, and transcript hash.
 ```

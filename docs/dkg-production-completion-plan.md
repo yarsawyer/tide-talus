@@ -386,7 +386,7 @@ Tasks:
 - [ ] Wire production sampler + production IT-VSS + vectorized Power2Round into
   one normal-build DKG path.
 - [ ] Make scaffold assembly unavailable to normal users.
-- [ ] Add public-key compatibility checks against FIPS/Tidecoin ML-DSA verifier
+- [ ] Add public-key compatibility checks against the FIPS ML-DSA verifier
   expectations.
 - [ ] Add multi-party agreement checks: all honest parties derive the same
   `rho`, `t1`, public key, setup certificate, and signer set.
@@ -516,7 +516,7 @@ Tasks:
 - [ ] Consume a fixed token batch before response work.
 - [ ] Privately check response norm and hint weight.
 - [ ] Open only selected valid `ctilde`, `z`, and `h`.
-- [ ] Verify final signature with standard FIPS/Tidecoin ML-DSA verifier.
+- [ ] Verify final signature with standard FIPS ML-DSA verifier.
 - [ ] Test malicious setup failures do not leak forbidden material.
 - [ ] Test final verify failure consumes one-time material and releases no
   signature.

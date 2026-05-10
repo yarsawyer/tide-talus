@@ -14,12 +14,10 @@ serde-wire = []
 test-dealer = []
 bench = []
 fips204-adapter = []
-tidecoin-local = ["dep:tidecoin-consensus-core"]
 
 [dependencies]
 fips204.workspace = true
 sha3.workspace = true
-tidecoin-consensus-core = { path = "../../rust-tidecoin/consensus-core", default-features = false, features = ["std"], optional = true }
 zeroize.workspace = true
 
 [dev-dependencies]

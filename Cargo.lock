@@ -128,12 +128,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hex-conservative"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "366fa3443ac84474447710ec17bb00b05dfbd096137817981e86f992f21a2793"
-
-[[package]]
 name = "hybrid-array"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -242,36 +236,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
-name = "serde"
-version = "1.0.228"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
-dependencies = [
- "serde_core",
- "serde_derive",
-]
-
-[[package]]
-name = "serde_core"
-version = "1.0.228"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
-dependencies = [
- "serde_derive",
-]
-
-[[package]]
-name = "serde_derive"
-version = "1.0.228"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -326,7 +290,6 @@ version = "0.1.0"
 dependencies = [
  "fips204",
  "sha3 0.10.9",
- "tidecoin-consensus-core",
  "zeroize",
 ]
 
@@ -380,89 +343,6 @@ dependencies = [
  "fips204",
  "ml-kem",
  "sha3 0.10.9",
-]
-
-[[package]]
-name = "tide-fn-dsa-comm"
-version = "0.4.0"
-source = "git+https://github.com/tidecoin/tide-fn-dsa?rev=30e5695f4c5718b1625d8f4227bed1ff0e872692#30e5695f4c5718b1625d8f4227bed1ff0e872692"
-dependencies = [
- "cpufeatures 0.2.17",
- "rand_core 0.6.4",
- "zeroize",
-]
-
-[[package]]
-name = "tide-fn-dsa-vrfy"
-version = "0.4.0"
-source = "git+https://github.com/tidecoin/tide-fn-dsa?rev=30e5695f4c5718b1625d8f4227bed1ff0e872692#30e5695f4c5718b1625d8f4227bed1ff0e872692"
-dependencies = [
- "tide-fn-dsa-comm",
-]
-
-[[package]]
-name = "tidecoin-consensus-core"
-version = "0.1.0"
-dependencies = [
- "fips204",
- "tide-fn-dsa-vrfy",
- "tidecoin-consensus-encoding",
- "tidecoin-internals",
- "tidecoin-io",
- "tidecoin-primitives",
- "tidecoin_hashes",
-]
-
-[[package]]
-name = "tidecoin-consensus-encoding"
-version = "0.1.0"
-dependencies = [
- "tidecoin-internals",
-]
-
-[[package]]
-name = "tidecoin-internals"
-version = "0.5.0"
-dependencies = [
- "hex-conservative",
-]
-
-[[package]]
-name = "tidecoin-io"
-version = "0.5.0"
-dependencies = [
- "tidecoin-consensus-encoding",
- "tidecoin-internals",
- "tidecoin_hashes",
-]
-
-[[package]]
-name = "tidecoin-primitives"
-version = "0.102.0"
-dependencies = [
- "hex-conservative",
- "tidecoin-consensus-encoding",
- "tidecoin-internals",
- "tidecoin-units",
- "tidecoin_hashes",
-]
-
-[[package]]
-name = "tidecoin-units"
-version = "0.3.0"
-dependencies = [
- "serde",
- "tidecoin-consensus-encoding",
- "tidecoin-internals",
-]
-
-[[package]]
-name = "tidecoin_hashes"
-version = "0.20.0"
-dependencies = [
- "hex-conservative",
- "tidecoin-consensus-encoding",
- "tidecoin-internals",
 ]
 
 [[package]]
