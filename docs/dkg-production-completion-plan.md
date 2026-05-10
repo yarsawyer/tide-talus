@@ -12,6 +12,13 @@ It intentionally separates:
 The goal is a production-only library API. Test harnesses may exist under
 `cfg(test)`, but normal users should not select scaffold or simulator paths.
 
+The complete cross-component roadmap is tracked in
+`docs/production-grade-roadmap.md`. This DKG plan remains the DKG-focused view;
+the roadmap adds strict online signing, no-rejected-`z` leakage, no public
+`A*secret` images, release gates, and review-package tasks.
+The production performance shape for preprocessing, CEF, CarryCompare, and BCC
+is tracked in `docs/preprocessing-bcc-performance.md`.
+
 ## Production Definition
 
 Full production DKG means:
@@ -24,6 +31,7 @@ batched/vector prime-field IT-MPC Power2Round
 standard ML-DSA public key pk = (rho, t1)
 retained secret material: s1 share only
 no s2/t/t0/low-bit/mask witness leakage
+no public exact A-image of secret material
 durable crash-safe logs and restart cursors
 release-valid DkgKeyPackage set
 ```
@@ -65,6 +73,8 @@ SHAKE/cSHAKE/KMAC/TupleHash transcript binding
   adapters, not only in-memory transport.
 - [ ] End-to-end production DKG generates release-valid packages without
   scaffold artifacts.
+- [ ] Release paths contain no public `A*s1_i`, `A*nonce` coefficient, or
+  `Phi = A*secret` artifacts.
 
 ## Phase 1: Production API Surface
 
@@ -465,6 +475,12 @@ Tasks:
 - [ ] Add normal-build public API scan.
 - [ ] Add forbidden-field scan for `s2`, `t`, `t0`, low bits, mask witnesses,
   retained receiver tags, and private setup payloads.
+- [ ] Add forbidden public-linear-image scan for `A*s1_i`,
+  `as1_commitment`, `A*nonce` coefficients, `Phi = A*secret`, and
+  `CommitmentBackedPartialVerifier` on release paths.
+- [ ] Add rejected-`z` leakage scan for clear partial `z_i` transport,
+  candidate-token verifier retry, exposed candidate hints, exposed validity
+  bits, and detailed private-check failure reasons on release paths.
 - [ ] Add feature scan to reject insecure/dev/test features in release builds.
 - [ ] Add performance regression test with max rounds/messages/bytes for
   ML-DSA-44 baseline.
@@ -478,6 +494,9 @@ Completeness gate:
 - [ ] A production-valid package set must pass exactly one narrow release path.
 - [ ] Any simulator/scaffold/test backend in normal build fails CI.
 - [ ] Any retained receiver-side tag in public artifacts fails CI.
+- [ ] Any public exact `A*secret` image in production artifacts fails CI.
+- [ ] Any public-linear-image online blame verifier in release builds fails CI.
+- [ ] Any clear rejected-`z` path in release builds fails CI.
 
 ## Phase 10: End-to-End Production DKG and Signing
 
@@ -491,12 +510,19 @@ Tasks:
 - [ ] Run full production DKG for ML-DSA-87.
 - [ ] Import each party's `s1` share into TALUS signing provider.
 - [ ] Generate preprocessing tokens without trusted dealer.
-- [ ] Run TALUS online signing.
+- [ ] Generate preprocessing tokens through token-batched/vectorized nonce,
+  CEF, CarryCompare, and BCC certification, not scalar-per-coefficient loops.
+- [ ] Run strict TALUS online signing with no rejected-`z` leakage.
+- [ ] Consume a fixed token batch before response work.
+- [ ] Privately check response norm and hint weight.
+- [ ] Open only selected valid `ctilde`, `z`, and `h`.
 - [ ] Verify final signature with standard FIPS/Tidecoin ML-DSA verifier.
 - [ ] Test malicious setup failures do not leak forbidden material.
 - [ ] Test final verify failure consumes one-time material and releases no
   signature.
-- [ ] Record performance counters for DKG and signing.
+- [ ] Test rejected candidates do not expose `z_i`, aggregate `z`, hints,
+  validity bits, token failure reasons, or selected-index failure patterns.
+- [ ] Record performance counters for DKG, preprocessing, and signing.
 
 Completeness gate:
 
@@ -506,6 +532,8 @@ Completeness gate:
 - [ ] DKG performance is within the agreed target envelope.
 - [ ] No test/scaffold feature or backend is required by the end-to-end
   production test.
+- [ ] `docs/no-rejected-z-leakage.md` is reflected in release-gate tests and
+  strict signing tests.
 
 ## Phase 11: Cryptographic Review Package
 
@@ -533,21 +561,31 @@ Completeness gate:
   step and source location.
 - [ ] Every release gate has a documented security reason.
 - [ ] Every known non-production/test helper is listed and gated.
+- [ ] `docs/no-public-a-secret-linear-images.md` is reflected in release-gate
+  tests and in the public API scan.
+- [ ] `docs/no-rejected-z-leakage.md` is reflected in release-gate tests and
+  strict online signing tests.
 
 ## Critical Path Order
 
 Recommended implementation order:
 
-1. Move remaining test/scaffold helpers into test/dev modules.
-2. Implement production vector IT-VSS backend with chunking and counters.
-3. Wire bounded sampler exclusively to production vector IT-VSS.
-4. Implement `ShareVec` / `BitShareVec` prime-field MPC backend.
-5. Implement vectorized Power2Round with precomputed masks.
-6. Wire production DKG assembly to `ProductionNativeDkgAssemblyOutput`.
-7. Add transport adapter conformance suite.
-8. Add persistence/restart/reuse prevention for vector IT-VSS and Power2Round.
-9. Run end-to-end DKG -> TALUS signing -> FIPS verification.
-10. Build review package and performance report.
+1. Gate current clear partial/signing and public-linear-image verifier as
+   test/research only.
+2. Add release scanners for public `A*secret` and rejected-`z` leakage.
+3. Move remaining test/scaffold helpers into test/dev modules.
+4. Implement production vector IT-VSS backend with chunking and counters.
+5. Wire bounded sampler exclusively to production vector IT-VSS.
+6. Implement `ShareVec` / `BitShareVec` prime-field MPC backend.
+7. Implement vectorized Power2Round with precomputed masks.
+8. Implement token-batched/vectorized preprocessing, private BCC, and strict
+   no-rejected-`z` signing.
+9. Wire production DKG assembly to `ProductionNativeDkgAssemblyOutput`.
+10. Add transport adapter conformance suite.
+11. Add persistence/restart/reuse prevention for vector IT-VSS, Power2Round,
+    preprocessing, and strict signing batches.
+12. Run end-to-end DKG -> TALUS signing -> FIPS verification.
+13. Build review package and performance report.
 
 ## Production Release Is Not Complete Until
 

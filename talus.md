@@ -49,9 +49,9 @@ and proof. Do not weaken or casually modify these parts:
 - BCC boundary checks and retry/failure semantics
 - CEF masked-broadcast arithmetic, including the +delta correction
 - TALUS-MPC honest-majority shape: N >= 2T - 1 for T >= 3
-- one-round online signing with z_i broadcasts
-- online blame using public A*s1_i commitments
-- paper reveal-on-failure blame semantics as a diagnostic construction
+- one-round online signing shape as a paper construction; production must
+  preserve ML-DSA rejection-sampling discipline and must not expose rejected
+  `z_i` values without a separate reviewed leakage proof
 ```
 
 Do not treat paper placeholders, classical setup references, or future-work notes as
@@ -61,6 +61,9 @@ production-complete for Tidecoin. These require stricter product design:
 - classical Pedersen DKG/VSS
 - finite-field/EC DH or classical-only AKE
 - unauthenticated PRF-derived triples for full malicious privacy
+- public exact A*secret images such as A*s1_i or A*nonce polynomial coefficients
+- public-linear-image online blame based on A*z_i = A*y_i + c*A*s1_i
+- reveal-on-failure after z_i has been sent
 - concrete persistence, rollback protection, transport, and deployment identity
 - adaptive security beyond the paper's erasure assumptions
 ```
@@ -68,7 +71,7 @@ production-complete for Tidecoin. These require stricter product design:
 Product rule: final Tidecoin TALUS must be end-to-end post-quantum. Classical
 Pedersen/DH-style setup is allowed only as test/research scaffolding, never as a
 production security dependency. Reviewed PQ key-share provisioning is allowed as
-an initial operational setup mode, but it is not a substitute for implementing
+an initial operational setup profile, but it is not a substitute for implementing
 native honest-majority IT-DKG/VSS.
 
 Product rule: post-challenge reveal-on-failure is not a production default. Once
@@ -77,7 +80,22 @@ material to reconstruct `y_i` creates a long-term-share leakage surface unless a
 separate proof and external review say otherwise. Production behavior after
 final verification failure is to consume the token, return no signature, and not
 reveal honest nonce/session material. Reveal-on-failure is reserved for
-offline/pre-challenge diagnostics or a separately reviewed forensic mode.
+offline/pre-challenge diagnostics or a separately reviewed forensic test path.
+
+Product rule: rejected candidate `z` values must not be exposed in production.
+Ordinary ML-DSA rejection sampling destroys failed candidates internally; a
+threshold implementation must preserve that discipline. The strict production
+signing path consumes tokens before response work, computes response checks
+privately, opens only selected valid signature material, and never exposes clear
+`z_i`, rejected aggregate `z`, candidate hints, validity bits, or detailed
+failure reasons. See `docs/no-rejected-z-leakage.md`.
+
+Product rule: no public exact ML-DSA matrix image of secret material. Values of
+the form `A*x` are not hiding when `x` is secret and the ML-DSA matrix has the
+standard `k >= l` shape. This forbids public `A*s1_i`, public
+`A*nonce-polynomial` coefficients, and Feldman-style lattice commitments
+`Phi = A*secret` in production. See
+`docs/no-public-a-secret-linear-images.md`.
 
 The implementation must support:
 
@@ -2168,12 +2186,14 @@ wall-clock time under LAN/WAN latency profiles
 Selected product design direction:
 
 ```text
-Use reviewed PQ key-share provisioning as an initial setup mode.
+Use reviewed PQ key-share provisioning as an initial setup profile.
 Implement native honest-majority IT-DKG/VSS as a mandatory product component.
 
-Every accepted keygen transcript must also publish public ML-DSA matrix A*s1_i
-commitments for later partial z_i verification and pairwise seed commitments
-for preprocessing/triple derivation.
+Accepted keygen transcripts must not publish public ML-DSA matrix `A*s1_i`
+commitments or any other exact public `A*secret` image. The earlier
+paper-compatible public-linear-image verifier is a test/research artifact only.
+Production must use non-revealing, pre-challenge certification and strict
+no-rejected-`z` signing instead.
 
 Plain Shamir DKG is not sufficient by itself because ML-DSA key material must be
 bounded: s1/s2 coefficients must be in [-eta, eta]. The bounded distributed
@@ -2195,14 +2215,14 @@ The generated secret must satisfy:
 |s_1|_\infty \le \eta
 ]
 
-Use two setup modes:
+Use two setup profiles:
 
 ```text
-1. dealer-test mode:
+1. dealer-test profile:
    only for tests and differential testing
 
-2. product setup mode:
-   reviewed PQ key-share provisioning as an initial mode
+2. product setup profile:
+   reviewed PQ key-share provisioning as an initial setup profile
    native honest-majority IT-DKG/VSS as a mandatory product component
 ```
 
@@ -2498,7 +2518,22 @@ A token is allowed into the pool only if certified.
 
 ## 12. Online signing protocol
 
-The online protocol consumes one certified token.
+The current local/paper-compatible online adapter consumes one certified token
+and computes clear partial responses. This is useful for correctness tests and
+for understanding the TALUS paper shape, but it is not the strict production
+online signing backend.
+
+Production signing must follow `docs/no-rejected-z-leakage.md`:
+
+```text
+- use BCC-certified tokens;
+- durably consume tokens before response work;
+- compute response checks privately;
+- do not send clear z_i;
+- do not expose rejected aggregate z, hints, validity bits, or failure reasons;
+- open only selected valid ctilde, z, and h;
+- run independent FIPS verification before output.
+```
 
 ### 12.1 Sign request
 
@@ -2543,7 +2578,7 @@ Compute:
 c = \mathrm{SampleInBall}(\widetilde c)
 ]
 
-### 12.3 Partial response
+### 12.3 Local/paper-compatible partial response
 
 Each party (i) computes:
 
@@ -2551,7 +2586,7 @@ Each party (i) computes:
 z_i = \hat y_i^\text{share} + c \cdot s_{1,i}
 ]
 
-The implementation must persist token consumption before requesting or releasing
+The local adapter must persist token consumption before requesting or releasing
 online partials, so a crash or final-verification failure cannot reuse the same
 nonce token. Then it zeroizes local nonce-share material as soon as the typed
 partial has been computed.
@@ -2570,7 +2605,7 @@ implementation for local harnesses, and `FileConsumedTokenStore` is a `std`
 append-only log used by crash/reopen tests. A production deployment still needs
 to choose the durable storage backend and locking model.
 
-Party sends:
+The local/paper-compatible transport shape sends:
 
 ```text
 PartialSignature {
@@ -2581,9 +2616,14 @@ PartialSignature {
 }
 ```
 
-### 12.4 Partial response verification
+This clear `z_i` message shape is forbidden in strict production signing unless
+a separate reviewed leakage proof promotes paper-fast candidate mode to
+production.
 
-The assembler checks each (z_i) using public commitments.
+### 12.4 Local/paper-compatible partial response verification
+
+The TALUS paper-style assembler checks each (z_i) using public exact linear
+images:
 
 Expected:
 
@@ -2634,6 +2674,12 @@ commitment-backed verifier derives `A` from the FIPS public-key seed, computes
 `Blame(i)` before aggregation if the identity fails. A no-op verifier exists only
 for scaffolding tests that intentionally do not model public commitments.
 
+This verifier is not production-safe. Public exact values of the form
+`A*secret` are not hiding for ML-DSA parameter shapes. Production must not use
+public `A*s1_i`, public nonce-polynomial `A*secret` commitments, or
+`CommitmentBackedPartialVerifier`; see
+`docs/no-public-a-secret-linear-images.md`.
+
 ### 12.5 Aggregate response
 
 Compute Lagrange coefficients for signer set (S):
@@ -2650,25 +2696,42 @@ z = \sum_{i \in S} \lambda_i z_i
 
 The current implementation has a deterministic in-process typed entrypoint
 (`sign_polynomial_with_token`) that consumes a certified token, obtains each
-party's typed `(y_i, s1_i)` share, computes typed partials, aggregates them,
-derives `A*z` from the FIPS public-key seed, computes TALUS public hints, encodes
-a FIPS-shaped candidate, and returns it only after the injected independent
-verifier accepts it. Both additive aggregation for local tests and
-Lagrange-at-zero aggregation for Shamir-style shares are implemented. Product
-key-share generation still has to guarantee that its public interpolation points
-match the online aggregation mode.
+clear local/test partial response, aggregates `z`, computes the public TALUS
+hint, encodes a FIPS-shaped candidate, and returns only after the injected final
+verifier accepts. This entrypoint is not the strict no-rejected-`z` production
+backend because rejected clear partials and aggregate candidates can exist
+inside the adapter/coordinator path.
 
-Check:
+### 12.6 Strict production response path
+
+The strict production backend replaces sections 12.3 through 12.5 with private
+batch signing:
+
+```text
+1. consume a fixed batch of BCC-certified tokens;
+2. derive ctilde_j locally for each token;
+3. compute [z_j] = [y_j] + c_j*[s1] inside IT-MPC;
+4. privately check z-bound, hint weight, and validity;
+5. privately select one valid candidate by random priority;
+6. open only selected ctilde, z, and h;
+7. run final FIPS verification before output;
+8. return generic batch failure if no candidate is valid, without opening
+   rejected candidate material.
+```
+
+No rejected candidate `z_i`, aggregate `z`, hint bits, validity bits, or private
+failure reasons may be logged, serialized, or returned.
+
+### 12.7 Response and hint checks
+
+The local/paper-compatible adapter computes the `z` norm and hint weight after
+clear aggregation:
 
 [
 |z|_\infty < \gamma_1 - \beta
 ]
 
-If this fails, consume token and retry with a new token. Do not output anything derived from this attempt.
-
-### 12.6 Hint
-
-Compute public:
+and:
 
 [
 r = A z - c t_1 2^d
@@ -2689,13 +2752,18 @@ Check:
 \mathrm{wt}(h) \le \omega
 ]
 
-Encode:
+If these checks fail in the local adapter, the token has already been consumed
+and no signature is returned. In strict production, these predicates are
+computed privately before any `z` or `h` is opened, and failed candidate
+material is not exposed.
+
+### 12.8 Final verification gate
+
+For the selected valid candidate, encode:
 
 [
 \sigma = (\widetilde c, z, h)
 ]
-
-### 12.7 Final verification gate
 
 Before returning:
 
@@ -2712,7 +2780,9 @@ If verification fails:
 - otherwise return RetryExhausted
 ```
 
-Never release invalid signatures. The TALUS paper emphasizes that final signatures are standard FIPS 204 signatures and that TALUS relies on verification of the assembled signature before output. ([arXiv][1])
+Never release invalid signatures. The TALUS paper emphasizes that final
+signatures are standard FIPS 204 signatures and that TALUS relies on
+verification of the assembled signature before output. ([arXiv][1])
 
 ## 13. Retry policy
 
@@ -2748,17 +2818,20 @@ pub enum SignOutcome<P: MlDsaParams> {
 }
 ```
 
-Do not hide retries from observability. The API may loop internally, but logs and metrics should report:
+Do not hide retries from local operational observability. The API may loop
+internally, but access-controlled logs and metrics may report:
 
 ```text
 attempts_used
 tokens_consumed
-bcc_or_verify_failures
+generic batch failures
 malicious_blames
 retry_exhaustions
 ```
 
-Do not log secrets, shares, nonces, challenges, or raw (z_i).
+Do not expose per-token private-check failure reasons in public telemetry. Do
+not log secrets, shares, nonces, challenges, raw `z_i`, rejected aggregate `z`,
+candidate hints, validity bits, or boundary distances.
 
 ## 14. Blame protocol
 
@@ -2787,43 +2860,48 @@ Offline blame may reveal preprocessing-only data because no challenge has been i
 
 Online blame must not reveal honest nonce material.
 
-Online blame handles:
+Strict production v1 does not use public-linear-image online blame. It may
+handle only non-secret, objectively attributable failures:
 
 ```text
 - missing partial response
 - malformed partial response
-- z_i inconsistent with commitments
 - replayed session
 - wrong signing set
+- invalid authenticated transport identity
+- equivocated broadcast
 ```
 
-Blame condition:
-
-[
-A z_i \ne A \hat y_i^\text{share} + c A s_{1,i}
-]
-
-Return:
+The paper-compatible condition:
 
 ```text
-Blame(i)
+A z_i != A*y_i + c*A*s1_i
 ```
 
-Do not reveal (\hat y_i), aggregate (\hat y), or secret shares after challenge computation.
+is not production-safe because it depends on public exact `A*secret` images and
+clear `z_i`. It is a test/research construction only.
+
+If a strict private response check fails and there is no non-revealing public
+evidence that identifies a party, return a generic abort/retry result, consume
+the relevant tokens, and do not reveal the failed candidate material.
+
+Do not reveal `y_i`, aggregate `y`, rejected `z_i`, rejected aggregate `z`,
+candidate hints, validity bits, or secret shares after challenge computation.
 
 ### 14.3 Verify failure after valid z checks
 
-If all (z_i) commitment checks pass but final FIPS verification fails:
+If private response checks complete but final FIPS verification fails:
 
 ```text
-- treat as BCC/rejection failure
-- consume token
-- retry
+- consume all participating tokens
+- return no signature
+- retry only with fresh tokens
 - no blame
-- no nonce reveal
+- no rejected z/h/failure detail reveal
 ```
 
-This is important. Revealing nonce material after (z_i = y_i + c s_{1,i}) has been sent can expose key material.
+This is important. Revealing nonce material or rejected response material after
+`z_i = y_i + c*s1_i` has been computed can expose key material.
 
 ## 15. Message and transcript design
 
@@ -3412,7 +3490,7 @@ No production release until:
 - setup supports reviewed PQ key-share provisioning and native honest-majority IT-DKG/VSS
 - production triple generation uses honest-majority IT-MPC/VSS certified authenticated triples, not trusted-dealer test triples
 - preprocessing certifies masked-broadcast consistency and CarryCompare before challenge
-- post-challenge reveal-on-failure is disabled by default; any forensic mode has separate proof and review
+- post-challenge reveal-on-failure is disabled by default; any forensic test path has separate proof and review
 - token/session persistence prevents reuse across crashes
 - transport provides authenticated P2P plus equivocation-resistant broadcast
 ```

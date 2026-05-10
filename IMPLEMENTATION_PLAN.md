@@ -19,6 +19,16 @@ Milestones 5 through 9 need product decisions before they can be called complete
 - durable storage and crash-consistent token consumption
 - transport/equivocation model and deployment assumptions
 
+The cross-component production completion checklist is now
+`docs/production-grade-roadmap.md`. It is the actionable roadmap for the final
+system and includes the two hard rules that supersede paper-compatible
+shortcuts:
+
+```text
+no public exact A-image of secret material
+no rejected-z leakage in production signing
+```
+
 Approved v1 production architecture:
 
 - honest-majority PQ TALUS-MPC
@@ -27,7 +37,7 @@ Approved v1 production architecture:
 - ML-DSA authenticated party identities and broadcast messages
 - SHAKE/KMAC transcript binding and key derivation
 - information-theoretic MPC/VSS preprocessing over PQ-authenticated channels
-- reviewed PQ key-share provisioning as an initial operational setup mode
+- reviewed PQ key-share provisioning as an initial operational setup profile
 - native honest-majority IT-DKG/VSS as a mandatory product component
 - bounded ML-DSA secret sampling as the review-critical DKG subprotocol
 - no Ring-LPN/PCG, PQ-OT/MASCOT, or LWE/RLWE FHE-SPDZ in v1 production
@@ -41,12 +51,13 @@ The TALUS paper is authoritative for the TALUS-specific signing mechanics. Follo
 - BCC condition, boundary handling, retry semantics, and final verification gate
 - CEF masked-broadcast arithmetic, including `+ delta`
 - TALUS-MPC honest-majority shape: `N >= 2T - 1` for `T >= 3`; `T = 2` handled separately
-- online `z_i` verification/blame using public `A*s1_i` commitments
-- paper reveal-on-failure blame semantics as a diagnostic construction
 
 The paper is not production-complete for our target where it uses abstract, classical, semi-honest, or future-work components. These must be replaced or reviewed before release:
 
 - classical Pedersen DKG or finite-field/EC DH/AKE
+- public exact lattice images of secrets, including `A*s1_i`, `A*nonce` coefficients, and Feldman-style `Phi = A*secret`
+- online `z_i` verification/blame based on public `A*s1_i`
+- paper reveal-on-failure blame semantics after `z_i` has been sent
 - pairwise seed setup unless instantiated with PQ-secure authenticated key establishment or reviewed provisioning
 - unauthenticated PRF-derived triples where malicious privacy requires authenticated Beaver triples
 - concrete durable storage, crash recovery, rollback protection, and transport
@@ -55,9 +66,12 @@ The paper is not production-complete for our target where it uses abstract, clas
 Product requirements that are stricter than the paper:
 
 - end-to-end post-quantum setup: no EC/finite-field Pedersen, no ECDH/DH, no classical-only PKI for production security
-- reviewed PQ key-share provisioning is acceptable as an initial mode, but native honest-majority IT-DKG/VSS remains mandatory
+- reviewed PQ key-share provisioning is acceptable as an initial setup profile, but native honest-majority IT-DKG/VSS remains mandatory
 - plain Shamir DKG is insufficient unless the bounded ML-DSA s1/s2 sampling subprotocol is reviewed
 - any ZK or cut-and-choose masked-broadcast proof is optional hardening, not the paper-mandated path
+- no public exact `A*secret` images in production; see `docs/no-public-a-secret-linear-images.md`
+- no per-party public-linear-image blame after challenge in v1 production
+- no rejected-`z` leakage in production; see `docs/no-rejected-z-leakage.md`
 - post-challenge reveal-on-failure is disabled by default; after `z_i = y_i + c*s1_i` is broadcast, revealing enough honest nonce material to reconstruct `y_i` is a long-term-share leakage surface unless separately proven and reviewed
 
 ## IT-DKG/VSS Source Bundle
@@ -125,6 +139,13 @@ Pinned product instantiation:
   Power2Round harness is only a correctness stress test; the production backend
   must batch across all coefficients, all openings, all checks, and all
   multiplications per circuit layer. See `docs/dkg-production-performance.md`.
+- Production nonce preprocessing, CEF, CarryCompare, and BCC certification must
+  also be token-batched/vectorized. Strict tokens are produced in batches or
+  bounded chunks; messages and rounds must scale with token batches/chunks and
+  circuit layers, not scalar coefficient loops. See
+  `docs/preprocessing-bcc-performance.md`.
+- Cross-component performance rules and follow-up benchmark/counter tasks are
+  tracked in `docs/optimization-principles.md`.
 - The full production DKG completion checklist, including IT-VSS performance,
   vectorized Power2Round, transport, persistence, release gates, end-to-end
   signing, and cryptographic review package, is tracked in
@@ -201,7 +222,7 @@ These are the decisions that affect implementation shape:
 - Transport threat model: authenticated channels supplied by caller, built-in TLS/noise, or test transport only for now.
 - Production malicious-MPC path: honest-majority IT-MPC/VSS preprocessing over PQ-authenticated channels.
 - Masked-broadcast failure path: certify consistency before challenge; post-challenge final-verify failure consumes the token and reveals no honest nonce material by default.
-- DKG path: reviewed PQ key-share provisioning as an initial mode, native honest-majority IT-DKG/VSS mandatory; classical Pedersen/DH is test/research-only.
+- DKG path: reviewed PQ key-share provisioning as an initial setup profile, native honest-majority IT-DKG/VSS mandatory; classical Pedersen/DH is test/research-only.
 - Initial `(N, T)` deployment envelope and whether to enforce `N >= 2T - 1` for `T >= 3` at config validation.
 - Compliance target: ACVP-compatible hooks only, or planned formal validation support.
 
@@ -209,12 +230,16 @@ These are the decisions that affect implementation shape:
 
 These are release blockers, not future improvements:
 
-- [ ] Reviewed PQ key-share provisioning mode is implemented and transcript-bound.
+- [ ] Reviewed PQ key-share provisioning profile is implemented and transcript-bound.
 - [ ] Native honest-majority IT-DKG/VSS is implemented.
 - [ ] Bounded ML-DSA s1/s2 distributed sampling is reviewed.
 - [ ] Production triple provider uses honest-majority IT-MPC/VSS certified authenticated triples; trusted-dealer triples are unavailable in release builds.
 - [ ] Masked-broadcast consistency and CarryCompare are certified before challenge.
-- [ ] Post-challenge reveal-on-failure is disabled by default; any forensic mode has separate proof and review.
+- [ ] No release path publishes or depends on exact `A*secret` images (`A*s1_i`, `A*nonce` coefficients, or `Phi = A*secret`).
+- [ ] `CommitmentBackedPartialVerifier` and any public-linear-image blame path are gated to tests or explicit insecure paper-compatibility builds.
+- [ ] Strict production signing exposes no rejected `z_i`, aggregate `z`, hints, validity bits, or failure reasons.
+- [ ] Current clear partial-signature adapters are gated as local/test or explicit research/paper-compatibility builds, not production.
+- [ ] Post-challenge reveal-on-failure is disabled by default; any forensic test path has separate proof and review.
 - [ ] Token and session persistence prevents nonce/session reuse across crashes.
 - [ ] Transport provides authenticated P2P channels and equivocation-resistant broadcast.
 
@@ -410,7 +435,7 @@ Implementation steps:
   Current status: `talus-mpc` exposes `MaskedBroadcastConsistencyVerifier`, public statement/proof containers, a clear deterministic verifier for local audit openings, a product ZK verifier placeholder that returns a typed blocker, and `CutAndChooseAuditPlan` for separating audited openings from certifiable token candidates. This is optional product hardening, not the TALUS paper's required path. The paper path is reveal-on-failure blame after final verification failure.
 - [ ] Implement production pre-challenge masked-broadcast consistency certification.
 - [ ] Implement production pre-challenge private CarryCompare certification.
-- [ ] Disable post-challenge reveal-on-failure by default; any forensic mode requires separate proof and review.
+- [ ] Disable post-challenge reveal-on-failure by default; any forensic test path requires separate proof and review.
 - [x] Implement token certification object.
 
 Verification:
@@ -430,11 +455,12 @@ Implementation steps:
 - [x] Implement `SignRequest` validation.
 - [x] Implement challenge computation from `tr`, `M'`, `mu`, and encoded `w1`.
   Current status: challenge computation now uses FIPS-compatible SHAKE256 `mu`, Algorithm 28 `w1Encode`, variable-length `ctilde = H(mu || w1Encode(w1), lambda/4)`, and exposes `ctilde` as bytes rather than assuming ML-DSA-44's 32-byte length.
-- [x] Implement partial `z_i = y_i + c * s1_i`.
-  Current status: typed polynomial helpers compute `z_i` from FIPS `ctilde`, local `y_i`, and `s1_i`; the online layer validates session/signer/challenge binding for typed partials, and `sign_polynomial_with_token` now drives token consumption, typed share lookup, partial computation, aggregation, FIPS candidate encoding via `A*z`, and the final verifier gate.
+- [x] Implement local/test partial `z_i = y_i + c * s1_i`.
+  Current status: typed polynomial helpers compute clear `z_i` from FIPS `ctilde`, local `y_i`, and `s1_i`; the online layer validates session/signer/challenge binding for typed partials, and `sign_polynomial_with_token` now drives token consumption, typed share lookup, partial computation, aggregation, FIPS candidate encoding via `A*z`, and the final verifier gate. This is not the strict production no-rejected-`z` signing backend because rejected clear partials can exist in the adapter/coordinator path.
 - [x] Persist token consumption before sending `z_i`.
-- [x] Verify each `z_i` against nonce and key commitments.
-  Current status: typed online signing now injects a `PolynomialPartialVerifier` before aggregation. The commitment-backed verifier checks `A*z_i == A*y_i + c*A*s1_i` using the FIPS public-key seed to derive `A`, and returns `Blame(i)` before aggregation on mismatch. A no-op verifier remains only for scaffolding tests that do not model commitments.
+- [ ] Replace clear partial `z_i` transport with strict private MPC response checks for production.
+- [ ] Gate `CommitmentBackedPartialVerifier` and public-linear-image blame as test/research only.
+- [ ] Implement strict private batch selection so only selected valid `ctilde/z/h` opens.
 - [x] Aggregate `z` with Lagrange coefficients.
   Current status: additive-share aggregation remains available for deterministic local tests. `talus-core` now exposes Lagrange coefficients at zero and Lagrange-weighted `PolyVec` aggregation over the ML-DSA modulus; `talus-mpc` exposes `assemble_polynomial_response_lagrange` and a `PolynomialAggregation::LagrangeAtZero` mode for typed online signing. Product key-share generation still has to provide shares at the matching public interpolation points.
 - [x] Check `z` norm, compute public hint, enforce hint weight, encode signature.
@@ -449,8 +475,9 @@ Verification:
 - [ ] Honest end-to-end signing for all parameter sets.
 - [x] Single attempt may fail without output.
 - [ ] Multi-attempt signing succeeds at expected rates.
-- [x] Wrong `z_i` returns `Blame(i)`.
-- [x] Commitment-backed partial verification accepts matching `A*y_i`/`A*s1_i` commitments and blames altered `z_i`.
+- [x] Local/test wrong `z_i` returns `Blame(i)`.
+- [ ] Production wrong-response handling uses non-revealing checks; no public `A*s1_i` blame.
+- [x] Commitment-backed partial verification accepts matching `A*y_i`/`A*s1_i` commitments and blames altered `z_i` in the local/paper-compatible test path.
 - [x] Commitment-backed partial verification rejects missing commitments and malformed commitment vector lengths.
 - [x] Typed polynomial partials with wrong session/signer/challenge binding return `Blame(i)`.
 - [x] Aggregated typed `z` at the strict `gamma1 - beta` boundary is rejected.
@@ -549,7 +576,7 @@ Implementation steps:
   Current update: `talus-wire` now defines `SynchronousBroadcastContract` as the product reliable-broadcast contract for embedding applications: for each `(session, round, sender)`, honest observers must deliver identical canonical `WireMessage` bytes or the adapter must report equivocation/abort; incomplete views are not progress. Conformance tests cover identical honest views, equivocation, and missing delivery.
   Current update 2: The transport tests now include an explicit application-provided PQ adapter harness rather than only direct `InMemoryTransport` calls. The harness binds an ML-KEM-768 session transcript and ML-DSA-65 operational identity transcript into `PqTransportSessionBinding`, implements the TALUS transport traits by delegating to the test bus, rejects wrong expected contexts, detects duplicate/replayed private messages, and exercises the synchronous broadcast contract's equivocation path. This still is a deterministic harness, not a shipped TCP/QUIC/libp2p transport implementation.
 - [ ] Implement pre-challenge masked-broadcast and CarryCompare certification.
-  Current status: optional verifier hooks and deterministic clear-audit scaffolding exist. The approved production path requires pre-challenge consistency certification and private CarryCompare certification before token admission. Post-challenge final verification failure must consume the token and reveal no honest nonce material by default. ZK, cut-and-choose, or reveal-on-failure forensic modes remain optional hardening/diagnostic paths requiring separate proof and review.
+  Current status: optional verifier hooks and deterministic clear-audit scaffolding exist. The approved production path requires pre-challenge consistency certification and private CarryCompare certification before token admission. Post-challenge final verification failure must consume the token and reveal no honest nonce material by default. ZK, cut-and-choose, or reveal-on-failure forensic paths remain optional hardening/diagnostic test paths requiring separate proof and review.
 - [ ] Add protocol versioning and upgrade/compatibility checks.
 
 Verification:
