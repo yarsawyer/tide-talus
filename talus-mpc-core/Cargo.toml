@@ -1,0 +1,22 @@
+[package]
+name = "talus-mpc-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["std"]
+std = []
+alloc = []
+serde-wire = []
+test-dealer = []
+bench = []
+
+[dependencies]
+talus-core = { path = "../talus-core", default-features = false }
+zeroize.workspace = true
+
+[lints]
+workspace = true

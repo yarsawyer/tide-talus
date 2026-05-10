@@ -1,0 +1,27 @@
+[package]
+name = "talus-dkg"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["std", "fips204-adapter"]
+std = ["talus-core/std"]
+alloc = ["talus-core/alloc"]
+serde-wire = []
+production-release-checks = []
+bench = []
+scaffold-dev = []
+fips204-adapter = ["talus-core/fips204-adapter"]
+
+[dependencies]
+sha3.workspace = true
+talus-core = { path = "../talus-core", default-features = false }
+talus-mpc-core = { path = "../talus-mpc-core", default-features = false }
+talus-wire = { path = "../talus-wire", default-features = false }
+zeroize.workspace = true
+
+[lints]
+workspace = true

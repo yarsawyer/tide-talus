@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "talus-core",
+    "talus-mpc-core",
+    "talus-dkg",
+    "talus-mpc",
+    "talus-wire",
+    "talus-tests",
+    "talus-bench",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tidecoin/talus"
+
+[workspace.dependencies]
+fips204 = { version = "=0.4.6", default-features = false, features = ["ml-dsa-44", "ml-dsa-65", "ml-dsa-87"] }
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+sha3 = { version = "0.10", default-features = false }
+subtle = { version = "2.6", default-features = false }
+zeroize = { version = "1.8", default-features = false, features = ["alloc", "zeroize_derive"] }
+ml-kem = { version = "0.3", default-features = false, features = ["hazmat"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+panic = "warn"
+unwrap_used = "warn"

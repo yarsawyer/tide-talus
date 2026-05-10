@@ -1,0 +1,27 @@
+[package]
+name = "talus-tests"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["std", "fips204-adapter"]
+std = ["talus-core/std", "talus-dkg/std", "talus-mpc/std", "talus-mpc-core/std", "talus-wire/std"]
+alloc = ["talus-core/alloc", "talus-dkg/alloc", "talus-mpc/alloc", "talus-mpc-core/alloc", "talus-wire/alloc"]
+serde-wire = []
+test-dealer = []
+bench = []
+fips204-adapter = ["talus-core/fips204-adapter"]
+tidecoin-local = ["talus-core/tidecoin-local"]
+
+[dependencies]
+talus-core = { path = "../talus-core", default-features = false }
+talus-dkg = { path = "../talus-dkg", default-features = false }
+talus-mpc = { path = "../talus-mpc", default-features = false }
+talus-mpc-core = { path = "../talus-mpc-core", default-features = false, features = ["test-dealer"] }
+talus-wire = { path = "../talus-wire", default-features = false }
+
+[lints]
+workspace = true
