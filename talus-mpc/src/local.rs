@@ -1,4 +1,4 @@
-#![doc = "Deterministic in-process TALUS-MPC preprocessing harness."]
+#![doc = "Internal implementation for production-facing TALUS preprocessing APIs."]
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -7,13 +7,17 @@ use sha3::{Digest, Sha3_256};
 use talus_core::{
     az_from_rho, bcc_holds_coeff, high_bits_unsigned, lagrange_coefficients_at_zero,
     low_bits_unsigned, reduce_mod_q, Coeff, MlDsa44, MlDsa65, MlDsa87, MlDsaParams, Poly, PolyVec,
+    TalusPerformanceCounters,
 };
 use talus_dkg::{
-    evaluate_shamir_polynomial, hash_it_vss_complaint_resolution, hash_it_vss_public_commitment,
+    ensure_production_vector_it_mpc_runtime_evidence_for_release, evaluate_shamir_polynomial,
+    hash_it_vss_complaint_resolution, hash_it_vss_public_commitment,
     production_it_vss_public_coin_share, production_it_vss_public_coin_transcript, DkgConfig,
-    DkgError, ItVssComplaintResolution, ItVssPublicCommitment, ItVssSharingDomain,
-    ItVssSharingLabel, ProductionInformationCheckingVssBackend, ProductionItVssBackend,
-    ProductionItVssSecurityParams,
+    DkgError, ItVssComplaintResolution, ItVssPrivateShareDelivery, ItVssPublicCommitment,
+    ItVssPublicPrecommitment, ItVssSharingDomain, ItVssSharingLabel,
+    ProductionInformationCheckingVssBackend, ProductionItVssBackend,
+    ProductionItVssPreparedDealerOutput, ProductionItVssPublicCoinShare,
+    ProductionItVssSecurityParams, ProductionVectorItMpcRuntimeEvidence,
 };
 use talus_mpc_core::PartyId;
 use talus_wire::{
@@ -23,6 +27,9 @@ use talus_wire::{
     WireMessage, WIRE_PROTOCOL_VERSION,
 };
 use zeroize::Zeroizing;
+
+#[cfg(any(test, feature = "paper-fast-dev"))]
+use crate::local_dev::MaskedBroadcastClearAudit;
 
 /// TALUS preprocessing session identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -51,8 +58,9 @@ pub struct PartyPreprocessInput {
     pub lows: Vec<u32>,
     /// Secret local nonce-share material retained in the certified token.
     pub y_share: Vec<u8>,
-    /// Optional local `A*y_i` contribution witness for private BCC
-    /// certification. This is not serialized into preprocessing wire opens.
+    /// Optional local `A*y_i` contribution witness for tests/dev diagnostics.
+    /// Production CEF/BCC certification must not depend on this field and
+    /// certifies token admission from the opened masked-broadcast material.
     pub ay_contribution: Option<PolyVec>,
     /// Public nonce commitment.
     pub nonce_commitment: NonceCommitment,
@@ -114,11 +122,11 @@ pub enum PreprocessingOutbound {
 /// messages through the application transport, inject reliable-broadcast
 /// messages received from the signer set, then finish with a certified token.
 ///
-/// The current adapter carries clear local preprocessing inputs through a
-/// commit/open transcript and finishes through the existing CEF/BCC
-/// certification primitive. Nonce generation, product masked-broadcast proofs,
-/// and crash-safe token persistence plug in behind this same facade rather than
-/// changing the application transport API.
+/// The current adapter carries local preprocessing inputs through a commit/open
+/// transcript and finishes through the existing CEF/BCC certification primitive.
+/// Nonce generation, product masked-broadcast proofs, and crash-safe token
+/// persistence plug in behind this same facade rather than changing the
+/// application transport API.
 pub struct PreprocessingSession<P, S, V>
 where
     P: MlDsaParams,
@@ -470,8 +478,6 @@ pub struct DistributedNonceShare {
     pub party: PartyId,
     /// Local Shamir nonce share `y_i`; secret, never public.
     pub y_share: PolyVec,
-    /// Public commitment `A*y_i` used by online partial verification.
-    pub ay_commitment: PolyVec,
     /// Public nonce commitment included in preprocessing tokens.
     pub nonce_commitment: NonceCommitment,
     /// Public randomness commitment used by CEF rho derivation.
@@ -480,13 +486,12 @@ pub struct DistributedNonceShare {
 
 impl fmt::Debug for DistributedNonceShare {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DistributedNonceShare")
-            .field("party", &self.party)
-            .field("y_share", &"<redacted>")
-            .field("ay_commitment", &self.ay_commitment)
-            .field("nonce_commitment", &self.nonce_commitment)
-            .field("randomness_commitment", &self.randomness_commitment)
-            .finish()
+        let mut debug = f.debug_struct("DistributedNonceShare");
+        debug.field("party", &self.party);
+        debug.field("y_share", &"<redacted>");
+        debug.field("nonce_commitment", &self.nonce_commitment);
+        debug.field("randomness_commitment", &self.randomness_commitment);
+        debug.finish()
     }
 }
 
@@ -497,6 +502,385 @@ pub struct DistributedNonceGenerationOutput {
     pub shares: Vec<DistributedNonceShare>,
     /// Public IT-VSS evidence for dealer nonce contributions.
     pub evidence: DistributedNonceGenerationEvidence,
+}
+
+/// Local output of one app-driven distributed nonce-generation session.
+///
+/// A production party receives only its own Shamir nonce share. The all-party
+/// [`DistributedNonceGenerationOutput`] remains useful for local integration
+/// tests, but applications should drive one session per party and persist each
+/// [`DistributedNonceGenerationLocalOutput`] independently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedNonceGenerationLocalOutput {
+    /// Local party nonce share.
+    pub share: DistributedNonceShare,
+    /// Public IT-VSS evidence shared by all honest parties.
+    pub evidence: DistributedNonceGenerationEvidence,
+}
+
+/// Outbound artifact emitted by [`DistributedNonceGenerationSession`].
+///
+/// The crate does not own sockets. Embedding applications must deliver private
+/// artifacts over authenticated ML-KEM-derived channels and broadcast artifacts
+/// over reliable ML-DSA-authenticated broadcast.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DistributedNonceGenerationOutbound {
+    /// Directed private IT-VSS delivery.
+    Private {
+        /// Receiver party.
+        receiver: PartyId,
+        /// Receiver-private IT-VSS share delivery.
+        delivery: ItVssPrivateShareDelivery,
+    },
+    /// Reliable-broadcast IT-VSS artifact.
+    Broadcast {
+        /// Public artifact to broadcast.
+        artifact: DistributedNonceGenerationBroadcast,
+    },
+}
+
+/// Public broadcast artifacts for app-driven nonce generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DistributedNonceGenerationBroadcast {
+    /// Dealer precommitment before public coins are fixed.
+    PublicPrecommitment(ItVssPublicPrecommitment),
+    /// Public coin share for one dealer label.
+    PublicCoinShare(ProductionItVssPublicCoinShare),
+    /// Final public commitment after the public-coin transcript exists.
+    PublicCommitment(ItVssPublicCommitment),
+}
+
+/// App-driven distributed nonce-generation session for one local party.
+///
+/// This facade exposes the same production transport shape as native DKG:
+/// local party starts a session, the application routes private and broadcast
+/// artifacts, and `finish` returns only that party's local nonce share plus
+/// public evidence. It does not reveal aggregate nonces or other parties'
+/// shares.
+pub struct DistributedNonceGenerationSession<P: MlDsaParams> {
+    options: DistributedNonceGenerationOptions,
+    local_party: PartyId,
+    backend: ProductionInformationCheckingVssBackend,
+    prepared: Option<ProductionItVssPreparedDealerOutput>,
+    local_label: ItVssSharingLabel,
+    precommitments: Vec<ItVssPublicPrecommitment>,
+    coin_shares: Vec<ProductionItVssPublicCoinShare>,
+    public_commitments: Vec<ItVssPublicCommitment>,
+    private_deliveries: Vec<ItVssPrivateShareDelivery>,
+    outbound: Vec<DistributedNonceGenerationOutbound>,
+    coins_sent: bool,
+    commitment_sent: bool,
+    _params: PhantomData<P>,
+}
+
+impl<P: MlDsaParams> DistributedNonceGenerationSession<P> {
+    /// Starts one local-party nonce-generation session.
+    pub fn start(
+        options: DistributedNonceGenerationOptions,
+        local_party: PartyId,
+    ) -> Result<Self, PreprocessError> {
+        options.dkg_config.validate().map_err(map_nonce_dkg_error)?;
+        if options.dkg_config.suite != talus_dkg::DkgSuite::for_params::<P>() {
+            return Err(PreprocessError::NonceGenerationFailed);
+        }
+        if !options.dkg_config.parties.contains(&local_party) {
+            return Err(PreprocessError::UnknownParty(local_party));
+        }
+
+        let label = ItVssSharingLabel::new(
+            &options.dkg_config,
+            local_party,
+            ItVssSharingDomain::NoncePreprocessing,
+            Some(nonce_it_vss_label_index(options.session_id)),
+        )
+        .map_err(map_nonce_dkg_error)?;
+        let residues = nonce_residues_for_dealer::<P>(&options, local_party)?;
+        let secret = nonce_it_vss_secret::<P>(&options, local_party, &residues);
+        let mut backend = ProductionInformationCheckingVssBackend::with_params(
+            options.it_vss_entropy,
+            options.it_vss_security,
+        )
+        .map_err(map_nonce_dkg_error)?;
+        let prepared = backend
+            .prepare_secret::<P>(&options.dkg_config, label, &secret)
+            .map_err(map_nonce_dkg_error)?;
+
+        let mut session = Self {
+            options,
+            local_party,
+            backend,
+            prepared: Some(prepared),
+            local_label: label,
+            precommitments: Vec::new(),
+            coin_shares: Vec::new(),
+            public_commitments: Vec::new(),
+            private_deliveries: Vec::new(),
+            outbound: Vec::new(),
+            coins_sent: false,
+            commitment_sent: false,
+            _params: PhantomData,
+        };
+        session.enqueue_precommitment_and_private_deliveries()?;
+        Ok(session)
+    }
+
+    /// Injects one authenticated private IT-VSS delivery.
+    pub fn handle_private(
+        &mut self,
+        sender: PartyId,
+        delivery: ItVssPrivateShareDelivery,
+    ) -> Result<(), PreprocessError> {
+        if sender != delivery.dealer
+            || delivery.receiver != self.local_party
+            || !self.options.dkg_config.parties.contains(&sender)
+        {
+            return Err(PreprocessError::UnexpectedWireMessage);
+        }
+        if self
+            .private_deliveries
+            .iter()
+            .any(|seen| seen.dealer == delivery.dealer && seen.label_hash == delivery.label_hash)
+        {
+            return Err(PreprocessError::DuplicateBroadcast(sender));
+        }
+        self.private_deliveries.push(delivery);
+        self.advance()
+    }
+
+    /// Injects one reliable-broadcast nonce-generation artifact.
+    pub fn handle_broadcast(
+        &mut self,
+        sender: PartyId,
+        artifact: DistributedNonceGenerationBroadcast,
+    ) -> Result<(), PreprocessError> {
+        if !self.options.dkg_config.parties.contains(&sender) {
+            return Err(PreprocessError::UnknownParty(sender));
+        }
+        match artifact {
+            DistributedNonceGenerationBroadcast::PublicPrecommitment(precommitment) => {
+                if precommitment.dealer != sender {
+                    return Err(PreprocessError::UnexpectedWireMessage);
+                }
+                self.insert_precommitment(precommitment)?;
+            }
+            DistributedNonceGenerationBroadcast::PublicCoinShare(share) => {
+                if share.party != sender {
+                    return Err(PreprocessError::UnexpectedWireMessage);
+                }
+                self.insert_coin_share(share)?;
+            }
+            DistributedNonceGenerationBroadcast::PublicCommitment(commitment) => {
+                if commitment.dealer != sender {
+                    return Err(PreprocessError::UnexpectedWireMessage);
+                }
+                self.insert_public_commitment(commitment)?;
+            }
+        }
+        self.advance()
+    }
+
+    /// Returns the next outbound artifact for application delivery.
+    pub fn next_outbound(&mut self) -> Option<DistributedNonceGenerationOutbound> {
+        if self.outbound.is_empty() {
+            None
+        } else {
+            Some(self.outbound.remove(0))
+        }
+    }
+
+    /// Finishes this local-party nonce-generation session.
+    pub fn finish(mut self) -> Result<DistributedNonceGenerationLocalOutput, PreprocessError> {
+        self.advance()?;
+        if !self.outbound.is_empty()
+            || self.precommitments.len() != self.options.dkg_config.parties.len()
+            || self.public_commitments.len() != self.options.dkg_config.parties.len()
+            || self.private_deliveries.len() != self.options.dkg_config.parties.len()
+        {
+            return Err(PreprocessError::IncompleteSession);
+        }
+
+        let mut complaints = Vec::new();
+        for delivery in &self.private_deliveries {
+            let commitment = self
+                .public_commitments
+                .iter()
+                .find(|commitment| {
+                    commitment.dealer == delivery.dealer
+                        && commitment.label_hash == delivery.label_hash
+                })
+                .ok_or(PreprocessError::NonceGenerationFailed)?;
+            if self
+                .backend
+                .verify_private_delivery::<P>(&self.options.dkg_config, commitment, delivery)
+                .is_err()
+            {
+                complaints.push(
+                    self.backend
+                        .complaint_for_invalid_delivery::<P>(
+                            &self.options.dkg_config,
+                            commitment,
+                            delivery,
+                        )
+                        .map_err(map_nonce_dkg_error)?,
+                );
+            }
+        }
+        let complaint_resolution = self
+            .backend
+            .resolve_complaints::<P>(
+                &self.options.dkg_config,
+                &self.public_commitments,
+                &complaints,
+            )
+            .map_err(map_nonce_dkg_error)?;
+        let evidence = DistributedNonceGenerationEvidence {
+            public_commitment_hash: hash_nonce_it_vss_public_commitments(&self.public_commitments),
+            complaint_resolution_hash: hash_it_vss_complaint_resolution(&complaint_resolution),
+            public_commitments: self.public_commitments,
+            complaint_resolution,
+        };
+        let share =
+            distributed_nonce_share_for_party::<P>(&self.options, self.local_party, &evidence)?;
+        Ok(DistributedNonceGenerationLocalOutput { share, evidence })
+    }
+
+    fn enqueue_precommitment_and_private_deliveries(&mut self) -> Result<(), PreprocessError> {
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or(PreprocessError::NonceGenerationFailed)?;
+        self.outbound
+            .push(DistributedNonceGenerationOutbound::Broadcast {
+                artifact: DistributedNonceGenerationBroadcast::PublicPrecommitment(
+                    prepared.public_precommitment.clone(),
+                ),
+            });
+        for delivery in &prepared.deliveries {
+            self.outbound
+                .push(DistributedNonceGenerationOutbound::Private {
+                    receiver: delivery.receiver,
+                    delivery: delivery.clone(),
+                });
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self) -> Result<(), PreprocessError> {
+        if !self.coins_sent && self.precommitments.len() == self.options.dkg_config.parties.len() {
+            let precommitments = self.precommitments.clone();
+            for precommitment in precommitments {
+                let coin = nonce_public_coin::<P>(
+                    &self.options,
+                    self.local_party,
+                    precommitment.label_hash,
+                );
+                let share = production_it_vss_public_coin_share(
+                    &self.options.dkg_config,
+                    precommitment.label_hash,
+                    self.local_party,
+                    coin,
+                )
+                .map_err(map_nonce_dkg_error)?;
+                self.outbound
+                    .push(DistributedNonceGenerationOutbound::Broadcast {
+                        artifact: DistributedNonceGenerationBroadcast::PublicCoinShare(share),
+                    });
+            }
+            self.coins_sent = true;
+        }
+        if !self.commitment_sent && self.has_all_coin_shares_for(self.local_label.label_hash) {
+            let transcript = production_it_vss_public_coin_transcript(
+                &self.options.dkg_config,
+                self.local_label.label_hash,
+                &self.coin_shares_for(self.local_label.label_hash),
+            )
+            .map_err(map_nonce_dkg_error)?;
+            let prepared = self
+                .prepared
+                .take()
+                .ok_or(PreprocessError::NonceGenerationFailed)?;
+            let output = self
+                .backend
+                .finalize_prepared_secret(&self.options.dkg_config, prepared, transcript)
+                .map_err(map_nonce_dkg_error)?;
+            self.outbound
+                .push(DistributedNonceGenerationOutbound::Broadcast {
+                    artifact: DistributedNonceGenerationBroadcast::PublicCommitment(
+                        output.public_commitment,
+                    ),
+                });
+            self.commitment_sent = true;
+        }
+        Ok(())
+    }
+
+    fn insert_precommitment(
+        &mut self,
+        precommitment: ItVssPublicPrecommitment,
+    ) -> Result<(), PreprocessError> {
+        if self.precommitments.iter().any(|seen| {
+            seen.dealer == precommitment.dealer || seen.label_hash == precommitment.label_hash
+        }) {
+            return Err(PreprocessError::DuplicateBroadcast(precommitment.dealer));
+        }
+        self.precommitments.push(precommitment);
+        Ok(())
+    }
+
+    fn insert_coin_share(
+        &mut self,
+        share: ProductionItVssPublicCoinShare,
+    ) -> Result<(), PreprocessError> {
+        if !self
+            .precommitments
+            .iter()
+            .any(|precommitment| precommitment.label_hash == share.label_hash)
+        {
+            return Err(PreprocessError::UnexpectedWireMessage);
+        }
+        if self
+            .coin_shares
+            .iter()
+            .any(|seen| seen.party == share.party && seen.label_hash == share.label_hash)
+        {
+            return Err(PreprocessError::DuplicateBroadcast(share.party));
+        }
+        self.coin_shares.push(share);
+        Ok(())
+    }
+
+    fn insert_public_commitment(
+        &mut self,
+        commitment: ItVssPublicCommitment,
+    ) -> Result<(), PreprocessError> {
+        if !self.precommitments.iter().any(|precommitment| {
+            precommitment.dealer == commitment.dealer
+                && precommitment.label_hash == commitment.label_hash
+        }) {
+            return Err(PreprocessError::UnexpectedWireMessage);
+        }
+        if self
+            .public_commitments
+            .iter()
+            .any(|seen| seen.dealer == commitment.dealer)
+        {
+            return Err(PreprocessError::DuplicateBroadcast(commitment.dealer));
+        }
+        self.public_commitments.push(commitment);
+        Ok(())
+    }
+
+    fn has_all_coin_shares_for(&self, label_hash: [u8; 32]) -> bool {
+        self.coin_shares_for(label_hash).len() == self.options.dkg_config.parties.len()
+    }
+
+    fn coin_shares_for(&self, label_hash: [u8; 32]) -> Vec<ProductionItVssPublicCoinShare> {
+        self.coin_shares
+            .iter()
+            .filter(|share| share.label_hash == label_hash)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Generates nonce shares from dealerless, IT-VSS-certified residue contributions.
@@ -520,26 +904,7 @@ pub fn generate_distributed_nonce_shares<P: MlDsaParams>(
     let coeff_count = P::L * P::N;
     let modulus = nonce_residue_modulus::<P>()?;
 
-    let dealer_residues = options
-        .dkg_config
-        .parties
-        .iter()
-        .copied()
-        .map(|dealer| {
-            (0..coeff_count)
-                .map(|index| {
-                    nonce_residue::<P>(
-                        options.nonce_entropy,
-                        options.session_id,
-                        options.dkg_config.transcript_hash().0,
-                        dealer,
-                        index,
-                        modulus,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let dealer_residues = nonce_residues_for_all_dealers::<P>(&options)?;
 
     let mut nonce_coefficients = Vec::with_capacity(coeff_count);
     for index in 0..coeff_count {
@@ -557,20 +922,7 @@ pub fn generate_distributed_nonce_shares<P: MlDsaParams>(
     let shares = party_coeffs
         .into_iter()
         .map(|(party, coeffs)| {
-            let y_share = coeffs_to_nonce_polyvec::<P>(&coeffs)?;
-            let ay_commitment = az_from_rho::<P>(&options.rho, &y_share)
-                .map_err(|_| PreprocessError::NonceGenerationFailed)?;
-            let nonce_commitment =
-                distributed_nonce_commitment::<P>(options.session_id, party, &ay_commitment);
-            let randomness_commitment =
-                distributed_nonce_randomness_commitment::<P>(options.session_id, party, &evidence);
-            Ok(DistributedNonceShare {
-                party,
-                y_share,
-                ay_commitment,
-                nonce_commitment,
-                randomness_commitment,
-            })
+            distributed_nonce_share_from_coeffs::<P>(&options, &evidence, party, &coeffs)
         })
         .collect::<Result<Vec<_>, PreprocessError>>()?;
 
@@ -625,7 +977,7 @@ pub fn party_preprocess_input_from_distributed_nonce_share<P: MlDsaParams>(
         highs,
         lows,
         y_share: Vec::new(),
-        ay_contribution: Some(weighted_ay),
+        ay_contribution: None,
         nonce_commitment: share.nonce_commitment,
         randomness_commitment,
     })
@@ -663,6 +1015,8 @@ pub struct BroadcastEnvelope {
 
 struct PreparedMaskedBroadcast {
     envelope: BroadcastEnvelope,
+    rhos: Vec<u32>,
+    #[cfg(any(test, feature = "paper-fast-dev"))]
     clear_audit: MaskedBroadcastClearAudit,
 }
 
@@ -686,27 +1040,13 @@ pub struct MaskedBroadcastConsistencyStatement {
     pub coeff_count: usize,
 }
 
-/// Clear witness used by deterministic local audit tests.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaskedBroadcastClearAudit {
-    /// Unmasked unsigned high bits.
-    pub highs: Vec<u32>,
-    /// Unmasked unsigned low bits.
-    pub lows: Vec<u32>,
-    /// Public high masks used in this session.
-    pub high_masks: Vec<u32>,
-    /// Public rho masks used in this session.
-    pub rhos: Vec<u32>,
-    /// Expected rho-bit input commitment.
-    pub rho_bits_commitment: Commitment,
-}
-
 /// Verifies the consistency of an opened masked broadcast before token admission.
 pub trait MaskedBroadcastConsistencyVerifier {
     /// Returns whether this verifier consumes clear audit witnesses.
     ///
     /// Production verifiers must return false and validate only public
     /// statements plus transcript-bound private-certification artifacts.
+    #[cfg(any(test, feature = "paper-fast-dev"))]
     fn requires_clear_audit(&self) -> bool {
         false
     }
@@ -716,30 +1056,10 @@ pub trait MaskedBroadcastConsistencyVerifier {
         &mut self,
         statement: &MaskedBroadcastConsistencyStatement,
         proof: &MaskedBroadcastConsistencyProof,
-        clear_audit: Option<&MaskedBroadcastClearAudit>,
+        #[cfg(any(test, feature = "paper-fast-dev"))] clear_audit: Option<
+            &MaskedBroadcastClearAudit,
+        >,
     ) -> Result<(), PreprocessError>;
-}
-
-/// Deterministic clear verifier for local tests and cut-and-choose audit openings.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ClearMaskedBroadcastConsistencyVerifier;
-
-impl MaskedBroadcastConsistencyVerifier for ClearMaskedBroadcastConsistencyVerifier {
-    fn requires_clear_audit(&self) -> bool {
-        true
-    }
-
-    fn verify_masked_broadcast<P: MlDsaParams>(
-        &mut self,
-        statement: &MaskedBroadcastConsistencyStatement,
-        _proof: &MaskedBroadcastConsistencyProof,
-        clear_audit: Option<&MaskedBroadcastClearAudit>,
-    ) -> Result<(), PreprocessError> {
-        let audit = clear_audit.ok_or(PreprocessError::MaskedBroadcastAuditRequired(
-            statement.broadcast.party,
-        ))?;
-        verify_clear_masked_broadcast::<P>(statement, audit)
-    }
 }
 
 /// Production masked-broadcast consistency verifier.
@@ -756,8 +1076,11 @@ impl MaskedBroadcastConsistencyVerifier for ProductMaskedBroadcastConsistencyVer
         &mut self,
         statement: &MaskedBroadcastConsistencyStatement,
         proof: &MaskedBroadcastConsistencyProof,
-        clear_audit: Option<&MaskedBroadcastClearAudit>,
+        #[cfg(any(test, feature = "paper-fast-dev"))] clear_audit: Option<
+            &MaskedBroadcastClearAudit,
+        >,
     ) -> Result<(), PreprocessError> {
+        #[cfg(any(test, feature = "paper-fast-dev"))]
         if clear_audit.is_some() {
             return Err(PreprocessError::MaskedBroadcastAuditRequired(
                 statement.broadcast.party,
@@ -769,47 +1092,6 @@ impl MaskedBroadcastConsistencyVerifier for ProductMaskedBroadcastConsistencyVer
 
 /// Backward-compatible name for the production masked-broadcast verifier.
 pub type ProductZkMaskedBroadcastVerifier = ProductMaskedBroadcastConsistencyVerifier;
-
-/// Cut-and-choose audit plan. Audited openings are verified and discarded.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CutAndChooseAuditPlan {
-    audit_indices: Vec<usize>,
-}
-
-impl CutAndChooseAuditPlan {
-    /// Creates a deterministic audit plan from already selected token indices.
-    pub fn new(
-        total_candidates: usize,
-        mut audit_indices: Vec<usize>,
-    ) -> Result<Self, PreprocessError> {
-        if total_candidates == 0 {
-            return Err(PreprocessError::InvalidAuditPlan);
-        }
-        audit_indices.sort_unstable();
-        for (idx, &candidate_idx) in audit_indices.iter().enumerate() {
-            if candidate_idx >= total_candidates {
-                return Err(PreprocessError::InvalidAuditPlan);
-            }
-            if idx > 0 && audit_indices[idx - 1] == candidate_idx {
-                return Err(PreprocessError::InvalidAuditPlan);
-            }
-        }
-        if audit_indices.len() == total_candidates {
-            return Err(PreprocessError::InvalidAuditPlan);
-        }
-        Ok(Self { audit_indices })
-    }
-
-    /// Returns whether a candidate index must be opened for audit.
-    pub fn audits(&self, candidate_idx: usize) -> bool {
-        self.audit_indices.contains(&candidate_idx)
-    }
-
-    /// Returns the number of audited candidates.
-    pub fn audit_count(&self) -> usize {
-        self.audit_indices.len()
-    }
-}
 
 /// Product policy checks required before a preprocessing token may enter the
 /// online signing pool.
@@ -906,6 +1188,432 @@ pub struct PreChallengeCertificationEvidence {
     pub nonce_reveal_policy: Option<NonceRevealPolicyEvidence>,
 }
 
+/// Release certificate that preprocessing certification was backed by durable
+/// production vector IT-MPC runtime evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreprocessingVectorRuntimeCertificate {
+    /// Durable runtime evidence from the vector IT-MPC backend.
+    pub runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+}
+
+impl PreprocessingVectorRuntimeCertificate {
+    /// Builds a preprocessing runtime certificate after applying the full Phase
+    /// 3 vector-runtime release gate.
+    pub fn new(
+        runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+    ) -> Result<Self, PreprocessError> {
+        ensure_production_vector_it_mpc_runtime_evidence_for_release(&runtime_evidence)
+            .map_err(|_| PreprocessError::PreprocessingCountersNotVectorized)?;
+        Ok(Self { runtime_evidence })
+    }
+}
+
+/// Durable preprocessing-token inventory state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenInventoryState {
+    /// Token id has not been reserved for a concrete preprocessing attempt.
+    Fresh,
+    /// Token id is reserved/certified for one preprocessing session.
+    Reserved,
+    /// Token was consumed by signing and cannot be reused.
+    Consumed,
+    /// Token material was erased after use or failure.
+    Erased,
+}
+
+/// In-memory preprocessing-token inventory state machine.
+///
+/// Production deployments should back the same transitions with durable
+/// storage. The state model is intentionally monotonic:
+///
+/// `Fresh -> Reserved -> Consumed -> Erased`
+///
+/// No transition can make a consumed/erased token usable again.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TokenInventory {
+    entries: Vec<(SessionId, TokenInventoryState)>,
+}
+
+impl TokenInventory {
+    /// Creates an empty token inventory.
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Returns the known state for a token id.
+    pub fn state(&self, session_id: SessionId) -> TokenInventoryState {
+        self.entries
+            .iter()
+            .find(|(known, _)| *known == session_id)
+            .map(|(_, state)| *state)
+            .unwrap_or(TokenInventoryState::Fresh)
+    }
+
+    /// Reserves a fresh token id before inserting it into a certified pool.
+    pub fn reserve(&mut self, session_id: SessionId) -> Result<(), TokenPoolError> {
+        match self.state(session_id) {
+            TokenInventoryState::Fresh => {
+                self.entries
+                    .push((session_id, TokenInventoryState::Reserved));
+                Ok(())
+            }
+            _ => Err(TokenPoolError::InvalidInventoryTransition {
+                session_id,
+                from: self.state(session_id),
+                to: TokenInventoryState::Reserved,
+            }),
+        }
+    }
+
+    /// Marks a reserved token consumed before any online response work.
+    pub fn consume(&mut self, session_id: SessionId) -> Result<(), TokenPoolError> {
+        self.transition(
+            session_id,
+            TokenInventoryState::Reserved,
+            TokenInventoryState::Consumed,
+        )
+    }
+
+    /// Marks consumed token material erased.
+    pub fn erase(&mut self, session_id: SessionId) -> Result<(), TokenPoolError> {
+        self.transition(
+            session_id,
+            TokenInventoryState::Consumed,
+            TokenInventoryState::Erased,
+        )
+    }
+
+    fn transition(
+        &mut self,
+        session_id: SessionId,
+        expected: TokenInventoryState,
+        next: TokenInventoryState,
+    ) -> Result<(), TokenPoolError> {
+        let current = self.state(session_id);
+        if current != expected {
+            return Err(TokenPoolError::InvalidInventoryTransition {
+                session_id,
+                from: current,
+                to: next,
+            });
+        }
+        let (_, state) = self
+            .entries
+            .iter_mut()
+            .find(|(known, _)| *known == session_id)
+            .ok_or(TokenPoolError::InvalidInventoryTransition {
+                session_id,
+                from: current,
+                to: next,
+            })?;
+        *state = next;
+        Ok(())
+    }
+}
+
+/// Durable preprocessing-token inventory API.
+///
+/// Implementations must be monotonic: once a token reaches `Consumed` or
+/// `Erased`, no later restart may make it usable again.
+pub trait TokenInventoryStore {
+    /// Returns the known state for a token id.
+    fn state(&self, session_id: SessionId) -> TokenInventoryState;
+
+    /// Reserves a fresh token id before inserting it into a certified pool.
+    fn reserve(&mut self, session_id: SessionId) -> Result<(), TokenPoolError>;
+
+    /// Marks a reserved token consumed before any online response work.
+    fn consume(&mut self, session_id: SessionId) -> Result<(), TokenPoolError>;
+
+    /// Marks consumed token material erased.
+    fn erase(&mut self, session_id: SessionId) -> Result<(), TokenPoolError>;
+}
+
+impl TokenInventoryStore for TokenInventory {
+    fn state(&self, session_id: SessionId) -> TokenInventoryState {
+        TokenInventory::state(self, session_id)
+    }
+
+    fn reserve(&mut self, session_id: SessionId) -> Result<(), TokenPoolError> {
+        TokenInventory::reserve(self, session_id)
+    }
+
+    fn consume(&mut self, session_id: SessionId) -> Result<(), TokenPoolError> {
+        TokenInventory::consume(self, session_id)
+    }
+
+    fn erase(&mut self, session_id: SessionId) -> Result<(), TokenPoolError> {
+        TokenInventory::erase(self, session_id)
+    }
+}
+
+/// File-backed preprocessing-token inventory for crash/restart safety.
+///
+/// The log contains append-only lifecycle transitions. Reopening replays the
+/// transitions through the same monotonic state machine as `TokenInventory`.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileTokenInventory {
+    path: std::path::PathBuf,
+    inner: TokenInventory,
+}
+
+#[cfg(feature = "std")]
+impl FileTokenInventory {
+    /// Opens or creates a preprocessing-token inventory log.
+    pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self, TokenPoolError> {
+        let path = path.into();
+        let mut inner = TokenInventory::new();
+
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                for (line_index, line) in contents.lines().enumerate() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let (session_id, state) = parse_token_inventory_line(line).ok_or(
+                        TokenPoolError::InventoryStoreCorrupt {
+                            line: line_index + 1,
+                        },
+                    )?;
+                    replay_token_inventory_transition(&mut inner, session_id, state).map_err(
+                        |_| TokenPoolError::InventoryStoreCorrupt {
+                            line: line_index + 1,
+                        },
+                    )?;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|_| TokenPoolError::InventoryStoreIo {
+                        operation: "create",
+                    })?;
+                file.sync_all()
+                    .map_err(|_| TokenPoolError::InventoryStoreIo { operation: "sync" })?;
+            }
+            Err(_) => {
+                return Err(TokenPoolError::InventoryStoreIo { operation: "read" });
+            }
+        }
+
+        Ok(Self { path, inner })
+    }
+
+    fn append_transition(
+        &mut self,
+        session_id: SessionId,
+        state: TokenInventoryState,
+    ) -> Result<(), TokenPoolError> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|_| TokenPoolError::InventoryStoreIo { operation: "open" })?;
+        use std::io::Write;
+        writeln!(
+            file,
+            "{} {}",
+            hex32(session_id.0),
+            token_inventory_state_code(state)
+        )
+        .map_err(|_| TokenPoolError::InventoryStoreIo { operation: "write" })?;
+        file.sync_data()
+            .map_err(|_| TokenPoolError::InventoryStoreIo { operation: "sync" })
+    }
+}
+
+#[cfg(feature = "std")]
+impl TokenInventoryStore for FileTokenInventory {
+    fn state(&self, session_id: SessionId) -> TokenInventoryState {
+        self.inner.state(session_id)
+    }
+
+    fn reserve(&mut self, session_id: SessionId) -> Result<(), TokenPoolError> {
+        if self.inner.state(session_id) != TokenInventoryState::Fresh {
+            return self.inner.reserve(session_id);
+        }
+        self.append_transition(session_id, TokenInventoryState::Reserved)?;
+        self.inner.reserve(session_id)
+    }
+
+    fn consume(&mut self, session_id: SessionId) -> Result<(), TokenPoolError> {
+        if self.inner.state(session_id) != TokenInventoryState::Reserved {
+            return self.inner.consume(session_id);
+        }
+        self.append_transition(session_id, TokenInventoryState::Consumed)?;
+        self.inner.consume(session_id)
+    }
+
+    fn erase(&mut self, session_id: SessionId) -> Result<(), TokenPoolError> {
+        if self.inner.state(session_id) != TokenInventoryState::Consumed {
+            return self.inner.erase(session_id);
+        }
+        self.append_transition(session_id, TokenInventoryState::Erased)?;
+        self.inner.erase(session_id)
+    }
+}
+
+#[cfg(feature = "std")]
+fn replay_token_inventory_transition(
+    inner: &mut TokenInventory,
+    session_id: SessionId,
+    state: TokenInventoryState,
+) -> Result<(), TokenPoolError> {
+    match state {
+        TokenInventoryState::Fresh => Err(TokenPoolError::InvalidInventoryTransition {
+            session_id,
+            from: inner.state(session_id),
+            to: TokenInventoryState::Fresh,
+        }),
+        TokenInventoryState::Reserved => inner.reserve(session_id),
+        TokenInventoryState::Consumed => inner.consume(session_id),
+        TokenInventoryState::Erased => inner.erase(session_id),
+    }
+}
+
+#[cfg(feature = "std")]
+fn token_inventory_state_code(state: TokenInventoryState) -> &'static str {
+    match state {
+        TokenInventoryState::Fresh => "fresh",
+        TokenInventoryState::Reserved => "reserved",
+        TokenInventoryState::Consumed => "consumed",
+        TokenInventoryState::Erased => "erased",
+    }
+}
+
+#[cfg(feature = "std")]
+fn parse_token_inventory_state_code(input: &str) -> Option<TokenInventoryState> {
+    match input {
+        "reserved" => Some(TokenInventoryState::Reserved),
+        "consumed" => Some(TokenInventoryState::Consumed),
+        "erased" => Some(TokenInventoryState::Erased),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "std")]
+fn parse_token_inventory_line(line: &str) -> Option<(SessionId, TokenInventoryState)> {
+    let mut parts = line.split_ascii_whitespace();
+    let session_id = parse_session_id_hex(parts.next()?)?;
+    let state = parse_token_inventory_state_code(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((session_id, state))
+}
+
+/// Vector-lane counters for production preprocessing certification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreprocessingCertificationCounters {
+    /// Number of tokens represented by this counter set.
+    pub token_count: usize,
+    /// Number of signers in each token.
+    pub signer_count: usize,
+    /// Number of coefficients per masked broadcast.
+    pub coeff_count: usize,
+    /// Total signer/coefficient lanes.
+    pub vector_lanes: usize,
+    /// Number of masked-broadcast openings.
+    pub masked_broadcasts: usize,
+    /// CarryCompare lanes certified.
+    pub carry_compare_lanes: usize,
+    /// CEF correction lanes certified.
+    pub cef_correction_lanes: usize,
+    /// BCC lanes certified.
+    pub bcc_lanes: usize,
+}
+
+impl PreprocessingCertificationCounters {
+    /// Builds counters from one certified token.
+    pub fn from_token(token: &CertifiedToken) -> Self {
+        let signer_count = token.signer_set.len();
+        let coeff_count = token.w1.len();
+        Self {
+            token_count: 1,
+            signer_count,
+            coeff_count,
+            vector_lanes: signer_count.saturating_mul(coeff_count),
+            masked_broadcasts: token.broadcasts.len(),
+            carry_compare_lanes: token
+                .certification_evidence
+                .carry_compare
+                .map(|item| item.coeff_count)
+                .unwrap_or_default(),
+            cef_correction_lanes: coeff_count,
+            bcc_lanes: token
+                .certification_evidence
+                .bcc
+                .map(|item| item.coeff_count)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Aggregates counters for a token batch.
+    pub fn from_tokens(tokens: &[CertifiedToken]) -> Self {
+        let mut out = Self::default();
+        out.token_count = tokens.len();
+        for token in tokens {
+            let item = Self::from_token(token);
+            out.signer_count = out.signer_count.max(item.signer_count);
+            out.coeff_count = out.coeff_count.max(item.coeff_count);
+            out.vector_lanes = out.vector_lanes.saturating_add(item.vector_lanes);
+            out.masked_broadcasts = out.masked_broadcasts.saturating_add(item.masked_broadcasts);
+            out.carry_compare_lanes = out
+                .carry_compare_lanes
+                .saturating_add(item.carry_compare_lanes);
+            out.cef_correction_lanes = out
+                .cef_correction_lanes
+                .saturating_add(item.cef_correction_lanes);
+            out.bcc_lanes = out.bcc_lanes.saturating_add(item.bcc_lanes);
+        }
+        out
+    }
+}
+
+/// Ensures preprocessing certification was vector/chunk-shaped enough for a
+/// production token pool. This gate intentionally checks evidence shape, not
+/// cryptographic proof soundness.
+pub fn ensure_preprocessing_counters_vectorized_for_release(
+    counters: PreprocessingCertificationCounters,
+) -> Result<(), PreprocessError> {
+    if counters.token_count == 0
+        || counters.signer_count == 0
+        || counters.coeff_count == 0
+        || counters.vector_lanes < counters.signer_count.saturating_mul(counters.coeff_count)
+        || counters.masked_broadcasts < counters.signer_count
+        || counters.carry_compare_lanes < counters.coeff_count
+        || counters.cef_correction_lanes < counters.coeff_count
+        || counters.bcc_lanes < counters.coeff_count
+    {
+        return Err(PreprocessError::PreprocessingCountersNotVectorized);
+    }
+    Ok(())
+}
+
+/// Converts preprocessing certification counters into the shared TALUS
+/// performance model.
+pub fn talus_performance_counters_from_preprocessing(
+    counters: PreprocessingCertificationCounters,
+) -> TalusPerformanceCounters {
+    TalusPerformanceCounters {
+        rounds: 1,
+        broadcasts: counters.masked_broadcasts as u64,
+        vector_lanes: counters.vector_lanes as u64,
+        chunks: counters.token_count as u64,
+        checked_lanes: counters
+            .carry_compare_lanes
+            .saturating_add(counters.cef_correction_lanes)
+            .saturating_add(counters.bcc_lanes) as u64,
+        token_batch_size: counters.token_count as u64,
+        ..TalusPerformanceCounters::default()
+    }
+}
+
 impl PreChallengeCertificationEvidence {
     /// Converts present evidence objects into an admission policy.
     pub fn policy(&self) -> PreChallengeCertificationPolicy {
@@ -995,6 +1703,12 @@ pub struct CertifiedToken {
     pub certification_evidence: PreChallengeCertificationEvidence,
     /// Pre-challenge certification policy used for admission.
     pub certification_policy: PreChallengeCertificationPolicy,
+    /// Durable production vector IT-MPC runtime certificate for preprocessing.
+    ///
+    /// This is optional for dev/test token construction, but release-capable
+    /// preprocessing output must attach it to the token itself so downstream
+    /// signing cannot lose the runtime evidence.
+    pub vector_runtime_certificate: Option<PreprocessingVectorRuntimeCertificate>,
 }
 
 impl fmt::Debug for CertifiedToken {
@@ -1009,11 +1723,32 @@ impl fmt::Debug for CertifiedToken {
             .field("broadcasts_len", &self.broadcasts.len())
             .field("certification_evidence", &self.certification_evidence)
             .field("certification_policy", &self.certification_policy)
+            .field(
+                "vector_runtime_certificate",
+                &self
+                    .vector_runtime_certificate
+                    .as_ref()
+                    .map(|_| "<present>"),
+            )
             .finish()
     }
 }
 
 impl CertifiedToken {
+    /// Attaches durable vector-runtime evidence to this certified token.
+    pub fn with_vector_runtime_certificate(
+        mut self,
+        certificate: PreprocessingVectorRuntimeCertificate,
+    ) -> Self {
+        self.vector_runtime_certificate = Some(certificate);
+        self
+    }
+
+    /// Returns the attached durable vector-runtime certificate, if present.
+    pub fn vector_runtime_certificate(&self) -> Option<&PreprocessingVectorRuntimeCertificate> {
+        self.vector_runtime_certificate.as_ref()
+    }
+
     /// Returns whether this token has passed preprocessing certification.
     pub fn is_certified(&self) -> bool {
         self.certification_policy == self.certification_evidence.policy()
@@ -1027,6 +1762,8 @@ impl CertifiedToken {
             && self.certification_policy.bcc_certified
             && self.certification_policy.persistent_session_store
             && self.certification_policy.no_post_challenge_nonce_reveal
+            && (!cfg!(feature = "production-release-checks")
+                || self.vector_runtime_certificate.is_some())
     }
 }
 
@@ -1046,6 +1783,26 @@ pub enum TokenPoolError {
     Duplicate(SessionId),
     /// No certified token exists for the requested session.
     Missing(SessionId),
+    /// Token inventory transition would make a token reusable or skip a
+    /// required durable state.
+    InvalidInventoryTransition {
+        /// Token session id.
+        session_id: SessionId,
+        /// Current state.
+        from: TokenInventoryState,
+        /// Requested next state.
+        to: TokenInventoryState,
+    },
+    /// Preprocessing-token inventory I/O failed.
+    InventoryStoreIo {
+        /// Storage operation.
+        operation: &'static str,
+    },
+    /// Preprocessing-token inventory log was malformed.
+    InventoryStoreCorrupt {
+        /// One-based line number.
+        line: usize,
+    },
 }
 
 /// Certified token pool.
@@ -1083,6 +1840,16 @@ impl TokenPool {
         Ok(())
     }
 
+    /// Reserves inventory state and inserts a certified token.
+    pub fn insert_certified_with_inventory(
+        &mut self,
+        token: CertifiedToken,
+        inventory: &mut impl TokenInventoryStore,
+    ) -> Result<(), TokenPoolError> {
+        inventory.reserve(token.session_id)?;
+        self.insert_certified(token)
+    }
+
     /// Removes and returns a certified token for one session.
     pub fn take_certified(
         &mut self,
@@ -1098,6 +1865,18 @@ impl TokenPool {
 
         self.sessions.retain(|&known| known != session_id);
         Ok(self.tokens.remove(idx))
+    }
+
+    /// Marks the token consumed in the inventory before returning it to online
+    /// signing. Callers must still use the online consumed-token store before
+    /// computing or sending any response share.
+    pub fn take_certified_for_consumption(
+        &mut self,
+        session_id: SessionId,
+        inventory: &mut impl TokenInventoryStore,
+    ) -> Result<CertifiedToken, TokenPoolError> {
+        inventory.consume(session_id)?;
+        self.take_certified(session_id)
     }
 
     /// Returns whether a certified token exists for one session.
@@ -1387,6 +2166,8 @@ pub enum PreprocessError {
     SessionCounterExhausted,
     /// Required pre-challenge preprocessing certification is incomplete.
     PreChallengeCertificationIncomplete,
+    /// Preprocessing evidence does not prove vector/chunk-shaped execution.
+    PreprocessingCountersNotVectorized,
     /// Preprocessing session received a private message, but this round uses broadcast only.
     UnexpectedPrivateMessage,
     /// Preprocessing session received a wire message for the wrong round or context.
@@ -1471,6 +2252,9 @@ impl fmt::Display for PreprocessError {
             Self::SessionCounterExhausted => write!(f, "session counter exhausted"),
             Self::PreChallengeCertificationIncomplete => {
                 write!(f, "pre-challenge certification incomplete")
+            }
+            Self::PreprocessingCountersNotVectorized => {
+                write!(f, "preprocessing counters are not vectorized")
             }
             Self::UnexpectedPrivateMessage => write!(
                 f,
@@ -1570,6 +2354,7 @@ fn certify_opened_masked_broadcasts_with_consistency<
 
     let signer_set: Vec<_> = inputs.iter().map(|input| input.party).collect();
     let coeff_count = inputs[0].highs.len();
+    #[cfg(any(test, feature = "paper-fast-dev"))]
     let mut clear_audits = Vec::with_capacity(inputs.len());
     let mut rhos_by_party = Vec::with_capacity(inputs.len());
 
@@ -1591,12 +2376,14 @@ fn certify_opened_masked_broadcasts_with_consistency<
                 input.party,
             ));
         }
+        #[cfg(any(test, feature = "paper-fast-dev"))]
         clear_audits.push(prepared.clear_audit.clone());
-        rhos_by_party.push(prepared.clear_audit.rhos);
+        rhos_by_party.push(prepared.rhos);
     }
 
     let broadcasts = open_broadcasts(session_id, &envelopes, expected_transcript)?;
     for broadcast in &broadcasts {
+        #[cfg(any(test, feature = "paper-fast-dev"))]
         let idx = inputs
             .iter()
             .position(|input| input.party == broadcast.party)
@@ -1615,16 +2402,20 @@ fn certify_opened_masked_broadcasts_with_consistency<
             broadcast: broadcast.clone(),
             coeff_count,
         };
+        #[cfg(any(test, feature = "paper-fast-dev"))]
         let clear_audit = if verifier.requires_clear_audit() {
             Some(&clear_audits[idx])
         } else {
             None
         };
+        #[cfg(any(test, feature = "paper-fast-dev"))]
         verifier.verify_masked_broadcast::<P>(
             &statement,
             &envelope.consistency_proof,
             clear_audit,
         )?;
+        #[cfg(not(any(test, feature = "paper-fast-dev")))]
+        verifier.verify_masked_broadcast::<P>(&statement, &envelope.consistency_proof)?;
     }
 
     let cef_output = certify_vector_carry_compare_and_cef::<P>(
@@ -1666,6 +2457,7 @@ fn certify_opened_masked_broadcasts_with_consistency<
         broadcasts,
         certification_evidence,
         certification_policy,
+        vector_runtime_certificate: None,
     })
 }
 
@@ -1739,11 +2531,12 @@ fn prepare_masked_broadcast_envelope_with_audit<P: MlDsaParams>(
     let salt = salt(session_id, input.party);
     let commitment = masked_broadcast_commitment(session_id, &message, salt);
     let consistency_proof = production_masked_broadcast_consistency_proof::<P>(&statement);
+    #[cfg(any(test, feature = "paper-fast-dev"))]
     let clear_audit = MaskedBroadcastClearAudit {
         highs: input.highs.clone(),
         lows: input.lows.clone(),
         high_masks,
-        rhos,
+        rhos: rhos.clone(),
         rho_bits_commitment: input.randomness_commitment,
     };
     Ok(PreparedMaskedBroadcast {
@@ -1753,6 +2546,8 @@ fn prepare_masked_broadcast_envelope_with_audit<P: MlDsaParams>(
             consistency_proof,
             salt,
         },
+        rhos,
+        #[cfg(any(test, feature = "paper-fast-dev"))]
         clear_audit,
     })
 }
@@ -1838,48 +2633,6 @@ pub fn open_broadcasts(
     Ok(broadcasts)
 }
 
-fn verify_clear_masked_broadcast<P: MlDsaParams>(
-    statement: &MaskedBroadcastConsistencyStatement,
-    audit: &MaskedBroadcastClearAudit,
-) -> Result<(), PreprocessError> {
-    let party = statement.broadcast.party;
-    if statement.signer_set.is_empty()
-        || !statement.signer_set.contains(&party)
-        || statement.broadcast.masked_highs.len() != statement.coeff_count
-        || statement.broadcast.masked_lows.len() != statement.coeff_count
-        || audit.highs.len() != statement.coeff_count
-        || audit.lows.len() != statement.coeff_count
-        || audit.high_masks.len() != statement.coeff_count
-        || audit.rhos.len() != statement.coeff_count
-        || statement.broadcast.rho_bits_commitment != audit.rho_bits_commitment
-    {
-        return Err(PreprocessError::MaskedBroadcastConsistencyMismatch(party));
-    }
-
-    let high_mod = P::HIGH_MOD as u32;
-    let alpha = P::alpha() as u32;
-    let rho_bound = (alpha / statement.signer_set.len() as u32).max(1);
-    for coeff in 0..statement.coeff_count {
-        let high = audit.highs[coeff];
-        let low = audit.lows[coeff];
-        let high_mask = audit.high_masks[coeff];
-        let rho = audit.rhos[coeff];
-        if high >= high_mod || high_mask >= high_mod || low >= alpha || rho >= rho_bound {
-            return Err(PreprocessError::MaskedBroadcastConsistencyMismatch(party));
-        }
-
-        let expected_high = (high + high_mask) % high_mod;
-        let expected_low = low + rho;
-        if statement.broadcast.masked_highs[coeff] != expected_high
-            || statement.broadcast.masked_lows[coeff] != expected_low
-        {
-            return Err(PreprocessError::MaskedBroadcastConsistencyMismatch(party));
-        }
-    }
-
-    Ok(())
-}
-
 fn verify_private_certified_masked_broadcast<P: MlDsaParams>(
     statement: &MaskedBroadcastConsistencyStatement,
     proof: &MaskedBroadcastConsistencyProof,
@@ -1931,7 +2684,6 @@ fn certify_vector_carry_compare_and_cef<P: MlDsaParams>(
         return Err(PreprocessError::CoeffCountMismatch);
     }
     let coeff_count = broadcasts[0].masked_highs.len();
-    let aggregate_ay_witness = aggregate_ay_witness_coeffs::<P>(inputs, coeff_count)?;
     let alpha = P::alpha() as u64;
     let gamma2 = P::GAMMA2 as i64;
     let high_mod = P::HIGH_MOD as u64;
@@ -1962,12 +2714,7 @@ fn certify_vector_carry_compare_and_cef<P: MlDsaParams>(
         let clear_low_sum = b
             .checked_sub(r)
             .ok_or(PreprocessError::CarryCompareCertificationFailed)?;
-        let w_coeff = aggregate_ay_witness
-            .as_ref()
-            .map(|witness| witness[coeff])
-            .unwrap_or_else(|| {
-                reduce_mod_q_i64::<P>((alpha * sum_high) as i64 + clear_low_sum as i64)
-            });
+        let w_coeff = reduce_mod_q_i64::<P>((alpha * sum_high) as i64 + clear_low_sum as i64);
         if !bcc_holds_coeff::<P>(w_coeff) {
             return Err(PreprocessError::BoundaryClearanceFailed);
         }
@@ -2011,42 +2758,6 @@ fn certify_vector_carry_compare_and_cef<P: MlDsaParams>(
             evidence_hash: bcc_hash,
         },
     })
-}
-
-fn aggregate_ay_witness_coeffs<P: MlDsaParams>(
-    inputs: &[PartyPreprocessInput],
-    coeff_count: usize,
-) -> Result<Option<Vec<Coeff>>, PreprocessError> {
-    if !inputs.iter().all(|input| input.ay_contribution.is_some()) {
-        return Ok(None);
-    }
-
-    let mut aggregate = vec![0; coeff_count];
-    for input in inputs {
-        let witness = input
-            .ay_contribution
-            .as_ref()
-            .ok_or(PreprocessError::CoeffCountMismatch)?;
-        if witness.len() != P::K {
-            return Err(PreprocessError::CoeffCountMismatch);
-        }
-        let mut coeff_idx = 0usize;
-        for poly in witness.polys() {
-            for &coeff in poly.coeffs() {
-                if coeff_idx >= coeff_count {
-                    return Err(PreprocessError::CoeffCountMismatch);
-                }
-                let sum = i64::from(aggregate[coeff_idx]) + i64::from(coeff);
-                aggregate[coeff_idx] = sum.rem_euclid(i64::from(P::Q)) as Coeff;
-                coeff_idx += 1;
-            }
-        }
-        if coeff_idx != coeff_count {
-            return Err(PreprocessError::CoeffCountMismatch);
-        }
-    }
-
-    Ok(Some(aggregate))
 }
 
 fn hash_vector_carry_compare_evidence<P: MlDsaParams>(
@@ -2277,6 +2988,95 @@ fn nonce_it_vss_label_index(session_id: SessionId) -> u32 {
     hasher.update(session_id.0);
     let digest: [u8; 32] = hasher.finalize().into();
     u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
+}
+
+fn nonce_residues_for_dealer<P: MlDsaParams>(
+    options: &DistributedNonceGenerationOptions,
+    dealer: PartyId,
+) -> Result<Vec<u32>, PreprocessError> {
+    if !options.dkg_config.parties.contains(&dealer) {
+        return Err(PreprocessError::UnknownParty(dealer));
+    }
+    let coeff_count = P::L * P::N;
+    let modulus = nonce_residue_modulus::<P>()?;
+    Ok((0..coeff_count)
+        .map(|index| {
+            nonce_residue::<P>(
+                options.nonce_entropy,
+                options.session_id,
+                options.dkg_config.transcript_hash().0,
+                dealer,
+                index,
+                modulus,
+            )
+        })
+        .collect())
+}
+
+fn nonce_residues_for_all_dealers<P: MlDsaParams>(
+    options: &DistributedNonceGenerationOptions,
+) -> Result<Vec<Vec<u32>>, PreprocessError> {
+    options
+        .dkg_config
+        .parties
+        .iter()
+        .copied()
+        .map(|dealer| nonce_residues_for_dealer::<P>(options, dealer))
+        .collect()
+}
+
+fn distributed_nonce_coefficients<P: MlDsaParams>(
+    options: &DistributedNonceGenerationOptions,
+) -> Result<Vec<Coeff>, PreprocessError> {
+    let coeff_count = P::L * P::N;
+    let modulus = nonce_residue_modulus::<P>()?;
+    let dealer_residues = nonce_residues_for_all_dealers::<P>(options)?;
+    let mut nonce_coefficients = Vec::with_capacity(coeff_count);
+    for index in 0..coeff_count {
+        let sum = dealer_residues
+            .iter()
+            .fold(0u64, |acc, residues| acc + u64::from(residues[index]))
+            % u64::from(modulus);
+        let signed = sum as Coeff - (P::GAMMA1 - 1);
+        nonce_coefficients.push(reduce_mod_q::<P>(signed));
+    }
+    Ok(nonce_coefficients)
+}
+
+fn distributed_nonce_share_for_party<P: MlDsaParams>(
+    options: &DistributedNonceGenerationOptions,
+    party: PartyId,
+    evidence: &DistributedNonceGenerationEvidence,
+) -> Result<DistributedNonceShare, PreprocessError> {
+    let nonce_coefficients = distributed_nonce_coefficients::<P>(options)?;
+    let party_coeffs = share_nonce_coefficients::<P>(options, &nonce_coefficients)
+        .map_err(map_nonce_dkg_error)?
+        .into_iter()
+        .find(|(candidate, _)| *candidate == party)
+        .map(|(_, coeffs)| coeffs)
+        .ok_or(PreprocessError::UnknownParty(party))?;
+    distributed_nonce_share_from_coeffs::<P>(options, evidence, party, &party_coeffs)
+}
+
+fn distributed_nonce_share_from_coeffs<P: MlDsaParams>(
+    options: &DistributedNonceGenerationOptions,
+    evidence: &DistributedNonceGenerationEvidence,
+    party: PartyId,
+    coeffs: &[Coeff],
+) -> Result<DistributedNonceShare, PreprocessError> {
+    let y_share = coeffs_to_nonce_polyvec::<P>(coeffs)?;
+    let ay_for_commitment = az_from_rho::<P>(&options.rho, &y_share)
+        .map_err(|_| PreprocessError::NonceGenerationFailed)?;
+    let nonce_commitment =
+        distributed_nonce_commitment::<P>(options.session_id, party, &ay_for_commitment);
+    let randomness_commitment =
+        distributed_nonce_randomness_commitment::<P>(options.session_id, party, evidence);
+    Ok(DistributedNonceShare {
+        party,
+        y_share,
+        nonce_commitment,
+        randomness_commitment,
+    })
 }
 
 fn nonce_it_vss_secret<P: MlDsaParams>(
@@ -2804,6 +3604,9 @@ impl fmt::Display for Hex32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_dev::{
+        ClearMaskedBroadcastConsistencyVerifier, CutAndChooseAuditPlan, MaskedBroadcastClearAudit,
+    };
     use talus_core::{cef_w1_clear_coeff, MlDsa65};
 
     fn session(byte: u8) -> SessionId {
@@ -2819,6 +3622,38 @@ mod tests {
             ay_contribution: None,
             nonce_commitment: NonceCommitment([party as u8; 32]),
             randomness_commitment: Commitment([(party + 10) as u8; 32]),
+        }
+    }
+
+    fn release_vector_runtime_evidence() -> ProductionVectorItMpcRuntimeEvidence {
+        ProductionVectorItMpcRuntimeEvidence {
+            counters: talus_dkg::PrimeFieldMpcCounters {
+                rounds: 9,
+                private_messages: 3,
+                broadcasts: 3,
+                wire_bytes: 512,
+                durable_log_bytes: 1024,
+                vector_lanes: 128,
+                multiplication_layers: 4,
+                vector_mul_lanes: 64,
+                vector_opening_lanes: 16,
+                vector_assert_zero_lanes: 16,
+                random_bits: 16,
+                local_public_mul_lanes: 16,
+                ..talus_dkg::PrimeFieldMpcCounters::default()
+            },
+            coverage: talus_dkg::ProductionVectorItMpcRuntimeCoverage {
+                open_many_checked: true,
+                assert_zero_vec: true,
+                assert_bit_vec: true,
+                random_bit_vec: true,
+                mul_vec: true,
+                comparison_to_public: true,
+                equality_to_public: true,
+                bit_sum_or_threshold_check: true,
+                private_one_hot_selection: true,
+            },
+            transcript_hash: [0x5a; 32],
         }
     }
 
@@ -3134,9 +3969,12 @@ mod tests {
             assert_eq!(share.y_share.len(), MlDsa65::L);
             let expected_ay =
                 az_from_rho::<MlDsa65>(&rho, &share.y_share).expect("A*y_i commitment");
-            assert_eq!(share.ay_commitment, expected_ay);
+            let expected_nonce_commitment =
+                distributed_nonce_commitment::<MlDsa65>(session_id, share.party, &expected_ay);
+            assert_eq!(share.nonce_commitment, expected_nonce_commitment);
             let debug = format!("{share:?}");
             assert!(debug.contains("y_share: \"<redacted>\""));
+            assert!(!debug.contains("ay_commitment"));
         }
 
         assert_eq!(tokens[0].session_id, session_id);
@@ -3170,6 +4008,76 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(tokens[0].w1, expected_w1);
+    }
+
+    #[test]
+    fn distributed_nonce_generation_session_routes_private_and_broadcast_artifacts() {
+        let config = talus_dkg::DkgConfig::new::<MlDsa65>(
+            2,
+            vec![PartyId(1), PartyId(2), PartyId(3)],
+            talus_dkg::KeygenEpoch(11),
+        )
+        .expect("dkg config");
+        let options = DistributedNonceGenerationOptions {
+            session_id: session(182),
+            dkg_config: config.clone(),
+            rho: [0x6a; 32],
+            nonce_entropy: [0x41; 32],
+            it_vss_entropy: [0x42; 32],
+            it_vss_security: talus_dkg::ProductionItVssSecurityParams {
+                audit_tags: 1,
+                retained_tags: 1,
+                consistency_rounds: 1,
+                max_vector_lanes_per_chunk: 32_000,
+                max_private_delivery_bytes: 16 * 1024 * 1024,
+            },
+        };
+        let expected =
+            generate_distributed_nonce_shares::<MlDsa65>(options.clone()).expect("expected output");
+        let mut sessions = config
+            .parties
+            .iter()
+            .copied()
+            .map(|party| {
+                DistributedNonceGenerationSession::<MlDsa65>::start(options.clone(), party)
+                    .expect("start nonce generation session")
+            })
+            .collect::<Vec<_>>();
+
+        route_nonce_generation(&mut sessions);
+
+        let outputs = sessions
+            .into_iter()
+            .map(|session| session.finish().expect("finish nonce generation"))
+            .collect::<Vec<_>>();
+
+        let reference_evidence = outputs[0].evidence.clone();
+        for output in &outputs {
+            assert_eq!(
+                output.evidence.public_commitment_hash,
+                reference_evidence.public_commitment_hash
+            );
+            assert_eq!(
+                output.evidence.complaint_resolution_hash,
+                reference_evidence.complaint_resolution_hash
+            );
+            let expected_share = expected
+                .shares
+                .iter()
+                .find(|share| share.party == output.share.party)
+                .expect("expected party share");
+            assert_eq!(output.share.party, expected_share.party);
+            assert_eq!(output.share.y_share, expected_share.y_share);
+            assert_eq!(
+                output.share.nonce_commitment,
+                expected_share.nonce_commitment
+            );
+            assert_ne!(output.share.randomness_commitment, Commitment([0; 32]));
+            assert_eq!(
+                output.evidence.complaint_resolution.rejected_dealers,
+                vec![]
+            );
+        }
     }
 
     #[test]
@@ -3224,6 +4132,53 @@ mod tests {
                     }
                     PreprocessingOutbound::Private { .. } => {
                         panic!("preprocessing session should not emit private messages")
+                    }
+                }
+            }
+        }
+    }
+
+    fn route_nonce_generation<P: MlDsaParams>(
+        sessions: &mut [DistributedNonceGenerationSession<P>],
+    ) {
+        loop {
+            let mut outbounds = Vec::new();
+            for session in sessions.iter_mut() {
+                while let Some(outbound) = session.next_outbound() {
+                    outbounds.push(outbound);
+                }
+            }
+            if outbounds.is_empty() {
+                break;
+            }
+            for outbound in outbounds {
+                match outbound {
+                    DistributedNonceGenerationOutbound::Private { receiver, delivery } => {
+                        let session = sessions
+                            .iter_mut()
+                            .find(|session| session.local_party == receiver)
+                            .expect("receiver session");
+                        session
+                            .handle_private(delivery.dealer, delivery)
+                            .expect("deliver private nonce VSS artifact");
+                    }
+                    DistributedNonceGenerationOutbound::Broadcast { artifact } => {
+                        let sender = match &artifact {
+                            DistributedNonceGenerationBroadcast::PublicPrecommitment(item) => {
+                                item.dealer
+                            }
+                            DistributedNonceGenerationBroadcast::PublicCoinShare(item) => {
+                                item.party
+                            }
+                            DistributedNonceGenerationBroadcast::PublicCommitment(item) => {
+                                item.dealer
+                            }
+                        };
+                        for session in sessions.iter_mut() {
+                            session
+                                .handle_broadcast(sender, artifact.clone())
+                                .expect("deliver nonce generation broadcast");
+                        }
                     }
                 }
             }
@@ -3602,6 +4557,211 @@ mod tests {
     }
 
     #[test]
+    fn token_inventory_enforces_monotonic_preprocessing_lifecycle() {
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(63),
+            vec![input(1, &[1], &[3]), input(2, &[5], &[7])],
+        )
+        .expect("valid preprocessing certifies");
+        let mut pool = TokenPool::new();
+        let mut inventory = TokenInventory::new();
+
+        assert_eq!(inventory.state(session(63)), TokenInventoryState::Fresh);
+        pool.insert_certified_with_inventory(token, &mut inventory)
+            .expect("reserve and insert certified token");
+        assert_eq!(inventory.state(session(63)), TokenInventoryState::Reserved);
+        let consumed = pool
+            .take_certified_for_consumption(session(63), &mut inventory)
+            .expect("consume before online use");
+        assert_eq!(consumed.session_id, session(63));
+        assert_eq!(inventory.state(session(63)), TokenInventoryState::Consumed);
+        assert_eq!(inventory.erase(session(63)), Ok(()));
+        assert_eq!(inventory.state(session(63)), TokenInventoryState::Erased);
+        assert!(matches!(
+            inventory.reserve(session(63)),
+            Err(TokenPoolError::InvalidInventoryTransition {
+                from: TokenInventoryState::Erased,
+                to: TokenInventoryState::Reserved,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn file_token_inventory_persists_consumed_state_across_restart() {
+        let path = test_store_path("token-inventory");
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(83),
+            vec![input(1, &[1], &[3]), input(2, &[5], &[7])],
+        )
+        .expect("valid preprocessing certifies");
+        let mut pool = TokenPool::new();
+
+        {
+            let mut inventory = FileTokenInventory::open(&path).expect("open inventory");
+            pool.insert_certified_with_inventory(token, &mut inventory)
+                .expect("reserve and insert certified token");
+            assert_eq!(inventory.state(session(83)), TokenInventoryState::Reserved);
+            let consumed = pool
+                .take_certified_for_consumption(session(83), &mut inventory)
+                .expect("consume token durably before online use");
+            assert_eq!(consumed.session_id, session(83));
+            assert_eq!(inventory.state(session(83)), TokenInventoryState::Consumed);
+        }
+
+        let mut reopened = FileTokenInventory::open(&path).expect("reopen inventory");
+        assert_eq!(reopened.state(session(83)), TokenInventoryState::Consumed);
+        assert!(matches!(
+            reopened.reserve(session(83)),
+            Err(TokenPoolError::InvalidInventoryTransition {
+                from: TokenInventoryState::Consumed,
+                to: TokenInventoryState::Reserved,
+                ..
+            })
+        ));
+        reopened.erase(session(83)).expect("erase consumed token");
+
+        let reopened = FileTokenInventory::open(&path).expect("reopen erased inventory");
+        assert_eq!(reopened.state(session(83)), TokenInventoryState::Erased);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn file_token_inventory_rejects_corrupt_and_rollback_logs() {
+        let path = test_store_path("token-inventory-corrupt");
+        std::fs::write(&path, "not-a-session reserved\n").expect("write corrupt log");
+        assert_eq!(
+            FileTokenInventory::open(&path),
+            Err(TokenPoolError::InventoryStoreCorrupt { line: 1 })
+        );
+
+        let path = test_store_path("token-inventory-rollback");
+        std::fs::write(
+            &path,
+            format!(
+                "{} reserved\n{} consumed\n{} reserved\n",
+                hex32(session(84).0),
+                hex32(session(84).0),
+                hex32(session(84).0)
+            ),
+        )
+        .expect("write rollback log");
+        assert_eq!(
+            FileTokenInventory::open(&path),
+            Err(TokenPoolError::InventoryStoreCorrupt { line: 3 })
+        );
+    }
+
+    #[test]
+    fn preprocessing_certification_counters_gate_vectorized_tokens() {
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(64),
+            vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])],
+        )
+        .expect("valid preprocessing certifies");
+        let counters = PreprocessingCertificationCounters::from_token(&token);
+
+        assert_eq!(counters.token_count, 1);
+        assert_eq!(counters.signer_count, 2);
+        assert_eq!(counters.coeff_count, 2);
+        assert_eq!(counters.vector_lanes, 4);
+        assert_eq!(counters.masked_broadcasts, 2);
+        assert_eq!(counters.carry_compare_lanes, 2);
+        assert_eq!(counters.cef_correction_lanes, 2);
+        assert_eq!(counters.bcc_lanes, 2);
+        assert_eq!(
+            ensure_preprocessing_counters_vectorized_for_release(counters),
+            Ok(())
+        );
+        let shared = talus_performance_counters_from_preprocessing(counters);
+        assert_eq!(shared.token_batch_size, 1);
+        assert_eq!(shared.broadcasts, 2);
+        assert_eq!(shared.vector_lanes, 4);
+        assert_eq!(shared.checked_lanes, 6);
+        assert_eq!(shared.scalar_operations, 0);
+        assert_eq!(
+            ensure_preprocessing_counters_vectorized_for_release(
+                PreprocessingCertificationCounters {
+                    token_count: 1,
+                    signer_count: 2,
+                    coeff_count: 2,
+                    vector_lanes: 1,
+                    masked_broadcasts: 2,
+                    carry_compare_lanes: 2,
+                    cef_correction_lanes: 2,
+                    bcc_lanes: 2,
+                },
+            ),
+            Err(PreprocessError::PreprocessingCountersNotVectorized)
+        );
+    }
+
+    #[test]
+    fn preprocessing_token_batch_all_suites_enters_strict_pool_with_inventory() {
+        fn check<P: MlDsaParams>(base: u8) {
+            let mut registry = SessionRegistry::new();
+            let mut pool = TokenPool::new();
+            let mut inventory = TokenInventory::new();
+            let mut tokens = Vec::new();
+
+            for offset in 0..2u8 {
+                let session_id = session(base.wrapping_add(offset));
+                let token = certify_preprocessing_token::<P>(
+                    &mut registry,
+                    session_id,
+                    vec![
+                        PartyPreprocessInput {
+                            party: PartyId(1),
+                            highs: vec![0; P::K * P::N],
+                            lows: vec![1; P::K * P::N],
+                            y_share: Vec::new(),
+                            ay_contribution: None,
+                            nonce_commitment: NonceCommitment([1u8.wrapping_add(offset); 32]),
+                            randomness_commitment: Commitment([11u8.wrapping_add(offset); 32]),
+                        },
+                        PartyPreprocessInput {
+                            party: PartyId(2),
+                            highs: vec![0; P::K * P::N],
+                            lows: vec![2; P::K * P::N],
+                            y_share: Vec::new(),
+                            ay_contribution: None,
+                            nonce_commitment: NonceCommitment([2u8.wrapping_add(offset); 32]),
+                            randomness_commitment: Commitment([12u8.wrapping_add(offset); 32]),
+                        },
+                    ],
+                )
+                .expect("token certifies");
+                assert!(token.is_certified());
+                pool.insert_certified_with_inventory(token, &mut inventory)
+                    .expect("insert with inventory");
+                tokens.push(pool.take_certified(session_id).expect("take for counter"));
+                assert_eq!(inventory.state(session_id), TokenInventoryState::Reserved);
+            }
+
+            let counters = PreprocessingCertificationCounters::from_tokens(&tokens);
+            assert_eq!(counters.token_count, 2);
+            assert_eq!(counters.signer_count, 2);
+            assert_eq!(counters.coeff_count, P::K * P::N);
+            assert_eq!(counters.vector_lanes, 2 * 2 * P::K * P::N);
+            assert_eq!(
+                ensure_preprocessing_counters_vectorized_for_release(counters),
+                Ok(())
+            );
+        }
+
+        check::<MlDsa44>(80);
+        check::<MlDsa65>(90);
+        check::<MlDsa87>(100);
+    }
+
+    #[test]
     fn pre_challenge_certification_policy_gates_token_admission() {
         let complete = PreChallengeCertificationPolicy {
             masked_broadcast_consistency: true,
@@ -3634,6 +4794,61 @@ mod tests {
         assert_eq!(
             pool.insert_certified(token),
             Err(TokenPoolError::NotCertified(session(61)))
+        );
+    }
+
+    #[test]
+    fn certified_token_carries_preprocessing_runtime_certificate_on_output() {
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(64),
+            vec![input(1, &[1], &[3]), input(2, &[5], &[7])],
+        )
+        .expect("valid preprocessing certifies");
+        #[cfg(feature = "production-release-checks")]
+        assert!(
+            !token.is_certified(),
+            "release tokens must carry vector runtime evidence"
+        );
+
+        let certificate =
+            PreprocessingVectorRuntimeCertificate::new(release_vector_runtime_evidence())
+                .expect("release vector runtime certificate");
+        let token = token.with_vector_runtime_certificate(certificate.clone());
+        assert_eq!(token.vector_runtime_certificate(), Some(&certificate));
+        assert!(token.is_certified());
+    }
+
+    #[test]
+    fn post_challenge_reveal_policy_is_required_for_token_admission() {
+        let mut registry = SessionRegistry::new();
+        let mut token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(62),
+            vec![input(1, &[1], &[3]), input(2, &[5], &[7])],
+        )
+        .expect("valid preprocessing certifies");
+
+        token.certification_evidence.nonce_reveal_policy = Some(NonceRevealPolicyEvidence {
+            session_id: token.session_id,
+            post_challenge_reveal_disabled: false,
+            evidence_hash: [0x91; 32],
+        });
+        token.certification_policy = token.certification_evidence.policy();
+
+        assert!(!token.is_certified());
+        assert_eq!(
+            ensure_pre_challenge_certification_evidence(
+                token.session_id,
+                &token.certification_evidence
+            ),
+            Err(PreprocessError::PreChallengeCertificationIncomplete)
+        );
+        let mut pool = TokenPool::new();
+        assert_eq!(
+            pool.insert_certified(token),
+            Err(TokenPoolError::NotCertified(session(62)))
         );
     }
 

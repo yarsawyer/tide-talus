@@ -14,6 +14,7 @@ serde-wire = []
 test-dealer = []
 bench = []
 fips204-adapter = ["talus-core/fips204-adapter"]
+paper-fast-dev = ["talus-mpc/paper-fast-dev", "talus-wire/paper-fast-dev"]
 
 [dependencies]
 talus-core = { path = "../talus-core", default-features = false }

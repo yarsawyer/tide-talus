@@ -206,15 +206,6 @@ pub struct VssCommitment {
 #[deprecated(note = "use VssCommitment; production VSS is information-theoretic, not Pedersen")]
 pub type PedersenCommitment = VssCommitment;
 
-/// Public commitment to one party's `A * s1_i` contribution.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct As1Commitment {
-    /// Party whose secret share is committed.
-    pub party: PartyId,
-    /// Serialized `A * s1_i` commitment vector.
-    pub bytes: Vec<u8>,
-}
-
 /// Public commitment to pairwise seed setup material.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PairwiseSeedCommitment {
@@ -239,8 +230,6 @@ pub struct DkgPublicOutput {
     pub t1: Vec<u8>,
     /// Accepted VSS commitments.
     pub vss_commitments: Vec<VssCommitment>,
-    /// Accepted `A * s1_i` commitments for online partial verification.
-    pub as1_commitments: Vec<As1Commitment>,
     /// Accepted pairwise seed commitments for preprocessing/triple derivation.
     pub pairwise_seed_commitments: Vec<PairwiseSeedCommitment>,
 }
@@ -266,11 +255,6 @@ impl DkgPublicOutput {
         }
         validate_commitment_party_set(
             &self.config,
-            self.as1_commitments.iter().map(|item| item.party),
-            CommitmentSet::As1,
-        )?;
-        validate_commitment_party_set(
-            &self.config,
             self.pairwise_seed_commitments.iter().map(|item| item.party),
             CommitmentSet::PairwiseSeed,
         )?;
@@ -290,12 +274,6 @@ impl DkgPublicOutput {
         hash_len_prefixed_vecs(
             &mut hasher,
             self.vss_commitments.iter().map(|item| &item.bytes),
-        );
-        hash_party_vecs(
-            &mut hasher,
-            self.as1_commitments
-                .iter()
-                .map(|item| (item.party, &item.bytes)),
         );
         hasher.update((self.pairwise_seed_commitments.len() as u32).to_le_bytes());
         for item in &self.pairwise_seed_commitments {

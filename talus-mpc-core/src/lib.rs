@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 #![doc = "Malicious-secure MPC primitives for TALUS."]
+//!
+//! This crate contains low-level authenticated-share, Beaver multiplication,
+//! bit, and CarryCompare primitives. Test dealers and local certification
+//! helpers are not production setup protocols; production TALUS uses higher
+//! level honest-majority IT-MPC/VSS runtime evidence before release.
 
 #[cfg(all(feature = "test-dealer", not(debug_assertions)))]
 compile_error!("the `test-dealer` feature is test-only and must not be enabled in release builds");

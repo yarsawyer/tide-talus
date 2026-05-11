@@ -13,7 +13,7 @@ alloc = ["talus-core/alloc"]
 serde-wire = []
 production-release-checks = []
 bench = []
-scaffold-dev = []
+scaffold-dev = ["talus-wire/paper-fast-dev"]
 fips204-adapter = ["talus-core/fips204-adapter"]
 
 [dependencies]
@@ -22,6 +22,9 @@ talus-core = { path = "../talus-core", default-features = false }
 talus-mpc-core = { path = "../talus-mpc-core", default-features = false }
 talus-wire = { path = "../talus-wire", default-features = false }
 zeroize.workspace = true
+
+[dev-dependencies]
+talus-wire = { path = "../talus-wire", default-features = false, features = ["paper-fast-dev"] }
 
 [lints]
 workspace = true

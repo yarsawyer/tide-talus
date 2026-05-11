@@ -1,5 +1,20 @@
 #![forbid(unsafe_code)]
 #![doc = "Canonical TALUS wire encodings and transport traits."]
+//!
+//! This crate defines canonical TALUS wire encodings, context binding, and
+//! app-facing transport traits. It intentionally does not implement sockets,
+//! TCP, QUIC, libp2p, retry policy, or deployment key management.
+//!
+//! Normal builds expose production wire domains such as strict signing MPC,
+//! DKG, preprocessing commit/open, and final signature messages. Paper-fast
+//! partial-signature payloads are test/dev only under `cfg(test)` or the
+//! explicit non-production `paper-fast-dev` feature, and
+//! `production-release-checks` refuses to build with that feature enabled.
+
+#[cfg(all(feature = "production-release-checks", feature = "paper-fast-dev"))]
+compile_error!(
+    "production-release-checks must not be built with paper-fast-dev insecure primitives"
+);
 
 use core::fmt;
 
@@ -44,6 +59,7 @@ pub enum RoundId {
     /// Online signing request round.
     SignRequest = 3,
     /// Online partial signature round.
+    #[cfg(any(test, feature = "paper-fast-dev"))]
     SignPartial = 4,
     /// Final signature announcement round.
     SignFinal = 5,
@@ -61,6 +77,8 @@ pub enum RoundId {
     DkgPrimeFieldMpc = 11,
     /// DKG IT-VSS public artifact persistence round.
     DkgItVssArtifact = 12,
+    /// Strict signing private MPC runtime round.
+    StrictSignMpc = 13,
 }
 
 impl RoundId {
@@ -69,6 +87,7 @@ impl RoundId {
             1 => Ok(Self::PreprocessCommit),
             2 => Ok(Self::PreprocessOpen),
             3 => Ok(Self::SignRequest),
+            #[cfg(any(test, feature = "paper-fast-dev"))]
             4 => Ok(Self::SignPartial),
             5 => Ok(Self::SignFinal),
             6 => Ok(Self::DkgCommit),
@@ -78,6 +97,7 @@ impl RoundId {
             10 => Ok(Self::DkgSmallResidue),
             11 => Ok(Self::DkgPrimeFieldMpc),
             12 => Ok(Self::DkgItVssArtifact),
+            13 => Ok(Self::StrictSignMpc),
             _ => Err(WireError::UnknownRound(value)),
         }
     }
@@ -93,6 +113,7 @@ pub enum PayloadKind {
     /// Online signing request.
     SignRequest = 3,
     /// Online partial signature.
+    #[cfg(any(test, feature = "paper-fast-dev"))]
     PartialSignature = 4,
     /// Final signature.
     FinalSignature = 5,
@@ -110,6 +131,8 @@ pub enum PayloadKind {
     DkgPrimeFieldMpc = 11,
     /// DKG IT-VSS public artifact payload.
     DkgItVssArtifact = 12,
+    /// Strict signing private MPC runtime payload.
+    StrictSignMpc = 13,
 }
 
 impl PayloadKind {
@@ -118,6 +141,7 @@ impl PayloadKind {
             1 => Ok(Self::PreprocessCommit),
             2 => Ok(Self::MaskedBroadcastOpen),
             3 => Ok(Self::SignRequest),
+            #[cfg(any(test, feature = "paper-fast-dev"))]
             4 => Ok(Self::PartialSignature),
             5 => Ok(Self::FinalSignature),
             6 => Ok(Self::DkgCommit),
@@ -127,6 +151,7 @@ impl PayloadKind {
             10 => Ok(Self::DkgSmallResidue),
             11 => Ok(Self::DkgPrimeFieldMpc),
             12 => Ok(Self::DkgItVssArtifact),
+            13 => Ok(Self::StrictSignMpc),
             _ => Err(WireError::UnknownPayloadKind(value)),
         }
     }
@@ -201,13 +226,42 @@ pub struct SignRequestPayload {
     pub token_transcript_hash: [u8; 32],
 }
 
-/// Partial signature payload.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PartialSignaturePayload {
-    /// Challenge seed.
-    pub ctilde: Vec<u8>,
-    /// Encoded partial response.
-    pub z_share: Vec<u8>,
+/// Test/dev-only wire payloads for paper-fast compatibility paths.
+///
+/// This module is intentionally absent from normal production builds. The
+/// partial-signature payload carries clear `z_i` material and must not be part
+/// of production transport.
+#[cfg(any(test, feature = "paper-fast-dev"))]
+pub mod dev_backends {
+    use super::{put_bytes, Cursor, WireError};
+
+    /// Partial signature payload.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct PartialSignaturePayload {
+        /// Challenge seed.
+        pub ctilde: Vec<u8>,
+        /// Encoded partial response.
+        pub z_share: Vec<u8>,
+    }
+
+    /// Encodes a partial signature payload.
+    pub fn encode_partial_signature_payload(payload: &PartialSignaturePayload) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_bytes(&mut out, &payload.ctilde);
+        put_bytes(&mut out, &payload.z_share);
+        out
+    }
+
+    /// Decodes a partial signature payload.
+    pub fn decode_partial_signature_payload(
+        bytes: &[u8],
+    ) -> Result<PartialSignaturePayload, WireError> {
+        let mut cursor = Cursor::new(bytes);
+        let ctilde = cursor.take_bytes()?;
+        let z_share = cursor.take_bytes()?;
+        cursor.finish()?;
+        Ok(PartialSignaturePayload { ctilde, z_share })
+    }
 }
 
 /// Final signature payload.
@@ -217,15 +271,107 @@ pub struct FinalSignaturePayload {
     pub signature: Vec<u8>,
 }
 
+/// Strict signing MPC runtime slot.
+///
+/// These slots are safe production transport domains. They carry only
+/// backend-specific private MPC messages and transcript bindings; selected
+/// public signature material is still emitted only through `FinalSignature`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrictSignMpcSlot {
+    /// Build private candidate-share handles from consumed certified tokens.
+    PrepareCandidateShares = 1,
+    /// Private response-bound predicate evaluation.
+    BoundChecks = 2,
+    /// Private hint/high-bits predicate evaluation.
+    HintChecks = 3,
+    /// Private one-hot candidate selection.
+    PrivateSelection = 4,
+    /// Open selected public signature material only.
+    SelectedOpening = 5,
+}
+
+impl StrictSignMpcSlot {
+    /// Returns the canonical wire code.
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Parses a canonical wire code.
+    pub fn from_u8(value: u8) -> Result<Self, WireError> {
+        match value {
+            1 => Ok(Self::PrepareCandidateShares),
+            2 => Ok(Self::BoundChecks),
+            3 => Ok(Self::HintChecks),
+            4 => Ok(Self::PrivateSelection),
+            5 => Ok(Self::SelectedOpening),
+            flag => Err(WireError::NonCanonicalFlag(flag)),
+        }
+    }
+}
+
+/// Strict signing private MPC runtime payload.
+///
+/// The payload intentionally stays opaque at the wire layer. Production
+/// adapters use it to carry authenticated private-MPC messages for the strict
+/// signing runtime while preserving the invariant that unselected candidates,
+/// private predicate bits, and failure details are not first-class wire fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictSignMpcPayload {
+    /// Strict signing runtime slot.
+    pub slot: StrictSignMpcSlot,
+    /// Slot-local phase number.
+    pub phase: u8,
+    /// Optional directed receiver; zero means broadcast/opening.
+    pub receiver_party_id: u16,
+    /// Transcript label hash for this runtime message.
+    pub label_hash: [u8; 32],
+    /// Runtime transcript hash before this payload.
+    pub transcript_hash: [u8; 32],
+    /// Backend-owned authenticated MPC message bytes.
+    pub opaque_payload: Vec<u8>,
+}
+
 /// DKG commitment payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DkgCommitPayload {
     /// IT-VSS commitment/check bytes.
     pub vss_commitments: Vec<Vec<u8>>,
     /// Serialized `A * s1_i` commitment vector.
+    ///
+    /// Scaffold/test-only. Production wire builds must not contain exact public
+    /// `A*secret` images.
+    #[cfg(any(test, feature = "paper-fast-dev"))]
     pub as1_commitment: Vec<u8>,
     /// Pairwise seed commitment.
     pub pairwise_seed_commitment: [u8; 32],
+}
+
+impl DkgCommitPayload {
+    /// Creates a production DKG commit payload without paper-compatible
+    /// public `A*secret` material.
+    pub fn new(vss_commitments: Vec<Vec<u8>>, pairwise_seed_commitment: [u8; 32]) -> Self {
+        Self {
+            vss_commitments,
+            #[cfg(any(test, feature = "paper-fast-dev"))]
+            as1_commitment: Vec::new(),
+            pairwise_seed_commitment,
+        }
+    }
+
+    /// Creates a paper-compatible scaffold DKG commit payload containing a
+    /// public exact `A*s1_i` image.
+    #[cfg(any(test, feature = "paper-fast-dev"))]
+    pub fn new_paper_fast_dev(
+        vss_commitments: Vec<Vec<u8>>,
+        as1_commitment: Vec<u8>,
+        pairwise_seed_commitment: [u8; 32],
+    ) -> Self {
+        Self {
+            vss_commitments,
+            as1_commitment,
+            pairwise_seed_commitment,
+        }
+    }
 }
 
 /// DKG directed share payload.
@@ -1400,25 +1546,6 @@ pub fn decode_sign_request_payload(bytes: &[u8]) -> Result<SignRequestPayload, W
     })
 }
 
-/// Encodes a partial signature payload.
-pub fn encode_partial_signature_payload(payload: &PartialSignaturePayload) -> Vec<u8> {
-    let mut out = Vec::new();
-    put_bytes(&mut out, &payload.ctilde);
-    put_bytes(&mut out, &payload.z_share);
-    out
-}
-
-/// Decodes a partial signature payload.
-pub fn decode_partial_signature_payload(
-    bytes: &[u8],
-) -> Result<PartialSignaturePayload, WireError> {
-    let mut cursor = Cursor::new(bytes);
-    let ctilde = cursor.take_bytes()?;
-    let z_share = cursor.take_bytes()?;
-    cursor.finish()?;
-    Ok(PartialSignaturePayload { ctilde, z_share })
-}
-
 /// Encodes a final signature payload.
 pub fn encode_final_signature_payload(payload: &FinalSignaturePayload) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1434,6 +1561,38 @@ pub fn decode_final_signature_payload(bytes: &[u8]) -> Result<FinalSignaturePayl
     Ok(FinalSignaturePayload { signature })
 }
 
+/// Encodes a strict signing private MPC runtime payload.
+pub fn encode_strict_sign_mpc_payload(payload: &StrictSignMpcPayload) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(payload.slot.as_u8());
+    out.push(payload.phase);
+    out.extend_from_slice(&payload.receiver_party_id.to_le_bytes());
+    out.extend_from_slice(&payload.label_hash);
+    out.extend_from_slice(&payload.transcript_hash);
+    put_bytes(&mut out, &payload.opaque_payload);
+    out
+}
+
+/// Decodes a strict signing private MPC runtime payload.
+pub fn decode_strict_sign_mpc_payload(bytes: &[u8]) -> Result<StrictSignMpcPayload, WireError> {
+    let mut cursor = Cursor::new(bytes);
+    let slot = StrictSignMpcSlot::from_u8(cursor.take_u8()?)?;
+    let phase = cursor.take_u8()?;
+    let receiver_party_id = cursor.take_u16()?;
+    let label_hash = cursor.take_array::<32>()?;
+    let transcript_hash = cursor.take_array::<32>()?;
+    let opaque_payload = cursor.take_bytes()?;
+    cursor.finish()?;
+    Ok(StrictSignMpcPayload {
+        slot,
+        phase,
+        receiver_party_id,
+        label_hash,
+        transcript_hash,
+        opaque_payload,
+    })
+}
+
 /// Encodes a DKG commitment payload.
 pub fn encode_dkg_commit_payload(payload: &DkgCommitPayload) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1441,6 +1600,7 @@ pub fn encode_dkg_commit_payload(payload: &DkgCommitPayload) -> Vec<u8> {
     for commitment in &payload.vss_commitments {
         put_bytes(&mut out, commitment);
     }
+    #[cfg(any(test, feature = "paper-fast-dev"))]
     put_bytes(&mut out, &payload.as1_commitment);
     out.extend_from_slice(&payload.pairwise_seed_commitment);
     out
@@ -1454,11 +1614,13 @@ pub fn decode_dkg_commit_payload(bytes: &[u8]) -> Result<DkgCommitPayload, WireE
     for _ in 0..len {
         vss_commitments.push(cursor.take_bytes()?);
     }
+    #[cfg(any(test, feature = "paper-fast-dev"))]
     let as1_commitment = cursor.take_bytes()?;
     let pairwise_seed_commitment = cursor.take_array::<32>()?;
     cursor.finish()?;
     Ok(DkgCommitPayload {
         vss_commitments,
+        #[cfg(any(test, feature = "paper-fast-dev"))]
         as1_commitment,
         pairwise_seed_commitment,
     })
@@ -1924,6 +2086,9 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::dev_backends::{
+        decode_partial_signature_payload, encode_partial_signature_payload, PartialSignaturePayload,
+    };
     use super::*;
 
     fn header(sender: u16, round: RoundId, kind: PayloadKind) -> WireHeader {
@@ -2070,6 +2235,42 @@ mod tests {
         };
         let encoded = encode_final_signature_payload(&final_sig);
         assert_eq!(decode_final_signature_payload(&encoded), Ok(final_sig));
+
+        let strict_mpc = StrictSignMpcPayload {
+            slot: StrictSignMpcSlot::PrivateSelection,
+            phase: 7,
+            receiver_party_id: 2,
+            label_hash: [0x51; 32],
+            transcript_hash: [0x52; 32],
+            opaque_payload: vec![10, 11, 12, 13],
+        };
+        let encoded = encode_strict_sign_mpc_payload(&strict_mpc);
+        assert_eq!(decode_strict_sign_mpc_payload(&encoded), Ok(strict_mpc));
+    }
+
+    #[test]
+    fn strict_sign_mpc_payload_rejects_unknown_slot_and_trailing_bytes() {
+        let strict_mpc = StrictSignMpcPayload {
+            slot: StrictSignMpcSlot::BoundChecks,
+            phase: 1,
+            receiver_party_id: 0,
+            label_hash: [0x31; 32],
+            transcript_hash: [0x32; 32],
+            opaque_payload: vec![1, 2, 3],
+        };
+        let mut encoded = encode_strict_sign_mpc_payload(&strict_mpc);
+        encoded[0] = 99;
+        assert_eq!(
+            decode_strict_sign_mpc_payload(&encoded),
+            Err(WireError::NonCanonicalFlag(99))
+        );
+
+        let mut encoded = encode_strict_sign_mpc_payload(&strict_mpc);
+        encoded.push(0);
+        assert_eq!(
+            decode_strict_sign_mpc_payload(&encoded),
+            Err(WireError::TrailingPayloadBytes(1))
+        );
     }
 
     #[test]
@@ -2174,6 +2375,24 @@ mod tests {
         assert_eq!(decode_message(&encoded), Ok(residue.clone()));
         assert_eq!(
             validate_round_batch(&[residue], RoundId::DkgSmallResidue, &context()),
+            Ok(())
+        );
+
+        let strict_mpc = WireMessage {
+            header: header(1, RoundId::StrictSignMpc, PayloadKind::StrictSignMpc),
+            payload: encode_strict_sign_mpc_payload(&StrictSignMpcPayload {
+                slot: StrictSignMpcSlot::SelectedOpening,
+                phase: 3,
+                receiver_party_id: 0,
+                label_hash: [0x41; 32],
+                transcript_hash: [0x42; 32],
+                opaque_payload: vec![9, 10],
+            }),
+        };
+        let encoded = encode_message(&strict_mpc).expect("encode strict mpc");
+        assert_eq!(decode_message(&encoded), Ok(strict_mpc.clone()));
+        assert_eq!(
+            validate_round_batch(&[strict_mpc], RoundId::StrictSignMpc, &context()),
             Ok(())
         );
     }
@@ -3051,5 +3270,40 @@ mod tests {
             transcript_hash_round([0; 32], &[first.clone(), second.clone()]),
             transcript_hash_round([0; 32], &[second, first])
         );
+    }
+
+    #[test]
+    fn production_wire_api_does_not_compile_clear_partial_or_public_a_secret_payloads() {
+        const DEV_CFG: &str = "#[cfg(any(test, feature = \"paper-fast-dev\"))]";
+
+        fn assert_cfg_gated(source: &str, needle: &str) {
+            let mut offset = 0;
+            while let Some(relative) = source[offset..].find(needle) {
+                let index = offset + relative;
+                let prefix = source[..index]
+                    .lines()
+                    .rev()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    prefix.contains(DEV_CFG),
+                    "`{needle}` must be gated by `{DEV_CFG}`"
+                );
+                offset = index + needle.len();
+            }
+        }
+
+        let source = include_str!("lib.rs");
+        for needle in [
+            "\n    SignPartial = 4,",
+            "\n    PartialSignature = 4,",
+            "\npub struct PartialSignaturePayload",
+            "\npub fn encode_partial_signature_payload",
+            "\npub fn decode_partial_signature_payload",
+            "\n    pub as1_commitment: Vec<u8>",
+        ] {
+            assert_cfg_gated(source, needle);
+        }
     }
 }

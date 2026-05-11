@@ -1,5 +1,8 @@
 # No Public Exact A-Images Of Secrets
 
+This is a security rationale/reference document. The live implementation
+checklist is `../IMPLEMENTATION_PLAN.md`.
+
 This document records a production security rule for TALUS-MPC:
 
 ```text
@@ -146,3 +149,30 @@ A*s1_i
 Any allowed occurrence must be test-only, dev-only, or documented as a forbidden
 paper-compatibility artifact.
 
+Current DKG status:
+
+```text
+As1Commitment:
+  removed from normal DKG production structs.
+
+DkgCommitPayload.as1_commitment:
+  removed from normal DKG commit payload.
+
+DkgPublicOutput.as1_commitments:
+  removed from normal DKG public output.
+
+production-release-checks + scaffold-dev:
+  compile-time error.
+
+talus-mpc/talus-wire production-release-checks + paper-fast-dev:
+  compile-time error.
+
+DistributedNonceShare.ay_commitment:
+  cfg(test) or paper-fast-dev only.
+
+MaskedBroadcastClearAudit / ClearMaskedBroadcastConsistencyVerifier:
+  cfg(test) or paper-fast-dev only.
+
+CutAndChooseAuditPlan:
+  cfg(test) or paper-fast-dev only.
+```

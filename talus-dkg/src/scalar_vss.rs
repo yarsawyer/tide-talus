@@ -146,7 +146,12 @@ pub struct TestOnlyBoundedSecretVectorDkgOutput {
     pub shares: Vec<TestOnlyBoundedSecretVectorShare>,
 }
 
-/// Scalar IT-VSS backend shape for native DKG implementation.
+/// Scalar IT-VSS backend shape for correctness and scaffold/dev checks.
+///
+/// Production native DKG must use vector/chunk IT-VSS certificates for bounded
+/// ML-DSA secret material. This scalar trait remains as a narrow helper for
+/// scalar tests and scaffold-only code; it must not become a scalar-per-
+/// coefficient production DKG backend.
 pub trait ScalarItVssBackend {
     /// Backend-specific public commitment/check object.
     type PublicCheck;

@@ -24,14 +24,14 @@ only be constructed after the centralized release checks accept:
 - no private setup payloads in release artifact logs
 - no scaffold backend ids in persisted public artifacts
 
-Production DKG must also use the vectorized execution model documented in
-[`docs/dkg-production-performance.md`](../docs/dkg-production-performance.md).
-In particular, production Power2Round must batch across coefficients, openings,
+Production DKG must also use the vectorized execution model tracked in the live
+workspace plan, [`IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md). In
+particular, production Power2Round must batch across coefficients, openings,
 checks, and circuit layers. Scalar-per-coefficient Power2Round is a test
 harness shape only.
 
-The full remaining production checklist is tracked in
-[`docs/dkg-production-completion-plan.md`](../docs/dkg-production-completion-plan.md).
+Historical DKG/performance checklists are archived under `docs/archive/`.
+They are useful context, but they are not the live production checklist.
 
 `NativeDkgAssemblyScaffoldOutput` is a test/scaffold output type. It is not
 release material and must never be accepted by application code without first
@@ -89,13 +89,64 @@ Concretely:
 - `ItVssBackendId::ProductionInformationChecking` is the final IT-VSS artifact
   identity. Test helpers may create production-identity artifacts only under
   `cfg(test)` for release-gate tests.
-- Concrete normal-build production implementations must be added behind these
+- Concrete normal-build production implementations must live behind these
   boundaries only when they perform the selected protocol phases, not just the
   artifact shape.
 
-The next production work should focus on replacing test substrates behind the
-existing boundaries, not on adding more alternate user-facing paths.
+The vector prime-field IT-MPC boundary is now part of the normal build:
+`ShareVec`, `BitShareVec`, batched checked openings, batched zero/bitness
+checks, batched random bits, vector multiplication layers, public-constant
+local multiplication, vector comparisons, vector canonical bit recovery, and
+selected high-bit opening are all normal-build circuit primitives. The local
+Shamir and clear simulators remain test/dev substrates.
 
-The most important replacement is a vectorized prime-field IT-MPC backend with
-`ShareVec` and `BitShareVec`. It must make DKG round complexity follow circuit
-depth rather than coefficient count.
+Release readiness for `Power2RoundBackendId::ProductionItMpc` requires
+`ProductionItMpcReadiness` to assert vector runtime operations, durable public
+round logs, durable local wire logs, release counters, no scalarized execution,
+local public-constant multiplication, PQ-authenticated transport, and
+abort/blame policy.
+
+The normal production Power2Round boundary is `ProductionPower2RoundOutput`
+with durable app-driven vector IT-MPC runtime evidence. The older generic
+`ProductionItMpcPower2RoundBackend` wrapper is test/dev-only because it is
+generic over `ItMpcPrimeFieldBackend`, which still includes local-compatible
+substrates. Release assembly accepts typed `ProductionPower2RoundOutput`;
+normal production callers cannot select local, in-process, clear, transport
+simulator, or generic backend-private Power2Round substrates.
+
+All release-capable Power2Round transport phases are exposed through
+`ProductionVectorPrimeFieldMpcRuntime`: masked `C` opening, wrap comparison,
+canonical subtractor, bitness/range/equality checks, add-4095, and selected
+`t1` high-bit opening. The mutable lower-level runtime escape hatch is
+test/scaffold-dev only. One implementation gap remains explicit: the final
+runtime must still own all nonlinear arithmetic/state generation from `[t]`
+and certified masks instead of accepting precomputed per-phase vectors from
+callers or tests. `ProductionPower2RoundCircuitState` now closes the first
+piece of that path by deriving the masked opening `C = t + A_mask` from local
+secret `[t]` shares and certified local mask shares before driving the
+production vector runtime.
+
+Native DKG assembly now has one normal production entry point:
+
+- `assemble_logged_native_dkg_production_from_logs` accepts a typed
+  `ProductionPower2RoundOutput` when an application has already driven the
+  Power2Round runtime externally.
+
+`assemble_logged_native_dkg_production_with_power2round_backend` and
+`NativeDkgSession::finish_with_power2round_backend` exist only under
+`cfg(test)` / `scaffold-dev` for correctness and migration tests. Output
+packages retain only `rho`, `t1`, `pk`, local `s1` share, and public
+certificates. `s2`, `t`, `t0`, low bits, masks, and simulator material are
+temporary assembly state and must not appear in output, public logs, or debug
+output.
+
+Phase 5 assembly coverage is split by cost:
+
+- `production_native_dkg_assembly_all_suites_release_valid` proves release-valid
+  native DKG assembly for ML-DSA-44/65/87 using production Power2Round evidence
+  and the production output constructor.
+- `native_dkg_application_driver_uses_production_it_vss_batch_path_to_assembly`
+  proves the transport-shaped app-driver path for ML-DSA-44, including
+  production vector IT-VSS logs and production vector Power2Round. This test is
+  slower because it exercises the local vector Power2Round runtime over a full
+  ML-DSA-44 vector.

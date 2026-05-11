@@ -1943,6 +1943,10 @@ pub struct ProductionItVssPublicCoinTranscript {
 /// information-checking material for every holder/receiver pair. It is
 /// intentionally vector/chunk oriented: one sharing certifies an entire `s1` or
 /// `s2` vector label, not one coefficient.
+///
+/// This is the canonical production IT-VSS backend identity. Scalar and
+/// in-process hash-binding helpers are correctness/scaffold fixtures and must
+/// not be wired into release-valid native DKG assembly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProductionInformationCheckingVssBackend {
     entropy: [u8; 32],
@@ -3422,6 +3426,28 @@ pub fn ensure_production_it_vss_counters_allowed_for_release(
         return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
     }
     Ok(())
+}
+
+/// Converts IT-VSS-specific counters into the shared TALUS performance model.
+pub fn talus_performance_counters_from_it_vss(
+    counters: ProductionItVssCounters,
+) -> TalusPerformanceCounters {
+    TalusPerformanceCounters {
+        rounds: counters.consistency_rounds,
+        private_messages: counters.private_deliveries,
+        broadcasts: counters
+            .public_audit_records
+            .saturating_add(counters.public_consistency_records),
+        wire_bytes: counters.private_delivery_bytes,
+        durable_log_bytes: counters.private_delivery_bytes.saturating_mul(2),
+        vector_lanes: counters.vector_lanes,
+        chunks: counters.vector_sharings,
+        checked_lanes: counters
+            .audited_tag_lanes
+            .saturating_add(counters.retained_tag_lanes),
+        wall_clock_micros: counters.elapsed_micros,
+        ..TalusPerformanceCounters::default()
+    }
 }
 
 impl ProductionItVssBackend for ProductionInformationCheckingVssBackend {

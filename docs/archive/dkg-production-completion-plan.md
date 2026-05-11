@@ -472,13 +472,13 @@ Tasks:
   builds.
 - [x] Centralize typed-output release checks behind
   `ensure_production_native_dkg_output_context_allowed_for_release`.
-- [ ] Add normal-build public API scan.
+- [x] Add normal-build public API scan.
 - [ ] Add forbidden-field scan for `s2`, `t`, `t0`, low bits, mask witnesses,
   retained receiver tags, and private setup payloads.
-- [ ] Add forbidden public-linear-image scan for `A*s1_i`,
+- [x] Add forbidden public-linear-image scan for `A*s1_i`,
   `as1_commitment`, `A*nonce` coefficients, `Phi = A*secret`, and
   `CommitmentBackedPartialVerifier` on release paths.
-- [ ] Add rejected-`z` leakage scan for clear partial `z_i` transport,
+- [x] Add rejected-`z` leakage scan for clear partial `z_i` transport,
   candidate-token verifier retry, exposed candidate hints, exposed validity
   bits, and detailed private-check failure reasons on release paths.
 - [ ] Add feature scan to reject insecure/dev/test features in release builds.
@@ -509,9 +509,22 @@ Tasks:
 - [ ] Run full production DKG for ML-DSA-65.
 - [ ] Run full production DKG for ML-DSA-87.
 - [ ] Import each party's `s1` share into TALUS signing provider.
-- [ ] Generate preprocessing tokens without trusted dealer.
-- [ ] Generate preprocessing tokens through token-batched/vectorized nonce,
-  CEF, CarryCompare, and BCC certification, not scalar-per-coefficient loops.
+- [x] Generate preprocessing tokens without public exact `A*nonce` commitments
+  in the normal API.
+  Current status: `talus-mpc` has `PreprocessingSession`,
+  `DistributedNonceShare`, masked-broadcast commit/open, certification
+  evidence, and `CertifiedToken`/`TokenPool` admission gates. The current nonce
+  generator is still in-process orchestration, not the final app-driven
+  production IT-VSS/IT-MPC phase.
+- [ ] Generate preprocessing tokens through app-driven token-batched/vectorized
+  nonce, CEF, CarryCompare, and BCC certification, not scalar-per-coefficient
+  loops or local aggregate witnesses.
+- [ ] Replace current deterministic masked-broadcast proof hashes/local
+  recomputation with final private production certification evidence.
+- [ ] Replace current local CEF/BCC witness evidence with production vector
+  IT-MPC evidence.
+- [ ] Persist preprocessing token inventory durably and reject token reuse after
+  restart/rollback.
 - [ ] Run strict TALUS online signing with no rejected-`z` leakage.
 - [ ] Consume a fixed token batch before response work.
 - [ ] Privately check response norm and hint weight.

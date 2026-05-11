@@ -13,6 +13,8 @@ alloc = []
 serde-wire = []
 test-dealer = []
 bench = []
+paper-fast-dev = []
+production-release-checks = []
 
 [dependencies]
 sha3.workspace = true

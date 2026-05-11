@@ -1,5 +1,8 @@
 # TALUS IT-VSS Rabin-Ben-Or Instantiation
 
+This is a protocol reference document. The live implementation checklist is
+`../IMPLEMENTATION_PLAN.md`.
+
 This document pins the v1 production target for native TALUS IT-DKG/VSS.
 It is intentionally conservative: the first reviewed implementation favors
 security with abort over liveness recovery that reveals additional secret-share

@@ -10,6 +10,64 @@ Do not implement production preprocessing as independent scalar work per
 coefficient, per token, or per signer.
 ```
 
+## Current Implementation Status
+
+This section is a ledger, not a design target. Do not reimplement these pieces
+from scratch.
+
+Implemented:
+
+- [x] Production-facing preprocessing session facade:
+  `talus-mpc/src/local.rs:82` (`PreprocessingSessionOptions`) and
+  `talus-mpc/src/local.rs:125` (`PreprocessingSession`).
+- [x] Broadcast commit/open path for masked broadcasts:
+  `talus-mpc/src/local.rs:1615` (`prepare_masked_broadcast_envelope`) and
+  `talus-mpc/src/local.rs:1752` (`open_broadcasts`).
+- [x] Normal nonce share type has no public exact `A*nonce` commitment:
+  `talus-mpc/src/local.rs:471` (`DistributedNonceShare`).
+- [x] Distributed nonce generation core:
+  `talus-mpc/src/local.rs:513` (`generate_distributed_nonce_shares`).
+- [x] Masked-broadcast consistency verifier boundary:
+  `talus-mpc/src/local.rs:691` (`MaskedBroadcastConsistencyVerifier`) and
+  `talus-mpc/src/local.rs:719`
+  (`ProductMaskedBroadcastConsistencyVerifier`).
+- [x] Token certification and pool admission:
+  `talus-mpc/src/local.rs:825` (`PreChallengeCertificationEvidence`),
+  `talus-mpc/src/local.rs:908` (`CertifiedToken`), and
+  `talus-mpc/src/local.rs:982` (`TokenPool`).
+- [x] Session-id persistence:
+  `talus-mpc/src/local.rs:1088` (`FileSessionRegistry`).
+- [x] CEF plus BCC admission in one vector pass:
+  `talus-mpc/src/local.rs:1815`
+  (`certify_vector_carry_compare_and_cef`), with:
+  ```text
+  w1 = (sum_Htilde + floor(B / alpha) - kappa + delta) mod m
+  ```
+
+Still production-blocking:
+
+- [ ] Nonce generation must become an app-driven protocol phase over
+  production IT-VSS/IT-MPC private deliveries. The current generator is
+  in-process/local orchestration.
+- [ ] Masked-broadcast consistency must be certified by the final private
+  backend. The current product verifier checks deterministic
+  statement/proof hashes and local recomputation.
+- [ ] CarryCompare, CEF correction bits, and BCC admission must be backed by
+  production vector IT-MPC evidence. The current path uses local aggregate
+  witnesses to certify the typed evidence.
+- [ ] Token inventory must be durable. Current session-id reuse prevention is
+  file-backed, but `TokenPool` itself is in-memory.
+- [ ] Token batches/chunks and counters must be implemented so performance is
+  gated by batch/chunk/circuit depth instead of scalar coefficient loops.
+
+Current non-goals:
+
+- Do not restore public exact `A*y`, `A*nonce`, or Feldman-style
+  `Phi = A*secret` commitments.
+- Do not add post-challenge reveal-on-failure to production.
+- Do not build a second preprocessing algorithm. Replace internals behind the
+  existing session/verifier/token boundaries.
+
 Production preprocessing must be vectorized and batched across:
 
 - token batches
@@ -249,12 +307,19 @@ token batches, chunks, and circuit depth, not with scalar coefficient loops.
 
 ## Completion Gates
 
+- [x] Production-facing `PreprocessingSession` API exists.
+- [x] Masked broadcast commit/open exists and validates transcript-bound
+  commitments/openings.
+- [x] Token admission requires pre-challenge certification evidence and BCC.
+- [x] Normal preprocessing exposes no public exact `A*nonce` image.
 - [ ] Production `PreprocessingSession` operates on token batches/chunks.
-- [ ] Nonce generation uses vector IT-VSS/IT-MPC only.
-- [ ] No release path accepts caller-provided clear `y_shares`.
-- [ ] Masked broadcast commit/open is vectorized.
+- [ ] Nonce generation uses app-driven vector IT-VSS/IT-MPC only.
+- [ ] No release path accepts caller-provided clear `y_shares` or local
+  aggregate nonce witnesses.
+- [ ] Masked broadcast commit/open is batched by token/chunk.
 - [ ] Masked-broadcast consistency certification is vectorized and private.
-- [ ] CarryCompare and CEF certification are vectorized.
+- [ ] CarryCompare and CEF certification are vectorized through production
+  IT-MPC evidence.
 - [ ] BCC certification is private, vectorized, and pre-challenge.
 - [ ] Failed BCC reveals no low bits, boundary distances, masks, or nonce
   material.

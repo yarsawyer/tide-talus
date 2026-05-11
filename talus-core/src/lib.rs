@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 #![doc = "Core TALUS arithmetic and fips204 adapter surface."]
+//!
+//! This crate contains standard-compatible ML-DSA/TALUS arithmetic helpers and
+//! the narrow `fips204` adapter surface used by higher-level TALUS protocols.
+//! It does not define a separate signing mode and does not provide paper-fast,
+//! scaffold, or transport APIs.
 
 pub mod bcc;
 pub mod cef;
@@ -9,6 +14,7 @@ pub mod fips204_encoding;
 pub mod fips204_ntt;
 pub mod fips204_verify;
 pub mod params;
+pub mod performance;
 pub mod poly;
 
 pub use bcc::{
@@ -31,6 +37,10 @@ pub use fips204_ntt::{
 };
 pub use fips204_verify::{verify_fips204_signature, Fips204Verifier, VerifyError};
 pub use params::{MlDsa44, MlDsa65, MlDsa87, MlDsaParams};
+pub use performance::{
+    ensure_performance_counters_within_envelope, PerformanceGateError, ProductionBatchSizingPolicy,
+    TalusPerformanceCounters, TalusPerformanceEnvelope,
+};
 pub use poly::{
     aggregate_z_shares, aggregate_z_shares_lagrange, infinity_norm, lagrange_coefficients_at_zero,
     mul_challenge_poly, mul_challenge_polyvec, partial_z_share, partial_z_share_with_challenge,

@@ -363,6 +363,8 @@ pub enum DkgError {
     DkgReleaseArtifactContainsPrivateSetupPayload,
     /// DKG setup restart state was incomplete for a release package.
     DkgSetupIncompleteAfterRestart,
+    /// DKG setup restart state was aborted and cannot become accepted.
+    DkgSetupAbortedAfterRestart,
     /// Scalar IT-VSS restart state was incomplete.
     ScalarItVssIncompleteAfterRestart,
     /// Scalar IT-VSS restart state was aborted and cannot become accepted.
@@ -437,8 +439,6 @@ pub enum DkgError {
 /// Public commitment/check set type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitmentSet {
-    /// Public `A*s1_i` matrix commitments.
-    As1,
     /// Pairwise seed commitments.
     PairwiseSeed,
 }
@@ -610,19 +610,6 @@ pub(crate) fn hash_len_prefixed_vecs<'a>(
     }
 }
 
-pub(crate) fn hash_party_vecs<'a>(
-    hasher: &mut Sha3_256,
-    values: impl Iterator<Item = (PartyId, &'a Vec<u8>)>,
-) {
-    let values: Vec<(PartyId, &Vec<u8>)> = values.collect();
-    hasher.update((values.len() as u32).to_le_bytes());
-    for (party, value) in values {
-        hasher.update(party.0.to_le_bytes());
-        hasher.update((value.len() as u32).to_le_bytes());
-        hasher.update(value);
-    }
-}
-
 pub(crate) fn hash_commit_round(
     previous: KeygenTranscriptHash,
     commits: &[DkgCommitPayload],
@@ -639,8 +626,6 @@ pub(crate) fn hash_commit_round(
                 .iter()
                 .map(|commitment| &commitment.bytes),
         );
-        hasher.update(payload.as1_commitment.party.0.to_le_bytes());
-        hash_bytes(&mut hasher, &payload.as1_commitment.bytes);
         hasher.update(payload.pairwise_seed_commitment.party.0.to_le_bytes());
         hasher.update(payload.pairwise_seed_commitment.commitment);
     }
