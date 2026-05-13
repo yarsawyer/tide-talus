@@ -22,6 +22,7 @@ docs/it-vss-rabin-ben-or.md
 docs/no-public-a-secret-linear-images.md
 docs/no-rejected-z-leakage.md
 docs/production-optimization-principles.md
+docs/threshold-scheme-evaluation.md
 talus.md
 SECURITY.md
 talus-dkg/ARCHITECTURE.md
@@ -72,6 +73,53 @@ Production means:
 Everything else is test, dev, research, or attack-demo code. It must be gated
 behind `cfg(test)`, explicit non-production features, or dev modules. Normal
 crate users must not be able to select it.
+
+## External Scheme Evaluation Track
+
+Canonical document:
+
+```text
+docs/threshold-scheme-evaluation.md
+```
+
+This track evaluates external threshold ML-DSA schemes that may inform future
+backend choices. It is not a replacement for the current production plan until
+its completion gates pass.
+
+Tracked candidates:
+
+```text
+Track A:
+  Mithril / ePrint 2026/013
+
+Track B:
+  Quorus / ePrint 2025/1163
+```
+
+Current status:
+
+```text
+[ ] Mithril paper review complete.
+[ ] Mithril Go implementation inspected and tested for N=3..6.
+[ ] Rust threshold-ml-dsa crate provenance inspected.
+[ ] Mithril signatures verified with an independent FIPS 204 verifier.
+[ ] Mithril DKG/key-import and malicious/fail-closed behavior assessed.
+
+[ ] Quorus paper review complete.
+[ ] Quorus honest-majority production model extracted.
+[ ] Quorus round count and WAN latency evaluated.
+[ ] Quorus implementation availability checked.
+[ ] Quorus compared against the current IT-VSS/IT-MPC direction.
+```
+
+Decision rule:
+
+```text
+No external scheme may replace the current production path based on paper,
+README, crate, or benchmark claims alone. A candidate must pass independent
+FIPS 204 verification tests, malicious/fail-closed tests, dependency/provenance
+review, and transport/DKG fit analysis before it can become a prototype backend.
+```
 
 ## Completed Baseline
 
@@ -2071,6 +2119,24 @@ Completed in the Phase 9 groundwork pass:
   ```
 - [x] Existing scalarized prime-field MPC wire-log checks reject scalar payload
   evidence on release paths.
+- [x] Add strict-signing live-runtime profiling:
+  ```text
+  per-phase elapsed milliseconds
+  per-phase PrimeFieldMpcCounters deltas
+  z response prep
+  z canonical decomposition
+  z-bound checks
+  hint canonical decomposition
+  hint/highbits checks
+  hint weight
+  private selection
+  selected-only opening
+  ```
+  The ignored live ML-DSA-65 strict test prints the profile under
+  `--nocapture`. Current measured bottlenecks are hint canonical decomposition,
+  hint/highbits checks, hint weight, z canonical decomposition, and z-bound
+  checks. The detailed snapshot is in
+  `docs/production-optimization-principles.md`.
 
 Remaining Phase 9 implementation tasks:
 
@@ -2153,10 +2219,29 @@ Remaining Phase 9 implementation tasks:
   talus-mpc/src/online.rs: StrictSigningDistributedRuntime
   talus-mpc/src/online.rs: ProductionStrictLiveVectorMpcArtifactSource
   ```
+  Optimization backlog:
+  ```text
+  [x] profile strict live runtime by phase
+  [ ] phase-batch all candidates/chunks
+  [ ] move z/hint canonical masks into preprocessing token inventory
+  [ ] precompute/store certified secret-shared [w] = [A*y] in each token
+  [ ] precompute/store certified secret-shared [As1] = [A*s1] in key state
+  [ ] compute online hint relation as [r] = [w] + c*[As1] - c*t1*2^d
+  [ ] avoid online recomputation of token-only BCC/CEF facts without removing
+      private z-bound or hint-weight checks
+  [ ] add vector circuit scheduler
+  [ ] specialize z-bound and hint/highbits circuits where proof-compatible
+  [ ] replace hint-weight reduction with a shallower threshold circuit
+  [ ] do not implement y-margin z-bound shortcuts as production without a
+      separate proof/review
+  [ ] add release-mode ML-DSA-44/65/87 signing performance gates
+  ```
 - [ ] Precompute reusable certified material where safe:
   ```text
   Power2Round canonical masks
   strict signing z/hint canonical masks
+  token-local secret-shared [w] = [A*y]
+  key-state secret-shared [As1] = [A*s1]
   preprocessing nonce-mask material
   IT-MPC random bits
   multiplication/checking preprocessing

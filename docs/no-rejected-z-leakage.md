@@ -434,9 +434,16 @@ ProductionVectorResponseBoundCheckBackend:
   backend state.
 
 ProductionVectorHintCheckBackend:
-  vector hint/highbits checker. It computes `A*z - c*t1*2^d`, derives the
-  candidate hint, enforces hint encoding/weight through the FIPS encoder, and
-  stores only the selected-output candidate bytes inside private backend state.
+  vector hint/highbits checker. The straightforward implementation computes
+  `A*z - c*t1*2^d`, derives the candidate hint, enforces hint encoding/weight
+  through the FIPS encoder, and stores only the selected-output candidate bytes
+  inside private backend state. The optimized strict-production target keeps the
+  same private hint/highbits and hint-weight gates, but computes the relation
+  from certified secret-shared helpers:
+    `[r] = [w] + c*[As1] - c*t1*2^d`
+  where `[w] = [A*y]` is token-local and `[As1] = [A*s1]` is long-term key
+  state. These helpers must remain secret-shared; they are not public
+  commitments.
 
 ProductionVectorPrivateSelectionBackend:
   combines the private bound/hint predicate state and selects the
@@ -459,8 +466,10 @@ Performance note:
   because rejected candidates must stay private. The production optimization
   path is documented in `docs/production-optimization-principles.md`: batch
   private checks by circuit layer, move eligible certified masks/material into
-  preprocessing, compact durable logs without losing replayability, and keep
-  paper-fast/clear-partial shortcuts out of production.
+  preprocessing, compute the online hint relation from secret-shared `[w]` and
+  `[As1]`, compact durable logs without losing replayability, and keep
+  paper-fast/clear-partial shortcuts out of production. Do not remove private
+  hint-weight or z-bound checks unless a separate reviewed proof justifies it.
 
 strict_candidate_priority:
   production-visible public priority derivation used after private validity

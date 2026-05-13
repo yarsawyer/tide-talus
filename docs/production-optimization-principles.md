@@ -28,6 +28,8 @@ Forbidden production "optimizations":
 - rejected aggregate z exposure;
 - reveal-on-failure after challenge;
 - public A*s1_i or public A*nonce commitments;
+- public `A*s1` or `A*nonce` helper material in any form that reveals the
+  secret by linear algebra;
 - candidate retry where failed candidate material is visible;
 - scalar-per-coefficient release transport;
 - caller-supplied runtime evidence or proof stubs.
@@ -61,6 +63,29 @@ fast after the vector reducer work:
 ```text
 production_vector_runtime_computes_private_bit_sum_leq_threshold: ~0.07s
 production_vector_runtime_computes_preprocessing_cef_bcc_threshold_phase: ~0.08s
+```
+
+Current profiled ML-DSA-65 debug/in-memory unit-harness snapshot:
+
+```text
+hint_canonical_decomposition: ~59.1s, 283 rounds, 789,504 mul lanes
+hint_highbits_checks:         ~46.5s, 140 rounds, 430,080 mul lanes
+hint_weight_check:            ~26.7s,  71 rounds,   6,170 mul lanes
+z_canonical_decomposition:    ~14.5s, 283 rounds, 657,920 mul lanes
+z_bound_checks:               ~11.5s,  97 rounds, 248,320 mul lanes
+z_bound_all:                  ~10.8s,  77 rounds,   5,166 mul lanes
+runtime_certificate:           ~2.6s, log/evidence scan only
+selected opening/product work: ~1.6s to ~1.7s per small phase
+```
+
+Interpretation:
+
+```text
+- canonical decomposition and private comparison/highbits circuits dominate;
+- selected-only opening is not the main cost;
+- log/evidence scanning is visible but secondary;
+- moving canonical masks/material into preprocessing and batching by phase are
+  the highest-impact next optimizations.
 ```
 
 ## Why Dev/Scaffold Was Fast
@@ -168,8 +193,28 @@ Strict signing pays heavily for private canonical bit decomposition of:
 
 ```text
 z
-hint/highbits intermediate r = A*z - c*t1*2^d
+hint/highbits intermediate r
 ```
+
+For strict production, do not optimize by removing online hint/highbits or
+hint-weight checks unless a separate proof shows they cannot fail or that any
+failure remains safely hidden. The approved optimization is to make the online
+hint relation cheaper:
+
+```text
+preprocessing/key state:
+  [w]    = [A*y]      // token-local, secret-shared and certified
+  [As1]  = [A*s1]     // long-term, secret-shared and certified
+
+online:
+  [r] = [w] + c*[As1] - c*t1*2^d
+
+not:
+  [r] = A*[z] - c*t1*2^d
+```
+
+`[As1]` and `[w]` must remain secret-shared. They are not public commitments and
+must never become public exact A-images.
 
 The decomposition protocol needs certified random masks. These masks can be
 generated and certified before online signing, as long as each mask is:
@@ -187,20 +232,26 @@ Production target:
 ```text
 preprocessing token contains:
   certified nonce y shares
+  certified secret-shared [w] = [A*y]
   BCC/CEF certificate
   certified canonical-mask inventory for strict z/hint checks
   durable one-time-use mask ids
 
+long-term key state contains:
+  certified secret-shared [As1] = [A*s1]
+
 online signing consumes:
   token batch
   mask batch
+  [w] token handles
+  [As1] key handles
   then performs masked openings/checks with already-certified masks
 ```
 
 Expected effect:
 
 ```text
-online signing loses large random-mask certification cost;
+online signing loses large random-mask certification and repeated A*z cost;
 online work becomes mostly challenge-dependent arithmetic, comparisons,
 selection, and selected opening.
 ```
@@ -263,7 +314,9 @@ Completion condition:
 ```text
 CertifiedToken carries enough preprocessing runtime evidence that strict signing
 does not rerun token certification circuits online, while still privately
-checking all challenge-dependent predicates before selected opening.
+checking all challenge-dependent predicates before selected opening. In
+particular, z-bound and hint-weight remain private online checks unless a
+reviewed proof removes them.
 ```
 
 ### 4. Use Layer Schedulers, Not Hand-Written Per-Step Loops
@@ -487,6 +540,86 @@ Implement optimizations in this order:
 
 This order keeps the current secure proof shape intact while attacking the main
 latency sources.
+
+## Optimization Backlog
+
+This backlog is intentionally concrete. It names speed work that is allowed
+under the strict production security model.
+
+### Strict Signing
+
+```text
+[x] Add live-runtime phase profiling.
+[ ] Batch by phase across candidates/chunks instead of candidate-by-candidate.
+[ ] Move z/hint canonical masks into preprocessing token inventory.
+[ ] Precompute/store certified secret-shared [w] = [A*y] in each token.
+[ ] Precompute/store certified secret-shared [As1] = [A*s1] in key state.
+[ ] Compute online hint relation as [r] = [w] + c*[As1] - c*t1*2^d.
+[ ] Avoid online recomputation of token-only BCC/CEF facts, but keep
+    challenge-dependent z-bound and hint-weight private checks unless separately
+    proven unnecessary.
+[ ] Add a vector circuit scheduler for repeated comparison/decomposition layers.
+[ ] Specialize z-bound as a centered range check instead of a generic
+    decomposition plus two full comparisons where proof-compatible.
+[ ] Specialize hint/highbits checks around the precomputed [w]/[As1] relation so
+    online signing does not redo token admission logic or full A*z.
+[ ] Replace current hint-weight reduction with a shallower tree/popcount
+    threshold circuit.
+[ ] Do not implement y-margin z-bound shortcuts as production unless separately
+    proven and reviewed.
+[ ] Keep selected-only opening and final FIPS verification unchanged.
+[ ] Add release-mode ML-DSA-44/65/87 signing performance gates.
+```
+
+### Preprocessing
+
+```text
+[ ] Certify token batches, not one token at a time.
+[ ] Store certified secret-shared [w] = [A*y] with each token.
+[ ] Precompute canonical decomposition masks for strict signing.
+[ ] Precompute safe random-bit/comparison helper material.
+[ ] Batch masked-broadcast commit/open vectors.
+[ ] Batch CarryCompare lanes.
+[ ] Batch CEF/BCC admission lanes.
+[ ] Persist one-time-use ids for every precomputed helper.
+[ ] Tune token batch size K from measured BCC-certified pass probability.
+```
+
+### Vector IT-MPC Runtime
+
+```text
+[ ] Add a layer scheduler that enqueues all gates for the current circuit layer.
+[ ] Aggregate same-layer private messages by receiver.
+[ ] Aggregate same-layer reliable broadcasts.
+[ ] Compact phase cursors without losing replayability.
+[ ] Compact durable wire logs while retaining transcript hashes and release
+    verification.
+[ ] Add CPU parallelism inside independent vector/chunk arithmetic with
+    deterministic transcript order.
+[ ] Add release-build benchmark mode separate from debug unit tests.
+```
+
+### DKG / IT-VSS / Bounded Sampler
+
+```text
+[ ] Keep IT-VSS at vector/chunk granularity, never scalar-per-coefficient.
+[ ] Add final chunk-size and memory-limit policy per ML-DSA suite.
+[ ] Batch bounded-sampler bitness/range/sum-mod-m checks.
+[ ] Ensure DKG counters scale with vector/chunk count and circuit depth.
+[ ] Keep Power2Round in the state-owned vector path and remove legacy helper-only
+    release callers.
+```
+
+### Measurement And Gates
+
+```text
+[ ] Record phase timing/counter breakdowns for strict signing in release mode.
+[ ] Record preprocessing token-batch fill timing/counters.
+[ ] Record DKG setup timing/counters.
+[ ] Add no-scalarized-release regression tests for every production path.
+[ ] Define acceptable local baseline envelopes for ML-DSA-44 first.
+[ ] Scale envelopes for ML-DSA-65 and ML-DSA-87 after ML-DSA-44 is stable.
+```
 
 ## Current Open Optimization Questions
 
