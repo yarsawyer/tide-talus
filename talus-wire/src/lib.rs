@@ -490,6 +490,45 @@ pub struct DkgItVssPublicCoinSharePayload {
     pub transcript_hash: [u8; 32],
 }
 
+/// DKG IT-VSS public audit/discard record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DkgItVssAuditRecordPayload {
+    /// Dealer whose sharing is audited.
+    pub dealer_party_id: u16,
+    /// Holder/intermediary whose vector share is authenticated.
+    pub holder_party_id: u16,
+    /// Receiver/verifier that opened the audited receiver-side tag.
+    pub receiver_party_id: u16,
+    /// Sharing label hash.
+    pub label_hash: [u8; 32],
+    /// Audited tag index.
+    pub tag_index: u16,
+    /// Opened audited receiver-side tag bytes. These bytes are public only
+    /// because the audited tag is discarded and never retained for opening.
+    pub audited_receiver_tag: Vec<u8>,
+    /// Hash of the opened audited receiver-side tag.
+    pub audited_receiver_tag_hash: [u8; 32],
+}
+
+/// DKG IT-VSS public vector-polynomial consistency record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DkgItVssConsistencyRecordPayload {
+    /// Dealer whose sharing is checked.
+    pub dealer_party_id: u16,
+    /// Holder whose polynomial point is checked.
+    pub holder_party_id: u16,
+    /// Sharing label hash.
+    pub label_hash: [u8; 32],
+    /// Consistency round.
+    pub round: u16,
+    /// Public challenge bit.
+    pub challenge_bit: u8,
+    /// Opened public masked evaluation vector bytes for this holder/round.
+    pub masked_eval: Vec<u8>,
+    /// Hash of the public masked evaluation vector.
+    pub masked_eval_hash: [u8; 32],
+}
+
 /// DKG verified IT-VSS sharing certificate wire payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DkgItVssCertificatePayload {
@@ -546,6 +585,10 @@ pub enum DkgItVssArtifactPayload {
     PublicCommitmentBatch(Vec<DkgItVssPublicCommitmentPayload>),
     /// One public-coin share artifact for consistency challenges.
     PublicCoinShare(DkgItVssPublicCoinSharePayload),
+    /// Public audit/discard records for vector information-checking tags.
+    PublicAuditRecords(Vec<DkgItVssAuditRecordPayload>),
+    /// Public vector-polynomial consistency records.
+    PublicConsistencyRecords(Vec<DkgItVssConsistencyRecordPayload>),
     /// One complaint-resolution artifact.
     ComplaintResolution(DkgItVssResolutionPayload),
 }
@@ -1823,6 +1866,32 @@ pub fn encode_dkg_it_vss_artifact_payload(payload: &DkgItVssArtifactPayload) -> 
             out.extend_from_slice(&share.coin);
             out.extend_from_slice(&share.transcript_hash);
         }
+        DkgItVssArtifactPayload::PublicAuditRecords(records) => {
+            out.push(6);
+            out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+            for record in records {
+                out.extend_from_slice(&record.dealer_party_id.to_le_bytes());
+                out.extend_from_slice(&record.holder_party_id.to_le_bytes());
+                out.extend_from_slice(&record.receiver_party_id.to_le_bytes());
+                out.extend_from_slice(&record.label_hash);
+                out.extend_from_slice(&record.tag_index.to_le_bytes());
+                put_bytes(&mut out, &record.audited_receiver_tag);
+                out.extend_from_slice(&record.audited_receiver_tag_hash);
+            }
+        }
+        DkgItVssArtifactPayload::PublicConsistencyRecords(records) => {
+            out.push(7);
+            out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+            for record in records {
+                out.extend_from_slice(&record.dealer_party_id.to_le_bytes());
+                out.extend_from_slice(&record.holder_party_id.to_le_bytes());
+                out.extend_from_slice(&record.label_hash);
+                out.extend_from_slice(&record.round.to_le_bytes());
+                out.push(record.challenge_bit);
+                put_bytes(&mut out, &record.masked_eval);
+                out.extend_from_slice(&record.masked_eval_hash);
+            }
+        }
         DkgItVssArtifactPayload::ComplaintResolution(resolution) => {
             out.push(2);
             put_u16_vec(&mut out, &resolution.accepted_dealers);
@@ -1881,6 +1950,38 @@ pub fn decode_dkg_it_vss_artifact_payload(
             coin: cursor.take_array::<32>()?,
             transcript_hash: cursor.take_array::<32>()?,
         }),
+        6 => {
+            let len = cursor.take_u32()? as usize;
+            let mut records = Vec::with_capacity(len);
+            for _ in 0..len {
+                records.push(DkgItVssAuditRecordPayload {
+                    dealer_party_id: cursor.take_u16()?,
+                    holder_party_id: cursor.take_u16()?,
+                    receiver_party_id: cursor.take_u16()?,
+                    label_hash: cursor.take_array::<32>()?,
+                    tag_index: cursor.take_u16()?,
+                    audited_receiver_tag: cursor.take_bytes()?,
+                    audited_receiver_tag_hash: cursor.take_array::<32>()?,
+                });
+            }
+            DkgItVssArtifactPayload::PublicAuditRecords(records)
+        }
+        7 => {
+            let len = cursor.take_u32()? as usize;
+            let mut records = Vec::with_capacity(len);
+            for _ in 0..len {
+                records.push(DkgItVssConsistencyRecordPayload {
+                    dealer_party_id: cursor.take_u16()?,
+                    holder_party_id: cursor.take_u16()?,
+                    label_hash: cursor.take_array::<32>()?,
+                    round: cursor.take_u16()?,
+                    challenge_bit: cursor.take_u8()?,
+                    masked_eval: cursor.take_bytes()?,
+                    masked_eval_hash: cursor.take_array::<32>()?,
+                });
+            }
+            DkgItVssArtifactPayload::PublicConsistencyRecords(records)
+        }
         2 => {
             let accepted_dealers = cursor.take_u16_vec()?;
             let rejected_dealers = cursor.take_u16_vec()?;

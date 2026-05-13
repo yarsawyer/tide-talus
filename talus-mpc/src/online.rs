@@ -2,8 +2,11 @@
 
 use core::{fmt, marker::PhantomData};
 
-use crate::local::{CertifiedToken, SessionId, TokenPoolError, TranscriptHash};
+use crate::local::{
+    ensure_certified_token_release_valid, CertifiedToken, SessionId, TokenPoolError, TranscriptHash,
+};
 use sha3::{Digest, Sha3_256};
+use std::time::Instant;
 use talus_core::{
     az_from_rho, compute_ctilde, compute_mu, compute_talus_hint_polyvec,
     lagrange_coefficients_at_zero, mul_challenge_polyvec, public_approx_from_az, public_key_decode,
@@ -12,13 +15,20 @@ use talus_core::{
     TalusPerformanceCounters, VerifyError,
 };
 use talus_dkg::{
+    ensure_production_strict_signing_runtime_evidence_for_release,
     ensure_production_vector_it_mpc_runtime_evidence_for_release, BoundedSecretVectorShare,
-    DkgConfig, DkgError, DkgSecretShare, ProductionVectorItMpcRuntimeEvidence,
+    DkgConfig, DkgError, DkgSecretShare, Power2RoundTranscriptLabel, PrimeFieldMpcCounters,
+    PrimeFieldMpcPhaseCursorLog, PrimeFieldMpcPhaseDriverStatus, PrimeFieldMpcWireMessageLog,
+    ProductionBitShareVec, ProductionBitSumLeqPublicVecState,
+    ProductionCanonicalBitDecompositionState, ProductionPublicComparisonVecState,
+    ProductionShareVec, ProductionVectorItMpcCollectResult, ProductionVectorItMpcEntropy,
+    ProductionVectorItMpcRuntimeEvidence, ProductionVectorPrimeFieldMpcRuntime,
 };
 use talus_mpc_core::PartyId;
 use talus_wire::{
-    decode_strict_sign_mpc_payload, encode_message, signing_set_hash, PayloadKind, RoundId,
-    StrictSignMpcPayload, StrictSignMpcSlot, SuiteId as WireSuiteId, WireMessage,
+    decode_strict_sign_mpc_payload, encode_message, signing_set_hash, AuthenticatedP2pTransport,
+    EquivocationResistantBroadcast, PayloadKind, RoundId, StrictSignMpcPayload, StrictSignMpcSlot,
+    SuiteId as WireSuiteId, WireMessage,
 };
 
 /// Current online protocol version.
@@ -262,7 +272,23 @@ pub struct StrictSigningEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StrictSigningVectorRuntimeCertificate {
     /// Durable runtime evidence from the vector IT-MPC backend.
-    pub runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+    runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+    /// Strict-signing release source that produced this certificate.
+    source: StrictSigningRuntimeCertificateSource,
+}
+
+/// Source of a strict-signing vector runtime certificate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrictSigningRuntimeCertificateSource {
+    /// Durable vector runtime evidence was validated but not bound to the
+    /// selected-opening artifact handoff. This is useful for tests and
+    /// lower-level adapters, but it is not sufficient for release strict
+    /// signing output.
+    RuntimeEvidenceOnly,
+    /// Durable vector runtime evidence was attached through the
+    /// selected-opening artifact handoff that validates request, token order,
+    /// selected priority, and selected challenge seed.
+    SelectedOpeningArtifact,
 }
 
 impl StrictSigningVectorRuntimeCertificate {
@@ -273,7 +299,48 @@ impl StrictSigningVectorRuntimeCertificate {
     ) -> Result<Self, OnlineError> {
         ensure_production_vector_it_mpc_runtime_evidence_for_release(&runtime_evidence)
             .map_err(|_| OnlineError::StrictSigningRuntimeSlotIncomplete)?;
-        Ok(Self { runtime_evidence })
+        Ok(Self {
+            runtime_evidence,
+            source: StrictSigningRuntimeCertificateSource::RuntimeEvidenceOnly,
+        })
+    }
+
+    /// Builds a strict-signing runtime certificate from evidence derived from
+    /// the strict signing runtime log.
+    pub fn new_for_strict_signing(
+        runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+    ) -> Result<Self, OnlineError> {
+        ensure_production_strict_signing_runtime_evidence_for_release(&runtime_evidence)
+            .map_err(|_| OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        Ok(Self {
+            runtime_evidence,
+            source: StrictSigningRuntimeCertificateSource::RuntimeEvidenceOnly,
+        })
+    }
+
+    /// Marks this certificate as bound through the selected-opening artifact
+    /// handoff.
+    fn into_selected_opening_artifact(mut self) -> Self {
+        self.source = StrictSigningRuntimeCertificateSource::SelectedOpeningArtifact;
+        self
+    }
+
+    /// Returns durable runtime evidence from the vector IT-MPC backend.
+    pub fn runtime_evidence(&self) -> &ProductionVectorItMpcRuntimeEvidence {
+        &self.runtime_evidence
+    }
+
+    /// Returns the release-source boundary that produced this certificate.
+    pub const fn source(&self) -> StrictSigningRuntimeCertificateSource {
+        self.source
+    }
+
+    /// Returns true only for the selected-opening artifact release path.
+    pub const fn is_selected_opening_artifact_bound(&self) -> bool {
+        matches!(
+            self.source,
+            StrictSigningRuntimeCertificateSource::SelectedOpeningArtifact
+        )
     }
 }
 
@@ -387,6 +454,20 @@ impl BccCertifiedTokenBatch {
         Ok(Self { signer_set, tokens })
     }
 
+    /// Creates a strict batch that is valid for release-capable signing.
+    pub fn new_release_validated(
+        tokens: Vec<CertifiedToken>,
+        min_batch_size: usize,
+    ) -> Result<Self, OnlineError> {
+        let batch = Self::new(tokens, min_batch_size)?;
+        for token in &batch.tokens {
+            ensure_certified_token_release_valid(token).map_err(|_| {
+                OnlineError::TokenPool(TokenPoolError::NotCertified(token.session_id))
+            })?;
+        }
+        Ok(batch)
+    }
+
     /// Number of tokens in the batch.
     pub fn len(&self) -> usize {
         self.tokens.len()
@@ -444,6 +525,11 @@ impl ConsumedBccCertifiedTokenBatch {
     /// Consumed token references for a private backend.
     pub fn tokens(&self) -> &[CertifiedToken] {
         &self.tokens
+    }
+
+    /// Session ids in consumed batch order.
+    pub fn session_ids(&self) -> Vec<SessionId> {
+        self.tokens.iter().map(|token| token.session_id).collect()
     }
 }
 
@@ -950,6 +1036,40 @@ where
     }
 }
 
+impl<P, Source, Store, V>
+    StrictSigningSession<
+        P,
+        ProductionStrictRuntimeSelectedOpeningArtifactBackend<Source>,
+        Store,
+        V,
+        StrictSigningCursorMemoryStore,
+        DirectStrictSigningComponentRuntime,
+    >
+where
+    P: MlDsaParams,
+    Source: StrictRuntimeSelectedOpeningArtifactSource<P>,
+    Store: TokenConsumptionStore,
+    V: FinalVerifier,
+{
+    /// Starts one release-capable strict signing session.
+    ///
+    /// This constructor requires a [`ProductionStrictRuntimeSelectedOpeningBackend`]
+    /// that consumes the selected-opening artifact emitted by the distributed
+    /// vector runtime. Dev/test callers may still use [`StrictSigningSession::start`],
+    /// but release builds also re-check the selected-output certificate in
+    /// [`StrictSigningSession::finish`].
+    pub fn start_release_validated(
+        request: StrictSignRequest,
+        tr: [u8; 64],
+        batch: BccCertifiedTokenBatch,
+        consumed: Store,
+        backend: ProductionStrictRuntimeSelectedOpeningArtifactBackend<Source>,
+        verifier: V,
+    ) -> Result<Self, OnlineError> {
+        Self::start(request, tr, batch, consumed, backend, verifier)
+    }
+}
+
 impl<P, B, S, V>
     StrictSigningSession<
         P,
@@ -1261,44 +1381,52 @@ where
             store: &mut self.cursor_store,
             cursor: observer_cursor,
         };
-        let result = self
-            .backend
-            .sign_consumed_batch_with_observer(
-                &self.request,
-                &self.tr,
-                consumed_batch,
-                &mut observer,
-            )
-            .and_then(|selected| {
-                if selected.evidence.token_count != strict_token_count {
-                    return Err(OnlineError::StrictResponseCheckShapeMismatch);
-                }
-                selected
-                    .evidence
-                    .response_check_counters
-                    .validate_for_batch(strict_token_count)?;
-                let verify_request = SignRequest {
-                    protocol_version: self.request.protocol_version,
-                    suite: self.request.suite,
-                    session_id: SessionId([0u8; 32]),
-                    signing_set: self.request.signing_set.clone(),
-                    message: self.request.message.clone(),
-                    external_mu: self.request.external_mu,
-                    context: self.request.context.clone(),
-                    token_transcript_hash: TranscriptHash([0u8; 32]),
-                };
-                if !self
-                    .verifier
-                    .verify_final(&verify_request, &selected.signature)
-                {
-                    self.counters.final_verify_failures =
-                        self.counters.final_verify_failures.saturating_add(1);
-                    return Err(OnlineError::FinalVerifyFailed);
-                }
-                self.counters.signatures_returned =
-                    self.counters.signatures_returned.saturating_add(1);
-                Ok(selected.signature)
-            });
+        let result =
+            self.backend
+                .sign_consumed_batch_with_observer(
+                    &self.request,
+                    &self.tr,
+                    consumed_batch,
+                    &mut observer,
+                )
+                .and_then(|selected| {
+                    if selected.evidence.token_count != strict_token_count {
+                        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+                    }
+                    selected
+                        .evidence
+                        .response_check_counters
+                        .validate_for_batch(strict_token_count)?;
+                    #[cfg(feature = "production-release-checks")]
+                    {
+                        if !selected.vector_runtime_certificate.as_ref().is_some_and(
+                            |certificate| certificate.is_selected_opening_artifact_bound(),
+                        ) {
+                            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+                        }
+                    }
+                    let verify_request = SignRequest {
+                        protocol_version: self.request.protocol_version,
+                        suite: self.request.suite,
+                        session_id: SessionId([0u8; 32]),
+                        signing_set: self.request.signing_set.clone(),
+                        message: self.request.message.clone(),
+                        external_mu: self.request.external_mu,
+                        context: self.request.context.clone(),
+                        token_transcript_hash: TranscriptHash([0u8; 32]),
+                    };
+                    if !self
+                        .verifier
+                        .verify_final(&verify_request, &selected.signature)
+                    {
+                        self.counters.final_verify_failures =
+                            self.counters.final_verify_failures.saturating_add(1);
+                        return Err(OnlineError::FinalVerifyFailed);
+                    }
+                    self.counters.signatures_returned =
+                        self.counters.signatures_returned.saturating_add(1);
+                    Ok(selected.signature)
+                });
         match result {
             Ok(signature) => {
                 self.phase = StrictSigningSessionPhase::Finished;
@@ -2115,6 +2243,89 @@ where
     }
 }
 
+/// Release adapter that binds strict-signing output to durable production
+/// vector IT-MPC runtime evidence.
+///
+/// The canonical component stack intentionally emits no release certificate by
+/// itself. A release-capable caller must drive the vector runtime, collect
+/// durable evidence from that runtime, and wrap the component stack with this
+/// adapter so the selected signature cannot be persisted without the Phase 3
+/// evidence gate passing.
+pub struct ProductionStrictSigningVectorMpcRuntimeBackend<B> {
+    inner: B,
+    runtime_certificate: StrictSigningVectorRuntimeCertificate,
+}
+
+impl<B> ProductionStrictSigningVectorMpcRuntimeBackend<B> {
+    /// Creates a release-capable strict-signing adapter from durable runtime
+    /// evidence. Incomplete, scalarized, or local-only evidence is rejected by
+    /// [`StrictSigningVectorRuntimeCertificate::new`].
+    pub fn new(
+        inner: B,
+        runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+    ) -> Result<Self, OnlineError> {
+        let runtime_certificate = StrictSigningVectorRuntimeCertificate::new(runtime_evidence)?;
+        Ok(Self {
+            inner,
+            runtime_certificate,
+        })
+    }
+
+    /// Creates an adapter from an already validated strict-signing runtime
+    /// certificate.
+    pub const fn with_certificate(
+        inner: B,
+        runtime_certificate: StrictSigningVectorRuntimeCertificate,
+    ) -> Self {
+        Self {
+            inner,
+            runtime_certificate,
+        }
+    }
+
+    /// Returns the validated runtime certificate attached by this adapter.
+    pub fn runtime_certificate(&self) -> &StrictSigningVectorRuntimeCertificate {
+        &self.runtime_certificate
+    }
+
+    /// Consumes the adapter and returns the wrapped backend.
+    pub fn into_inner(self) -> B {
+        self.inner
+    }
+}
+
+impl<P, B> StrictPrivateSigningBackend<P> for ProductionStrictSigningVectorMpcRuntimeBackend<B>
+where
+    P: MlDsaParams,
+    B: StrictPrivateSigningBackend<P>,
+{
+    fn sign_consumed_batch(
+        &mut self,
+        request: &StrictSignRequest,
+        tr: &[u8; 64],
+        batch: ConsumedBccCertifiedTokenBatch,
+    ) -> Result<StrictSelectedSignature, OnlineError> {
+        let selected = self.inner.sign_consumed_batch(request, tr, batch)?;
+        Ok(selected.with_vector_runtime_certificate(self.runtime_certificate.clone()))
+    }
+
+    fn sign_consumed_batch_with_observer<O>(
+        &mut self,
+        request: &StrictSignRequest,
+        tr: &[u8; 64],
+        batch: ConsumedBccCertifiedTokenBatch,
+        observer: &mut O,
+    ) -> Result<StrictSelectedSignature, OnlineError>
+    where
+        O: StrictSigningRuntimeObserver,
+    {
+        let selected = self
+            .inner
+            .sign_consumed_batch_with_observer(request, tr, batch, observer)?;
+        Ok(selected.with_vector_runtime_certificate(self.runtime_certificate.clone()))
+    }
+}
+
 /// One party's private polynomial shares for strict vector signing.
 #[derive(Clone, Eq, PartialEq)]
 pub struct StrictPolynomialSigningShare {
@@ -2146,6 +2357,19 @@ pub trait StrictPolynomialShareProvider {
     ) -> Result<StrictPolynomialSigningShare, OnlineError>;
 }
 
+impl<T> StrictPolynomialShareProvider for &T
+where
+    T: StrictPolynomialShareProvider + ?Sized,
+{
+    fn signing_share(
+        &self,
+        session_id: SessionId,
+        party: PartyId,
+    ) -> Result<StrictPolynomialSigningShare, OnlineError> {
+        (**self).signing_share(session_id, party)
+    }
+}
+
 /// Opaque handle for one strict vector signing candidate.
 #[derive(Clone)]
 pub struct StrictVectorCandidateHandle {
@@ -2154,6 +2378,7 @@ pub struct StrictVectorCandidateHandle {
     response: PolyVec,
     bound_ok: Option<bool>,
     hint_ok: Option<bool>,
+    hint: Option<PolyVec>,
     signature: Option<FinalSignature>,
 }
 
@@ -2162,6 +2387,2869 @@ impl fmt::Debug for StrictVectorCandidateHandle {
         f.debug_struct("StrictVectorCandidateHandle")
             .field("priority", &self.priority)
             .finish()
+    }
+}
+
+/// Runtime-owned strict-signing candidate.
+///
+/// This is the release-path candidate shape. It carries only production vector
+/// MPC handles and public metadata; it does not contain local `PolyVec`
+/// responses, local pass/fail booleans, or prebuilt signatures.
+#[derive(Clone)]
+pub struct StrictRuntimeCandidateHandle {
+    priority: StrictCandidatePriority,
+    ctilde: Vec<u8>,
+    z_share: ProductionShareVec,
+    z_bound_ok: Option<ProductionBitShareVec>,
+    h_bits: Option<ProductionBitShareVec>,
+    hint_ok: Option<ProductionBitShareVec>,
+    valid: Option<ProductionBitShareVec>,
+    selected_z_share: Option<ProductionShareVec>,
+    selected_h_bits: Option<ProductionBitShareVec>,
+}
+
+impl StrictRuntimeCandidateHandle {
+    /// Creates a runtime-owned candidate after response preparation.
+    pub fn new_runtime_prepared(
+        priority: StrictCandidatePriority,
+        ctilde: Vec<u8>,
+        z_share: ProductionShareVec,
+    ) -> Self {
+        Self {
+            priority,
+            ctilde,
+            z_share,
+            z_bound_ok: None,
+            h_bits: None,
+            hint_ok: None,
+            valid: None,
+            selected_z_share: None,
+            selected_h_bits: None,
+        }
+    }
+
+    /// Public priority for private selection.
+    pub const fn priority(&self) -> StrictCandidatePriority {
+        self.priority
+    }
+
+    /// Public challenge seed bound to this candidate.
+    pub fn ctilde(&self) -> &[u8] {
+        &self.ctilde
+    }
+
+    /// Runtime-owned shared response `[z]`.
+    pub const fn z_share(&self) -> &ProductionShareVec {
+        &self.z_share
+    }
+
+    /// Private response-bound pass bit, once computed.
+    pub const fn z_bound_ok(&self) -> Option<&ProductionBitShareVec> {
+        self.z_bound_ok.as_ref()
+    }
+
+    /// Private hint/highbits pass bit, once computed.
+    pub const fn hint_ok(&self) -> Option<&ProductionBitShareVec> {
+        self.hint_ok.as_ref()
+    }
+
+    /// Private hint-bit vector, once computed.
+    pub const fn h_bits(&self) -> Option<&ProductionBitShareVec> {
+        self.h_bits.as_ref()
+    }
+
+    /// Private combined validity bit, once computed.
+    pub const fn valid(&self) -> Option<&ProductionBitShareVec> {
+        self.valid.as_ref()
+    }
+
+    /// Selected shared response handle, once private selection has run.
+    pub const fn selected_z_share(&self) -> Option<&ProductionShareVec> {
+        self.selected_z_share.as_ref()
+    }
+
+    /// Selected shared hint-bit handle, once private selection has run.
+    pub const fn selected_h_bits(&self) -> Option<&ProductionBitShareVec> {
+        self.selected_h_bits.as_ref()
+    }
+
+    /// Installs the private response-bound pass bit.
+    pub fn with_z_bound_ok(mut self, bit: ProductionBitShareVec) -> Self {
+        self.z_bound_ok = Some(bit);
+        self
+    }
+
+    /// Installs the private hint/highbits pass bit.
+    pub fn with_hint_ok(mut self, bit: ProductionBitShareVec) -> Self {
+        self.hint_ok = Some(bit);
+        self
+    }
+
+    /// Installs the private hint-bit vector.
+    pub fn with_h_bits(mut self, bits: ProductionBitShareVec) -> Self {
+        self.h_bits = Some(bits);
+        self
+    }
+
+    /// Installs the private combined validity bit.
+    pub fn with_valid(mut self, bit: ProductionBitShareVec) -> Self {
+        self.valid = Some(bit);
+        self
+    }
+
+    /// Installs selected-output handles produced by private selection.
+    pub fn with_selected_handles(
+        mut self,
+        z_share: ProductionShareVec,
+        h_bits: ProductionBitShareVec,
+    ) -> Self {
+        self.selected_z_share = Some(z_share);
+        self.selected_h_bits = Some(h_bits);
+        self
+    }
+}
+
+impl fmt::Debug for StrictRuntimeCandidateHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StrictRuntimeCandidateHandle")
+            .field("priority", &self.priority)
+            .field("ctilde_len", &self.ctilde.len())
+            .field("z_share", &self.z_share.id())
+            .field("z_bound_ok", &self.z_bound_ok.as_ref().map(|bit| bit.id()))
+            .field("h_bits", &self.h_bits.as_ref().map(|bits| bits.id()))
+            .field("hint_ok", &self.hint_ok.as_ref().map(|bit| bit.id()))
+            .field("valid", &self.valid.as_ref().map(|bit| bit.id()))
+            .field(
+                "selected_z_share",
+                &self.selected_z_share.as_ref().map(|share| share.id()),
+            )
+            .field(
+                "selected_h_bits",
+                &self.selected_h_bits.as_ref().map(|bits| bits.id()),
+            )
+            .finish()
+    }
+}
+
+/// Converts a polynomial vector to runtime lane order:
+/// `poly_0[0..256], poly_1[0..256], ...`.
+pub fn strict_polyvec_to_runtime_lanes<P: MlDsaParams>(
+    polyvec: &PolyVec,
+) -> Result<Vec<talus_core::Coeff>, OnlineError> {
+    if polyvec.len() != P::L {
+        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+    }
+    let mut lanes = Vec::with_capacity(P::L * P::N);
+    for poly in polyvec.polys() {
+        lanes.extend_from_slice(poly.coeffs());
+    }
+    Ok(lanes)
+}
+
+/// Builds the runtime-owned response share `[z] = [y] + c[s1]`.
+///
+/// The challenge multiplication is public-linear and therefore stays local to
+/// the vector runtime; no secret-dependent value is opened.
+pub fn strict_prepare_runtime_z_share<P, T, L, C>(
+    runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    y_share: &ProductionShareVec,
+    s1_share: &ProductionShareVec,
+    ctilde: &[u8],
+    label: &Power2RoundTranscriptLabel,
+) -> Result<ProductionShareVec, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    let c_s1 = runtime
+        .mul_public_challenge_polyvec_share_vec::<P>(
+            config,
+            s1_share,
+            ctilde,
+            &label.child("c_times_s1"),
+        )
+        .map_err(OnlineError::from)?;
+    runtime
+        .add_share_vec::<P>(config, y_share, &c_s1, &label.child("z"))
+        .map_err(OnlineError::from)
+}
+
+fn strict_runtime_polyvec_to_lanes(polyvec: &PolyVec) -> Vec<talus_core::Coeff> {
+    let mut lanes = Vec::with_capacity(polyvec.len() * 256);
+    for poly in polyvec.polys() {
+        lanes.extend_from_slice(poly.coeffs());
+    }
+    lanes
+}
+
+/// Computes the public-linear `A[z]` share for strict signing.
+pub fn strict_runtime_az_share<P, T, L, C>(
+    runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    rho: &[u8; 32],
+    z_share: &ProductionShareVec,
+    label: &Power2RoundTranscriptLabel,
+) -> Result<ProductionShareVec, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    runtime
+        .az_from_rho_share_vec::<P>(config, rho, z_share, label)
+        .map_err(OnlineError::from)
+}
+
+/// Computes the private verifier approximation share
+/// `[r] = A[z] - c*t1*2^d` for strict hint checks.
+pub fn strict_runtime_hint_approx_share<P, T, L, C>(
+    runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    public_key: &[u8],
+    ctilde: &[u8],
+    z_share: &ProductionShareVec,
+    label: &Power2RoundTranscriptLabel,
+) -> Result<ProductionShareVec, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    let decoded = public_key_decode::<P>(public_key)?;
+    let az = strict_runtime_az_share::<P, T, L, C>(
+        runtime,
+        config,
+        &decoded.rho,
+        z_share,
+        &label.child("az"),
+    )?;
+    let challenge = sample_in_ball::<P>(ctilde);
+    let t1_2d = talus_core::t1_times_2d::<P>(&decoded.t1);
+    let ct1 = mul_challenge_polyvec::<P>(&challenge, &t1_2d);
+    let ct1_lanes = strict_runtime_polyvec_to_lanes(&ct1);
+    let ct1_share = runtime
+        .public_lanes_share_vec::<P>(config, &label.child("ct1_2d"), &ct1_lanes)
+        .map_err(OnlineError::from)?;
+    runtime
+        .sub_share_vec::<P>(config, &az, &ct1_share, &label.child("hint_approx"))
+        .map_err(OnlineError::from)
+}
+
+/// Runtime-owned private z-bound check state.
+///
+/// Given canonical bits of `[z]`, this state computes the private predicate
+/// `z_bound_ok = ([z] < Gamma) OR ([z] > q - Gamma)`, where
+/// `Gamma = gamma1 - beta`. No coefficient, failed predicate, or pass bit is
+/// opened by this state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictRuntimeZBoundCheckState {
+    lt_gamma: ProductionPublicComparisonVecState,
+    gt_upper: ProductionPublicComparisonVecState,
+    pending_or: bool,
+    ok: Option<ProductionBitShareVec>,
+}
+
+impl StrictRuntimeZBoundCheckState {
+    /// Initializes the private z-bound comparisons from canonical bits of z.
+    pub fn new<P, T, L, C>(
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        z_bits_by_bit_le: &[ProductionBitShareVec],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<Self, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if z_bits_by_bit_le.len() != 23 {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        let gamma = u32::try_from(P::GAMMA1 - P::BETA)
+            .map_err(|_| OnlineError::StrictResponseCheckShapeMismatch)?;
+        let upper = P::Q as u32 - gamma;
+        Ok(Self {
+            lt_gamma: runtime
+                .start_lt_public_vec::<P>(
+                    config,
+                    z_bits_by_bit_le,
+                    gamma,
+                    &label.child("z_lt_gamma"),
+                )
+                .map_err(OnlineError::from)?,
+            gt_upper: runtime
+                .start_gt_public_vec::<P>(
+                    config,
+                    z_bits_by_bit_le,
+                    upper,
+                    &label.child("z_gt_q_minus_gamma"),
+                )
+                .map_err(OnlineError::from)?,
+            pending_or: false,
+            ok: None,
+        })
+    }
+
+    /// Returns the private z-bound result once available.
+    pub fn result(&self) -> Option<&ProductionBitShareVec> {
+        self.ok.as_ref()
+    }
+
+    /// Drives one multiplication layer of the lower-bound comparison.
+    pub fn drive_lt_gamma_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        runtime
+            .drive_public_comparison_vec_step::<P, E>(config, &mut self.lt_gamma, entropy)
+            .map_err(OnlineError::from)
+    }
+
+    /// Collects one multiplication layer of the lower-bound comparison.
+    pub fn collect_lt_gamma_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime
+            .collect_public_comparison_vec_step::<P>(config, &mut self.lt_gamma)
+            .map_err(OnlineError::from)
+    }
+
+    /// Drives one multiplication layer of the upper-bound comparison.
+    pub fn drive_gt_upper_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        runtime
+            .drive_public_comparison_vec_step::<P, E>(config, &mut self.gt_upper, entropy)
+            .map_err(OnlineError::from)
+    }
+
+    /// Collects one multiplication layer of the upper-bound comparison.
+    pub fn collect_gt_upper_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime
+            .collect_public_comparison_vec_step::<P>(config, &mut self.gt_upper)
+            .map_err(OnlineError::from)
+    }
+
+    /// Drives the private OR of the two completed comparison bits.
+    pub fn drive_or_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        if self.pending_or {
+            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+        }
+        let lt = self
+            .lt_gamma
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let gt = self
+            .gt_upper
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        runtime
+            .drive_bit_and_vec::<P, E>(config, lt, gt, &label.child("z_bound_or"), entropy)
+            .map_err(OnlineError::from)?;
+        self.pending_or = true;
+        Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+            receiver: runtime.local_party(),
+            kind: talus_dkg::PrimeFieldMpcRoundKind::MulDegreeReduce,
+            phase: talus_dkg::PrimeFieldMpcPhase::MulDegreeReductionShare,
+            label_hash: talus_dkg::power2round_label_hash(
+                &label
+                    .child("z_bound_or")
+                    .child("bit_and")
+                    .child("mul_layer"),
+            ),
+        })
+    }
+
+    /// Collects the private OR result.
+    pub fn collect_or_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if !self.pending_or {
+            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+        }
+        let (status, and_bit) = match runtime
+            .collect_bit_and_vec::<P>(config, &label.child("z_bound_or"))
+        {
+            Ok(ProductionVectorItMpcCollectResult::Waiting(status)) => {
+                return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+            }
+            Ok(ProductionVectorItMpcCollectResult::Collected { status, value }) => (status, value),
+            Err(err) => return Err(OnlineError::from(err)),
+        };
+        let lt = self
+            .lt_gamma
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let gt = self
+            .gt_upper
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        self.ok = Some(
+            runtime
+                .bit_or_from_and_vec::<P>(config, lt, gt, &and_bit, &label.child("z_bound_ok"))
+                .map_err(OnlineError::from)?,
+        );
+        self.pending_or = false;
+        Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+    }
+}
+
+fn strict_highbits_interval_constants<P: MlDsaParams>(
+    w1: &[u32],
+) -> Result<
+    (
+        Vec<talus_core::Coeff>,
+        Vec<talus_core::Coeff>,
+        Vec<talus_core::Coeff>,
+    ),
+    OnlineError,
+> {
+    let expected = P::K * P::N;
+    if w1.len() != expected {
+        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+    }
+    let high_mod = ((P::Q - 1) / (2 * P::GAMMA2)) as u32;
+    let alpha = 2 * P::GAMMA2;
+    let mut lower = Vec::with_capacity(expected);
+    let mut upper_exclusive = Vec::with_capacity(expected);
+    let mut wraps_zero = Vec::with_capacity(expected);
+    for (idx, &high) in w1.iter().enumerate() {
+        if high >= high_mod {
+            return Err(OnlineError::Hint(HintError::W1OutOfRange {
+                index: idx,
+                value: high,
+            }));
+        }
+        if high == 0 {
+            lower.push(P::Q - P::GAMMA2 - 1);
+            upper_exclusive.push(P::GAMMA2 + 1);
+            wraps_zero.push(1);
+        } else {
+            let center = i64::from(high) * i64::from(alpha);
+            lower.push((center - i64::from(P::GAMMA2)) as talus_core::Coeff);
+            upper_exclusive.push((center + i64::from(P::GAMMA2) + 1) as talus_core::Coeff);
+            wraps_zero.push(0);
+        }
+    }
+    Ok((lower, upper_exclusive, wraps_zero))
+}
+
+/// Runtime-owned private hint-bit derivation state.
+///
+/// Given canonical bits of `[r] = A[z] - c*t1*2^d`, this state computes the
+/// private TALUS hint vector `h = HighBits(r) != w1` without opening `r`,
+/// `HighBits(r)`, per-coefficient pass/fail bits, or hint weight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictRuntimeHintBitsCheckState {
+    gt_lower: ProductionPublicComparisonVecState,
+    lt_upper: ProductionPublicComparisonVecState,
+    wraps_zero: Vec<talus_core::Coeff>,
+    pending_and: bool,
+    pending_or: bool,
+    interval_and: Option<ProductionBitShareVec>,
+    interval_or: Option<ProductionBitShareVec>,
+    hint_bits: Option<ProductionBitShareVec>,
+}
+
+impl StrictRuntimeHintBitsCheckState {
+    /// Initializes private interval checks for `HighBits(r) == w1`.
+    pub fn new<P, T, L, C>(
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        r_bits_by_bit_le: &[ProductionBitShareVec],
+        w1: &[u32],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<Self, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if r_bits_by_bit_le.len() != 23 {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        let (lower, upper_exclusive, wraps_zero) = strict_highbits_interval_constants::<P>(w1)?;
+        Ok(Self {
+            gt_lower: runtime
+                .start_gt_public_lanes_vec::<P>(
+                    config,
+                    r_bits_by_bit_le,
+                    &lower,
+                    &label.child("highbits_gt_lower"),
+                )
+                .map_err(OnlineError::from)?,
+            lt_upper: runtime
+                .start_lt_public_lanes_vec::<P>(
+                    config,
+                    r_bits_by_bit_le,
+                    &upper_exclusive,
+                    &label.child("highbits_lt_upper"),
+                )
+                .map_err(OnlineError::from)?,
+            wraps_zero,
+            pending_and: false,
+            pending_or: false,
+            interval_and: None,
+            interval_or: None,
+            hint_bits: None,
+        })
+    }
+
+    /// Returns the private hint bits once available.
+    pub fn hint_bits(&self) -> Option<&ProductionBitShareVec> {
+        self.hint_bits.as_ref()
+    }
+
+    /// Drives one multiplication layer of the lower interval comparison.
+    pub fn drive_gt_lower_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        runtime
+            .drive_public_comparison_vec_step::<P, E>(config, &mut self.gt_lower, entropy)
+            .map_err(OnlineError::from)
+    }
+
+    /// Collects one multiplication layer of the lower interval comparison.
+    pub fn collect_gt_lower_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime
+            .collect_public_comparison_vec_step::<P>(config, &mut self.gt_lower)
+            .map_err(OnlineError::from)
+    }
+
+    /// Drives one multiplication layer of the upper interval comparison.
+    pub fn drive_lt_upper_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        runtime
+            .drive_public_comparison_vec_step::<P, E>(config, &mut self.lt_upper, entropy)
+            .map_err(OnlineError::from)
+    }
+
+    /// Collects one multiplication layer of the upper interval comparison.
+    pub fn collect_lt_upper_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime
+            .collect_public_comparison_vec_step::<P>(config, &mut self.lt_upper)
+            .map_err(OnlineError::from)
+    }
+
+    /// Drives the private `gt_lower AND lt_upper` interval bit.
+    pub fn drive_interval_and_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        if self.pending_and {
+            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+        }
+        let gt = self
+            .gt_lower
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let lt = self
+            .lt_upper
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        runtime
+            .drive_bit_and_vec::<P, E>(config, gt, lt, &label.child("highbits_interval"), entropy)
+            .map_err(OnlineError::from)?;
+        self.pending_and = true;
+        Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+            receiver: runtime.local_party(),
+            kind: talus_dkg::PrimeFieldMpcRoundKind::MulDegreeReduce,
+            phase: talus_dkg::PrimeFieldMpcPhase::MulDegreeReductionShare,
+            label_hash: talus_dkg::power2round_label_hash(
+                &label
+                    .child("highbits_interval")
+                    .child("bit_and")
+                    .child("mul_layer"),
+            ),
+        })
+    }
+
+    /// Collects `gt_lower AND lt_upper`.
+    pub fn collect_interval_and_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if !self.pending_and {
+            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+        }
+        match runtime.collect_bit_and_vec::<P>(config, &label.child("highbits_interval")) {
+            Ok(ProductionVectorItMpcCollectResult::Waiting(status)) => {
+                Ok(ProductionVectorItMpcCollectResult::Waiting(status))
+            }
+            Ok(ProductionVectorItMpcCollectResult::Collected { status, value }) => {
+                self.interval_and = Some(value);
+                self.pending_and = false;
+                Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+            }
+            Err(err) => Err(OnlineError::from(err)),
+        }
+    }
+
+    /// Drives the private wrap interval OR used when public `w1 == 0`.
+    pub fn drive_wrap_or_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        if self.pending_or {
+            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+        }
+        let gt = self
+            .gt_lower
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let lt = self
+            .lt_upper
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        runtime
+            .drive_bit_and_vec::<P, E>(config, gt, lt, &label.child("highbits_wrap_or"), entropy)
+            .map_err(OnlineError::from)?;
+        self.pending_or = true;
+        Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+            receiver: runtime.local_party(),
+            kind: talus_dkg::PrimeFieldMpcRoundKind::MulDegreeReduce,
+            phase: talus_dkg::PrimeFieldMpcPhase::MulDegreeReductionShare,
+            label_hash: talus_dkg::power2round_label_hash(
+                &label
+                    .child("highbits_wrap_or")
+                    .child("bit_and")
+                    .child("mul_layer"),
+            ),
+        })
+    }
+
+    /// Collects the wrap interval OR and finalizes private hint bits.
+    pub fn collect_wrap_or_and_finalize<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if !self.pending_or {
+            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+        }
+        let (status, and_bit) = match runtime
+            .collect_bit_and_vec::<P>(config, &label.child("highbits_wrap_or"))
+        {
+            Ok(ProductionVectorItMpcCollectResult::Waiting(status)) => {
+                return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+            }
+            Ok(ProductionVectorItMpcCollectResult::Collected { status, value }) => (status, value),
+            Err(err) => return Err(OnlineError::from(err)),
+        };
+        let gt = self
+            .gt_lower
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let lt = self
+            .lt_upper
+            .result()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let interval_or = runtime
+            .bit_or_from_and_vec::<P>(config, gt, lt, &and_bit, &label.child("interval_wrap_or"))
+            .map_err(OnlineError::from)?;
+        self.interval_or = Some(interval_or);
+        self.pending_or = false;
+        self.finalize_hint_bits::<P, T, L, C>(runtime, config, label)?;
+        Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+    }
+
+    fn finalize_hint_bits<P, T, L, C>(
+        &mut self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(), OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let interval_and = self
+            .interval_and
+            .as_ref()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let interval_or = self
+            .interval_or
+            .as_ref()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let eq_high = runtime
+            .public_lane_select_bit_vec::<P>(
+                config,
+                interval_or,
+                interval_and,
+                &self.wraps_zero,
+                &label.child("eq_highbits"),
+            )
+            .map_err(OnlineError::from)?;
+        self.hint_bits = Some(
+            runtime
+                .bit_not_vec::<P>(config, &eq_high, &label.child("hint_bits"))
+                .map_err(OnlineError::from)?,
+        );
+        Ok(())
+    }
+}
+
+fn strict_split_bit_vec_lanes<P, T, L, C>(
+    runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    bits: &ProductionBitShareVec,
+    label: &Power2RoundTranscriptLabel,
+) -> Result<Vec<ProductionBitShareVec>, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    runtime
+        .split_bit_share_vec_lanes::<P>(config, bits, label)
+        .map_err(OnlineError::from)
+}
+
+/// Runtime-owned private hint-weight check state.
+///
+/// This converts a private hint vector into a single private pass bit
+/// `[wt(h) <= omega]`. The pass bit is not opened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictRuntimeHintWeightCheckState {
+    threshold: ProductionBitSumLeqPublicVecState,
+}
+
+impl StrictRuntimeHintWeightCheckState {
+    /// Initializes private `wt(h) <= omega`.
+    pub fn new<P, T, L, C>(
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        h_bits: &ProductionBitShareVec,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<Self, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if h_bits.len() != P::K * P::N {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        let bits = strict_split_bit_vec_lanes::<P, T, L, C>(runtime, config, h_bits, label)?;
+        Ok(Self {
+            threshold: runtime
+                .start_bit_sum_leq_public_vec::<P>(
+                    config,
+                    &bits,
+                    P::OMEGA as u32,
+                    &label.child("hint_weight_leq_omega"),
+                )
+                .map_err(OnlineError::from)?,
+        })
+    }
+
+    /// Returns the private pass bit once available.
+    pub fn result(&self) -> Option<&ProductionBitShareVec> {
+        self.threshold.result()
+    }
+
+    /// Drives one multiplication layer of the private hint-weight check.
+    pub fn drive_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        runtime
+            .drive_bit_sum_leq_public_vec_step::<P, E>(config, &mut self.threshold, entropy)
+            .map_err(OnlineError::from)
+    }
+
+    /// Collects one multiplication layer of the private hint-weight check.
+    pub fn collect_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime
+            .collect_bit_sum_leq_public_vec_step::<P>(config, &mut self.threshold)
+            .map_err(OnlineError::from)
+    }
+}
+
+/// Runtime-owned private `AND` over every lane in a bit vector.
+///
+/// This returns a single private bit proving all input lanes were one by
+/// checking `sum(!bits) <= 0`. It is used to turn per-coefficient z-bound
+/// predicates into one candidate-level private pass bit without opening failed
+/// coefficient locations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictRuntimeAllBitsTrueState {
+    threshold: ProductionBitSumLeqPublicVecState,
+}
+
+impl StrictRuntimeAllBitsTrueState {
+    /// Initializes private `all(bits)`.
+    pub fn new<P, T, L, C>(
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        bits: &ProductionBitShareVec,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<Self, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let not_bits = runtime
+            .bit_not_vec::<P>(config, bits, &label.child("not_bits"))
+            .map_err(OnlineError::from)?;
+        let violation_bits =
+            strict_split_bit_vec_lanes::<P, T, L, C>(runtime, config, &not_bits, label)?;
+        Ok(Self {
+            threshold: runtime
+                .start_bit_sum_leq_public_vec::<P>(
+                    config,
+                    &violation_bits,
+                    0,
+                    &label.child("all_bits_true"),
+                )
+                .map_err(OnlineError::from)?,
+        })
+    }
+
+    /// Returns the private all-true bit once available.
+    pub fn result(&self) -> Option<&ProductionBitShareVec> {
+        self.threshold.result()
+    }
+
+    /// Drives one multiplication layer.
+    pub fn drive_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        runtime
+            .drive_bit_sum_leq_public_vec_step::<P, E>(config, &mut self.threshold, entropy)
+            .map_err(OnlineError::from)
+    }
+
+    /// Collects one multiplication layer.
+    pub fn collect_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime
+            .collect_bit_sum_leq_public_vec_step::<P>(config, &mut self.threshold)
+            .map_err(OnlineError::from)
+    }
+}
+
+/// Runtime-owned private valid-bit combination state.
+///
+/// Computes `valid = z_bound_ok AND hint_ok` without opening either predicate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictRuntimeValidBitState {
+    pending: bool,
+    valid: Option<ProductionBitShareVec>,
+}
+
+impl StrictRuntimeValidBitState {
+    /// Creates an empty valid-bit combiner.
+    pub const fn new() -> Self {
+        Self {
+            pending: false,
+            valid: None,
+        }
+    }
+
+    /// Returns the private valid bit once available.
+    pub fn result(&self) -> Option<&ProductionBitShareVec> {
+        self.valid.as_ref()
+    }
+
+    /// Drives `z_bound_ok AND hint_ok`.
+    pub fn drive_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        z_bound_ok: &ProductionBitShareVec,
+        hint_ok: &ProductionBitShareVec,
+        label: &Power2RoundTranscriptLabel,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        if self.pending {
+            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+        }
+        runtime
+            .drive_bit_and_vec::<P, E>(
+                config,
+                z_bound_ok,
+                hint_ok,
+                &label.child("valid_bit"),
+                entropy,
+            )
+            .map_err(OnlineError::from)?;
+        self.pending = true;
+        Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+            receiver: runtime.local_party(),
+            kind: talus_dkg::PrimeFieldMpcRoundKind::MulDegreeReduce,
+            phase: talus_dkg::PrimeFieldMpcPhase::MulDegreeReductionShare,
+            label_hash: talus_dkg::power2round_label_hash(
+                &label.child("valid_bit").child("bit_and").child("mul_layer"),
+            ),
+        })
+    }
+
+    /// Collects the private valid bit.
+    pub fn collect_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if !self.pending {
+            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+        }
+        match runtime.collect_bit_and_vec::<P>(config, &label.child("valid_bit")) {
+            Ok(ProductionVectorItMpcCollectResult::Waiting(status)) => {
+                Ok(ProductionVectorItMpcCollectResult::Waiting(status))
+            }
+            Ok(ProductionVectorItMpcCollectResult::Collected { status, value }) => {
+                self.valid = Some(value);
+                self.pending = false;
+                Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+            }
+            Err(err) => Err(OnlineError::from(err)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrictPrioritySelectionPending {
+    SelectedAnd,
+    PrefixOr,
+}
+
+/// Runtime-owned private priority selection state.
+///
+/// Candidates are processed in public-priority order. For candidate `j`, the
+/// state computes:
+///
+/// `selected_j = valid_j AND !any_lower_priority_valid`
+///
+/// and updates the private prefix bit. No `valid_j`, selected bit, invalid set,
+/// or failure reason is opened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictRuntimePrioritySelectionState {
+    order: Vec<usize>,
+    cursor: usize,
+    prefix_valid: ProductionBitShareVec,
+    pending: Option<StrictPrioritySelectionPending>,
+    selected_bits: Vec<Option<ProductionBitShareVec>>,
+}
+
+impl StrictRuntimePrioritySelectionState {
+    /// Initializes private priority selection.
+    pub fn new<P, T, L, C>(
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        priorities: &[StrictCandidatePriority],
+        valid_bits: &[ProductionBitShareVec],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<Self, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if priorities.len() != valid_bits.len() || priorities.is_empty() {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        if valid_bits.iter().any(|bit| bit.len() != 1) {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        let mut order = (0..priorities.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&idx| priorities[idx]);
+        Ok(Self {
+            order,
+            cursor: 0,
+            prefix_valid: runtime
+                .public_bit_share_vec::<P>(config, &label.child("prefix_valid_init"), false, 1)
+                .map_err(OnlineError::from)?,
+            pending: None,
+            selected_bits: vec![None; priorities.len()],
+        })
+    }
+
+    /// Returns true after every candidate has a private selected bit.
+    pub fn is_done(&self) -> bool {
+        self.cursor >= self.order.len() && self.pending.is_none()
+    }
+
+    /// Returns private one-hot selected bits once available.
+    pub fn selected_bits(&self) -> Option<Vec<ProductionBitShareVec>> {
+        if !self.is_done() {
+            return None;
+        }
+        self.selected_bits.iter().cloned().collect()
+    }
+
+    /// Returns the private "at least one valid candidate" bit after priority
+    /// selection completes.
+    pub fn any_valid_bit(&self) -> Option<ProductionBitShareVec> {
+        self.is_done().then(|| self.prefix_valid.clone())
+    }
+
+    /// Drives the next private selection multiplication layer.
+    pub fn drive_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        valid_bits: &[ProductionBitShareVec],
+        label: &Power2RoundTranscriptLabel,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        if self.pending.is_some() {
+            return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
+        }
+        if self.cursor >= self.order.len() {
+            return Ok(PrimeFieldMpcPhaseDriverStatus::Collected {
+                receiver: None,
+                kind: talus_dkg::PrimeFieldMpcRoundKind::AssertZero,
+                phase: talus_dkg::PrimeFieldMpcPhase::BitSumThresholdCheck,
+                label_hash: talus_dkg::power2round_label_hash(label),
+                senders: Vec::new(),
+            });
+        }
+        let candidate_idx = self.order[self.cursor];
+        if self.selected_bits[candidate_idx].is_some() {
+            runtime
+                .drive_bit_and_vec::<P, E>(
+                    config,
+                    &self.prefix_valid,
+                    &valid_bits[candidate_idx],
+                    &label.child(format!("candidate_{candidate_idx}/prefix_or")),
+                    entropy,
+                )
+                .map_err(OnlineError::from)?;
+            self.pending = Some(StrictPrioritySelectionPending::PrefixOr);
+            return Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+                receiver: runtime.local_party(),
+                kind: talus_dkg::PrimeFieldMpcRoundKind::MulDegreeReduce,
+                phase: talus_dkg::PrimeFieldMpcPhase::MulDegreeReductionShare,
+                label_hash: talus_dkg::power2round_label_hash(
+                    &label
+                        .child(format!("candidate_{candidate_idx}/prefix_or"))
+                        .child("bit_and")
+                        .child("mul_layer"),
+                ),
+            });
+        }
+        let not_prefix = runtime
+            .bit_not_vec::<P>(
+                config,
+                &self.prefix_valid,
+                &label.child(format!("candidate_{candidate_idx}/not_prefix")),
+            )
+            .map_err(OnlineError::from)?;
+        runtime
+            .drive_bit_and_vec::<P, E>(
+                config,
+                &valid_bits[candidate_idx],
+                &not_prefix,
+                &label.child(format!("candidate_{candidate_idx}/selected")),
+                entropy,
+            )
+            .map_err(OnlineError::from)?;
+        self.pending = Some(StrictPrioritySelectionPending::SelectedAnd);
+        Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+            receiver: runtime.local_party(),
+            kind: talus_dkg::PrimeFieldMpcRoundKind::MulDegreeReduce,
+            phase: talus_dkg::PrimeFieldMpcPhase::MulDegreeReductionShare,
+            label_hash: talus_dkg::power2round_label_hash(
+                &label
+                    .child(format!("candidate_{candidate_idx}/selected"))
+                    .child("bit_and")
+                    .child("mul_layer"),
+            ),
+        })
+    }
+
+    /// Collects the pending private selection multiplication layer.
+    pub fn collect_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        valid_bits: &[ProductionBitShareVec],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, OnlineError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let pending = self
+            .pending
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let candidate_idx = self.order[self.cursor];
+        match pending {
+            StrictPrioritySelectionPending::SelectedAnd => {
+                let selected_label = label.child(format!("candidate_{candidate_idx}/selected"));
+                let (status, selected) =
+                    match runtime.collect_bit_and_vec::<P>(config, &selected_label) {
+                        Ok(ProductionVectorItMpcCollectResult::Waiting(status)) => {
+                            return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+                        }
+                        Ok(ProductionVectorItMpcCollectResult::Collected { status, value }) => {
+                            (status, value)
+                        }
+                        Err(err) => return Err(OnlineError::from(err)),
+                    };
+                self.selected_bits[candidate_idx] = Some(selected);
+                self.pending = None;
+                Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+            }
+            StrictPrioritySelectionPending::PrefixOr => {
+                let prefix_label = label.child(format!("candidate_{candidate_idx}/prefix_or"));
+                let (status, and_bit) =
+                    match runtime.collect_bit_and_vec::<P>(config, &prefix_label) {
+                        Ok(ProductionVectorItMpcCollectResult::Waiting(status)) => {
+                            return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+                        }
+                        Ok(ProductionVectorItMpcCollectResult::Collected { status, value }) => {
+                            (status, value)
+                        }
+                        Err(err) => return Err(OnlineError::from(err)),
+                    };
+                self.prefix_valid = runtime
+                    .bit_or_from_and_vec::<P>(
+                        config,
+                        &self.prefix_valid,
+                        &valid_bits[candidate_idx],
+                        &and_bit,
+                        &label.child(format!("candidate_{candidate_idx}/prefix_valid")),
+                    )
+                    .map_err(OnlineError::from)?;
+                self.cursor += 1;
+                self.pending = None;
+                Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+            }
+        }
+    }
+}
+
+fn strict_hint_bits_to_polyvec<P: MlDsaParams>(
+    h_bits: &[talus_core::Coeff],
+) -> Result<PolyVec, OnlineError> {
+    if h_bits.len() != P::K * P::N {
+        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+    }
+    let mut polys = Vec::with_capacity(P::K);
+    for poly_idx in 0..P::K {
+        let mut coeffs = [0; 256];
+        for coeff_idx in 0..P::N {
+            let bit = h_bits[poly_idx * P::N + coeff_idx];
+            if bit != 0 && bit != 1 {
+                return Err(OnlineError::StrictResponseCheckShapeMismatch);
+            }
+            coeffs[coeff_idx] = bit;
+        }
+        polys.push(Poly::from_coeffs(coeffs));
+    }
+    Ok(PolyVec::new(polys))
+}
+
+/// Drives private selected-vector products `selected_j * value_j` for all
+/// candidates. The one-lane selected bits are repeated privately to the value
+/// vector shape before multiplication.
+pub fn strict_drive_selected_share_products<P, T, L, C, E>(
+    runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    selected_bits: &[ProductionBitShareVec],
+    values: &[ProductionShareVec],
+    label: &Power2RoundTranscriptLabel,
+    entropy: &mut E,
+) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+    E: ProductionVectorItMpcEntropy,
+{
+    if selected_bits.len() != values.len() || values.is_empty() {
+        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+    }
+    for (idx, (selected, value)) in selected_bits.iter().zip(values).enumerate() {
+        let repeated = runtime
+            .repeat_one_lane_bit_share_vec::<P>(
+                config,
+                selected,
+                value.len(),
+                &label.child(format!("candidate_{idx}/selected_repeated")),
+            )
+            .map_err(OnlineError::from)?;
+        runtime
+            .drive_selection_product_vec::<P, E>(
+                config,
+                &repeated,
+                value,
+                &label.child(format!("selection_product_{idx}")),
+                entropy,
+            )
+            .map_err(OnlineError::from)?;
+    }
+    Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+        receiver: runtime.local_party(),
+        kind: talus_dkg::PrimeFieldMpcRoundKind::MulDegreeReduce,
+        phase: talus_dkg::PrimeFieldMpcPhase::MulDegreeReductionShare,
+        label_hash: talus_dkg::power2round_label_hash(label),
+    })
+}
+
+/// Collects selected-vector products and returns the privately selected share.
+pub fn strict_collect_selected_share_products<P, T, L, C>(
+    runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    candidate_count: usize,
+    label: &Power2RoundTranscriptLabel,
+) -> Result<ProductionVectorItMpcCollectResult<ProductionShareVec>, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    runtime
+        .collect_selection_products_vec::<P>(config, candidate_count, label)
+        .map_err(OnlineError::from)
+}
+
+fn strict_u8_lanes_from_opening(lanes: &[talus_core::Coeff]) -> Result<Vec<u8>, OnlineError> {
+    lanes
+        .iter()
+        .map(|&lane| u8::try_from(lane).map_err(|_| OnlineError::StrictResponseCheckShapeMismatch))
+        .collect()
+}
+
+fn strict_selected_public_lanes_share<P, T, L, C>(
+    runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    selected_bits: &[ProductionBitShareVec],
+    public_lanes: &[Vec<u8>],
+    label: &Power2RoundTranscriptLabel,
+) -> Result<ProductionShareVec, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    if selected_bits.len() != public_lanes.len() || public_lanes.is_empty() {
+        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+    }
+    let lane_count = public_lanes[0].len();
+    if lane_count == 0
+        || public_lanes.iter().any(|lanes| lanes.len() != lane_count)
+        || selected_bits.iter().any(|bit| bit.len() != 1)
+    {
+        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+    }
+    let mut selected = runtime
+        .public_const_share_vec::<P>(config, &label.child("init"), 0, lane_count)
+        .map_err(OnlineError::from)?;
+    for (idx, (bit, lanes)) in selected_bits.iter().zip(public_lanes).enumerate() {
+        let repeated = runtime
+            .repeat_one_lane_bit_share_vec::<P>(
+                config,
+                bit,
+                lane_count,
+                &label.child(format!("candidate_{idx}/selected_repeated")),
+            )
+            .map_err(OnlineError::from)?;
+        let weighted = runtime
+            .mul_public_lanes_share_vec::<P>(
+                config,
+                repeated.certified_share(),
+                &lanes
+                    .iter()
+                    .copied()
+                    .map(talus_core::Coeff::from)
+                    .collect::<Vec<_>>(),
+                &label.child(format!("candidate_{idx}/weighted")),
+            )
+            .map_err(OnlineError::from)?;
+        selected = runtime
+            .add_share_vec::<P>(
+                config,
+                &selected,
+                &weighted,
+                &label.child(format!("candidate_{idx}/accumulate")),
+            )
+            .map_err(OnlineError::from)?;
+    }
+    Ok(selected)
+}
+
+/// Drives checked opening of the selected response `z`.
+pub fn strict_drive_selected_z_opening<P, T, L, C>(
+    runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    selected_z: &ProductionShareVec,
+    label: &Power2RoundTranscriptLabel,
+) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    if selected_z.len() != P::L * P::N {
+        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+    }
+    runtime
+        .drive_open_share_vec::<P>(config, selected_z, &label.child("open_selected_z"))
+        .map_err(OnlineError::from)
+}
+
+/// Collects checked selected `z` opening.
+pub fn strict_collect_selected_z_opening<P, T, L, C>(
+    runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    label: &Power2RoundTranscriptLabel,
+) -> Result<ProductionVectorItMpcCollectResult<PolyVec>, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    match runtime
+        .collect_open_share_vec::<P>(config, &label.child("open_selected_z"))
+        .map_err(OnlineError::from)?
+    {
+        ProductionVectorItMpcCollectResult::Waiting(status) => {
+            Ok(ProductionVectorItMpcCollectResult::Waiting(status))
+        }
+        ProductionVectorItMpcCollectResult::Collected { status, value } => {
+            Ok(ProductionVectorItMpcCollectResult::Collected {
+                status,
+                value: strict_runtime_lanes_to_opened_polyvec::<P>(&value, P::L)?,
+            })
+        }
+    }
+}
+
+fn strict_runtime_lanes_to_opened_polyvec<P: MlDsaParams>(
+    lanes: &[talus_core::Coeff],
+    poly_count: usize,
+) -> Result<PolyVec, OnlineError> {
+    if lanes.len() != poly_count * P::N {
+        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+    }
+    let mut polys = Vec::with_capacity(poly_count);
+    for poly_idx in 0..poly_count {
+        let mut coeffs = [0; 256];
+        coeffs.copy_from_slice(&lanes[poly_idx * P::N..(poly_idx + 1) * P::N]);
+        polys.push(Poly::from_coeffs(coeffs));
+    }
+    Ok(PolyVec::new(polys))
+}
+
+/// Drives checked opening of selected hint bits.
+pub fn strict_drive_selected_h_opening<P, T, L, C>(
+    runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    selected_h: &ProductionBitShareVec,
+    label: &Power2RoundTranscriptLabel,
+) -> Result<PrimeFieldMpcPhaseDriverStatus, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    if selected_h.len() != P::K * P::N {
+        return Err(OnlineError::StrictResponseCheckShapeMismatch);
+    }
+    runtime
+        .drive_open_bit_share_vec::<P>(config, selected_h, &label.child("open_selected_h"))
+        .map_err(OnlineError::from)
+}
+
+/// Collects checked selected hint bits opening.
+pub fn strict_collect_selected_h_opening<P, T, L, C>(
+    runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    label: &Power2RoundTranscriptLabel,
+) -> Result<ProductionVectorItMpcCollectResult<PolyVec>, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    match runtime
+        .collect_open_bit_share_vec::<P>(config, &label.child("open_selected_h"))
+        .map_err(OnlineError::from)?
+    {
+        ProductionVectorItMpcCollectResult::Waiting(status) => {
+            Ok(ProductionVectorItMpcCollectResult::Waiting(status))
+        }
+        ProductionVectorItMpcCollectResult::Collected { status, value } => {
+            Ok(ProductionVectorItMpcCollectResult::Collected {
+                status,
+                value: strict_hint_bits_to_polyvec::<P>(&value)?,
+            })
+        }
+    }
+}
+
+/// Encodes the final signature after selected `ctilde`, `z`, and `h` are
+/// available. This is intentionally after selected opening; candidate
+/// signatures are not prebuilt or stored on runtime handles.
+pub fn strict_encode_selected_signature<P: MlDsaParams>(
+    ctilde: &[u8],
+    z: &PolyVec,
+    h: &PolyVec,
+) -> Result<FinalSignature, OnlineError> {
+    signature_encode::<P>(ctilde, z, h)
+        .map(|bytes| FinalSignature { bytes })
+        .map_err(OnlineError::from)
+}
+
+/// Builds the selected strict-signing output after selected opening only.
+///
+/// This function is the final non-verifier step for the runtime-backed path:
+/// it encodes `ctilde*`, opened selected `z*`, and opened selected `h*`, then
+/// emits coarse public evidence. It accepts no unselected candidates and no
+/// pass/fail bits.
+pub fn strict_build_selected_signature_output<P: MlDsaParams>(
+    request: &StrictSignRequest,
+    token_count: usize,
+    selected_priority: StrictCandidatePriority,
+    ctilde: &[u8],
+    z: &PolyVec,
+    h: &PolyVec,
+) -> Result<StrictSelectedSignature, OnlineError> {
+    let signature = strict_encode_selected_signature::<P>(ctilde, z, h)?;
+    let signature_hash = strict_signature_hash(&signature);
+    let counters = StrictResponseCheckCounters {
+        candidates: token_count,
+        private_response_vectors: token_count,
+        z_bound_checks: token_count,
+        hint_weight_checks: token_count,
+        validity_bits: token_count,
+        selected_openings: 1,
+    };
+    counters.validate_for_batch(token_count)?;
+    Ok(StrictSelectedSignature {
+        signature,
+        evidence: StrictSigningEvidence {
+            token_count,
+            response_check_counters: counters,
+            selected_priority,
+            signature_hash,
+            transcript_hash: strict_backend_transcript_hash(
+                request,
+                token_count,
+                selected_priority,
+                signature_hash,
+            ),
+        },
+        vector_runtime_certificate: None,
+    })
+}
+
+/// Selected-opening artifact emitted by the distributed strict runtime.
+///
+/// This is the handoff boundary between the app-driven vector MPC runtime and
+/// `StrictSigningSession::finish`: it contains only selected public material
+/// plus the durable runtime certificate. It must not contain rejected
+/// candidate values, validity bits, failure reasons, or local partial
+/// responses.
+#[derive(Clone, Eq, PartialEq)]
+pub struct StrictRuntimeSelectedOpeningArtifact {
+    /// Hash of the strict signing request this artifact is bound to.
+    pub request_hash: [u8; 32],
+    /// Consumed token session ids in batch order.
+    pub token_session_ids: Vec<SessionId>,
+    /// Public priority of the privately selected valid candidate.
+    pub selected_priority: StrictCandidatePriority,
+    /// Selected challenge seed.
+    pub selected_ctilde: Vec<u8>,
+    /// Opened selected response.
+    pub selected_z: PolyVec,
+    /// Opened selected hint bits.
+    pub selected_h: PolyVec,
+    /// Durable vector runtime certificate proving the private checks/opening
+    /// were produced by the production vector runtime.
+    pub runtime_certificate: StrictSigningVectorRuntimeCertificate,
+}
+
+impl fmt::Debug for StrictRuntimeSelectedOpeningArtifact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StrictRuntimeSelectedOpeningArtifact")
+            .field("request_hash", &self.request_hash)
+            .field("token_count", &self.token_session_ids.len())
+            .field("selected_priority", &self.selected_priority)
+            .field("selected_ctilde_len", &self.selected_ctilde.len())
+            .field("selected_z", &"<opened-selected-redacted>")
+            .field("selected_h", &"<opened-selected-redacted>")
+            .field("runtime_certificate", &"<validated>")
+            .finish()
+    }
+}
+
+impl StrictRuntimeSelectedOpeningArtifact {
+    /// Creates a selected-opening artifact from the runtime output boundary.
+    pub fn new(
+        request_hash: [u8; 32],
+        token_session_ids: Vec<SessionId>,
+        selected_priority: StrictCandidatePriority,
+        selected_ctilde: Vec<u8>,
+        selected_z: PolyVec,
+        selected_h: PolyVec,
+        runtime_certificate: StrictSigningVectorRuntimeCertificate,
+    ) -> Self {
+        Self {
+            request_hash,
+            token_session_ids,
+            selected_priority,
+            selected_ctilde,
+            selected_z,
+            selected_h,
+            runtime_certificate,
+        }
+    }
+}
+
+/// Source that runs or resumes the distributed vector runtime and returns the
+/// selected-opening artifact for one already consumed strict-signing batch.
+///
+/// Implementations are the release handoff point for app-driven strict
+/// signing. They must drive the private response/check/select/open phases and
+/// return only the selected public material captured in
+/// [`StrictRuntimeSelectedOpeningArtifact`].
+pub trait StrictRuntimeSelectedOpeningArtifactSource<P: MlDsaParams> {
+    /// Produces the selected-opening artifact for `batch`.
+    fn produce_selected_opening_artifact(
+        &mut self,
+        request: &StrictSignRequest,
+        tr: &[u8; 64],
+        batch: &ConsumedBccCertifiedTokenBatch,
+    ) -> Result<StrictRuntimeSelectedOpeningArtifact, OnlineError>;
+}
+
+/// Live vector-MPC input handles for one strict signing candidate.
+#[derive(Clone, Debug)]
+pub struct StrictRuntimeCandidateShareInput {
+    /// Token/session id this input belongs to.
+    pub token_session_id: SessionId,
+    /// Shared nonce response component `[y_j]`.
+    pub y_share: ProductionShareVec,
+    /// Shared long-term key component `[s1]`.
+    pub s1_share: ProductionShareVec,
+    /// Certified canonical mask value for decomposing `[z_j]`.
+    pub z_mask_value: ProductionShareVec,
+    /// Certified canonical mask bits for decomposing `[z_j]`.
+    pub z_mask_bits_by_bit: Vec<ProductionBitShareVec>,
+    /// Certified canonical mask value for decomposing
+    /// `[A*z_j - c_j*t1*2^d]`.
+    pub hint_mask_value: ProductionShareVec,
+    /// Certified canonical mask bits for decomposing
+    /// `[A*z_j - c_j*t1*2^d]`.
+    pub hint_mask_bits_by_bit: Vec<ProductionBitShareVec>,
+    /// Public `w1` vector for the candidate token.
+    pub w1: Vec<u32>,
+}
+
+impl StrictRuntimeCandidateShareInput {
+    fn validate_for<P: MlDsaParams>(&self) -> Result<(), OnlineError> {
+        if self.y_share.len() != P::L * P::N
+            || self.s1_share.len() != P::L * P::N
+            || self.z_mask_value.len() != P::L * P::N
+            || self.hint_mask_value.len() != P::K * P::N
+            || self.z_mask_bits_by_bit.len() != 23
+            || self.hint_mask_bits_by_bit.len() != 23
+            || self
+                .z_mask_bits_by_bit
+                .iter()
+                .any(|bits| bits.len() != P::L * P::N)
+            || self
+                .hint_mask_bits_by_bit
+                .iter()
+                .any(|bits| bits.len() != P::K * P::N)
+            || self.w1.len() != P::K * P::N
+        {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Non-secret profile entry for one live strict-signing vector runtime phase.
+///
+/// This is diagnostic data only. It records wall-clock time and durable-runtime
+/// counter deltas by coarse phase; it must not contain candidate values,
+/// validity bits, hints, z values, masks, or failure reasons.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictLiveVectorMpcPhaseProfile {
+    /// Coarse phase name.
+    pub phase: String,
+    /// Candidate index for per-candidate phases.
+    pub candidate_index: Option<usize>,
+    /// Elapsed wall-clock time in milliseconds.
+    pub elapsed_ms: u128,
+    /// Counter delta observed in the durable runtime log during this phase.
+    pub counter_delta: PrimeFieldMpcCounters,
+}
+
+fn strict_counter_delta(
+    after: PrimeFieldMpcCounters,
+    before: PrimeFieldMpcCounters,
+) -> PrimeFieldMpcCounters {
+    PrimeFieldMpcCounters {
+        rounds: after.rounds.saturating_sub(before.rounds),
+        private_messages: after
+            .private_messages
+            .saturating_sub(before.private_messages),
+        broadcasts: after.broadcasts.saturating_sub(before.broadcasts),
+        wire_bytes: after.wire_bytes.saturating_sub(before.wire_bytes),
+        durable_log_bytes: after
+            .durable_log_bytes
+            .saturating_sub(before.durable_log_bytes),
+        vector_lanes: after.vector_lanes.saturating_sub(before.vector_lanes),
+        multiplication_layers: after
+            .multiplication_layers
+            .saturating_sub(before.multiplication_layers),
+        wall_clock_ms: after.wall_clock_ms.saturating_sub(before.wall_clock_ms),
+        scalar_mul_gates: after
+            .scalar_mul_gates
+            .saturating_sub(before.scalar_mul_gates),
+        vector_mul_lanes: after
+            .vector_mul_lanes
+            .saturating_sub(before.vector_mul_lanes),
+        scalar_openings: after.scalar_openings.saturating_sub(before.scalar_openings),
+        vector_opening_lanes: after
+            .vector_opening_lanes
+            .saturating_sub(before.vector_opening_lanes),
+        scalar_assert_zero: after
+            .scalar_assert_zero
+            .saturating_sub(before.scalar_assert_zero),
+        vector_assert_zero_lanes: after
+            .vector_assert_zero_lanes
+            .saturating_sub(before.vector_assert_zero_lanes),
+        random_bits: after.random_bits.saturating_sub(before.random_bits),
+        local_public_mul_lanes: after
+            .local_public_mul_lanes
+            .saturating_sub(before.local_public_mul_lanes),
+    }
+}
+
+/// Release-facing strict signing source backed by live vector MPC handles.
+///
+/// This source owns the runtime and candidate share handles. It prepares
+/// `[z]`, derives private response-bound and hint predicates via the vector
+/// runtime state machines, performs private priority selection, opens only the
+/// selected `z` and `h`, and derives its certificate from the runtime's
+/// durable wire log.
+#[derive(Clone, Debug)]
+pub struct ProductionStrictLiveVectorMpcArtifactSource<T, L, C, E> {
+    config: DkgConfig,
+    runtime: ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    entropy: E,
+    public_key: Vec<u8>,
+    candidate_inputs: Vec<StrictRuntimeCandidateShareInput>,
+    profile: Vec<StrictLiveVectorMpcPhaseProfile>,
+}
+
+impl<T, L, C, E> ProductionStrictLiveVectorMpcArtifactSource<T, L, C, E> {
+    /// Creates a live vector-MPC artifact source.
+    pub fn new(
+        config: DkgConfig,
+        runtime: ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        entropy: E,
+        public_key: Vec<u8>,
+        candidate_inputs: Vec<StrictRuntimeCandidateShareInput>,
+    ) -> Self {
+        Self {
+            config,
+            runtime,
+            entropy,
+            public_key,
+            candidate_inputs,
+            profile: Vec::new(),
+        }
+    }
+
+    /// Returns the owned runtime.
+    pub const fn runtime(&self) -> &ProductionVectorPrimeFieldMpcRuntime<T, L, C> {
+        &self.runtime
+    }
+
+    /// Returns the non-secret strict-signing runtime profile captured by the
+    /// latest execution.
+    pub fn profile(&self) -> &[StrictLiveVectorMpcPhaseProfile] {
+        &self.profile
+    }
+}
+
+impl<T, L, C, E> ProductionStrictLiveVectorMpcArtifactSource<T, L, C, E>
+where
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    fn profile_start(&self) -> (Instant, PrimeFieldMpcCounters) {
+        let counters = self
+            .runtime
+            .runtime_evidence()
+            .map(|evidence| evidence.counters)
+            .unwrap_or_default();
+        (Instant::now(), counters)
+    }
+
+    fn profile_finish(
+        &mut self,
+        phase: impl Into<String>,
+        candidate_index: Option<usize>,
+        started_at: Instant,
+        counters_before: PrimeFieldMpcCounters,
+    ) {
+        let counters_after = self
+            .runtime
+            .runtime_evidence()
+            .map(|evidence| evidence.counters)
+            .unwrap_or_default();
+        self.profile.push(StrictLiveVectorMpcPhaseProfile {
+            phase: phase.into(),
+            candidate_index,
+            elapsed_ms: started_at.elapsed().as_millis(),
+            counter_delta: strict_counter_delta(counters_after, counters_before),
+        });
+    }
+
+    #[cfg(test)]
+    fn print_profile(&self) {
+        eprintln!("strict live vector MPC profile:");
+        for entry in &self.profile {
+            eprintln!(
+                "  phase={} candidate={:?} elapsed_ms={} delta={:?}",
+                entry.phase, entry.candidate_index, entry.elapsed_ms, entry.counter_delta
+            );
+        }
+    }
+}
+
+fn strict_collected_unit(
+    result: ProductionVectorItMpcCollectResult<()>,
+) -> Result<(), OnlineError> {
+    match result {
+        ProductionVectorItMpcCollectResult::Collected { .. } => Ok(()),
+        ProductionVectorItMpcCollectResult::Waiting(_) => {
+            Err(OnlineError::StrictSigningRuntimeSlotIncomplete)
+        }
+    }
+}
+
+fn strict_collected_value<T>(
+    result: ProductionVectorItMpcCollectResult<T>,
+) -> Result<T, OnlineError> {
+    match result {
+        ProductionVectorItMpcCollectResult::Collected { value, .. } => Ok(value),
+        ProductionVectorItMpcCollectResult::Waiting(_) => {
+            Err(OnlineError::StrictSigningRuntimeSlotIncomplete)
+        }
+    }
+}
+
+fn strict_certify_canonical_bits<P, T, L, C, E>(
+    state: &mut ProductionCanonicalBitDecompositionState,
+    runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    config: &DkgConfig,
+    label: &Power2RoundTranscriptLabel,
+    entropy: &mut E,
+) -> Result<Vec<ProductionBitShareVec>, OnlineError>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+    E: ProductionVectorItMpcEntropy,
+{
+    state
+        .drive_masked_c_opening_checked::<P, _, _, _>(runtime, config, label)
+        .map_err(OnlineError::from)?;
+    strict_collected_value(
+        state
+            .collect_masked_c_opening_checked::<P, _, _, _>(runtime, config, label)
+            .map_err(OnlineError::from)?,
+    )?;
+    state
+        .start_wrap_comparison::<P, _, _, _>(runtime, config, label)
+        .map_err(OnlineError::from)?;
+    loop {
+        let status = state
+            .drive_wrap_comparison_step::<P, _, _, _, _>(runtime, config, entropy)
+            .map_err(OnlineError::from)?;
+        if matches!(status, PrimeFieldMpcPhaseDriverStatus::Collected { .. }) {
+            break;
+        }
+        strict_collected_unit(
+            state
+                .collect_wrap_comparison_step::<P, _, _, _>(runtime, config)
+                .map_err(OnlineError::from)?,
+        )?;
+    }
+    state
+        .start_canonical_bit_recovery::<P, _, _, _>(runtime, config, label)
+        .map_err(OnlineError::from)?;
+    while state.r_bits_by_bit().is_none() {
+        state
+            .drive_canonical_bit_recovery_step::<P, _, _, _, _>(runtime, config, label, entropy)
+            .map_err(OnlineError::from)?;
+        strict_collected_unit(
+            state
+                .collect_canonical_bit_recovery_step::<P, _, _, _>(runtime, config, label)
+                .map_err(OnlineError::from)?,
+        )?;
+    }
+    for bit_idx in 0..23 {
+        state
+            .drive_r_bitness_product::<P, _, _, _, _>(runtime, config, label, bit_idx, entropy)
+            .map_err(OnlineError::from)?;
+        strict_collected_unit(
+            state
+                .collect_r_bitness_product::<P, _, _, _>(runtime, config, label, bit_idx)
+                .map_err(OnlineError::from)?,
+        )?;
+        state
+            .drive_r_bitness_zero_check::<P, _, _, _>(runtime, config, label, bit_idx)
+            .map_err(OnlineError::from)?;
+        strict_collected_unit(
+            state
+                .collect_r_bitness_zero_check::<P, _, _, _>(runtime, config, label, bit_idx)
+                .map_err(OnlineError::from)?,
+        )?;
+    }
+    state
+        .start_r_lt_q_check::<P, _, _, _>(runtime, config, label)
+        .map_err(OnlineError::from)?;
+    while state.r_lt_q().is_none() {
+        state
+            .drive_r_lt_q_check_step::<P, _, _, _, _>(runtime, config, entropy)
+            .map_err(OnlineError::from)?;
+        strict_collected_unit(
+            state
+                .collect_r_lt_q_check_step::<P, _, _, _>(runtime, config)
+                .map_err(OnlineError::from)?,
+        )?;
+    }
+    state
+        .drive_r_lt_q_assert_true::<P, _, _, _>(runtime, config, label)
+        .map_err(OnlineError::from)?;
+    strict_collected_unit(
+        state
+            .collect_r_lt_q_assert_true::<P, _, _, _>(runtime, config, label)
+            .map_err(OnlineError::from)?,
+    )?;
+    state
+        .drive_r_bits_equal_value_check::<P, _, _, _>(runtime, config, label)
+        .map_err(OnlineError::from)?;
+    strict_collected_unit(
+        state
+            .collect_r_bits_equal_value_check::<P, _, _, _>(runtime, config, label)
+            .map_err(OnlineError::from)?,
+    )?;
+    state
+        .r_bits_by_bit()
+        .map(|bits| bits.to_vec())
+        .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)
+}
+
+impl<P, T, L, C, E> StrictRuntimeSelectedOpeningArtifactSource<P>
+    for ProductionStrictLiveVectorMpcArtifactSource<T, L, C, E>
+where
+    P: MlDsaParams,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+    E: ProductionVectorItMpcEntropy,
+{
+    fn produce_selected_opening_artifact(
+        &mut self,
+        request: &StrictSignRequest,
+        tr: &[u8; 64],
+        batch: &ConsumedBccCertifiedTokenBatch,
+    ) -> Result<StrictRuntimeSelectedOpeningArtifact, OnlineError> {
+        if request.suite != P::NAME || request.signing_set.as_slice() != batch.signer_set() {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        if self.candidate_inputs.len() != batch.len() {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        let metadata = strict_candidate_metadata_batch::<P>(request, batch, tr);
+        let token_session_ids = batch.session_ids();
+        let root_label = Power2RoundTranscriptLabel::root(
+            &self.config,
+            strict_signing_session_id(request, &token_session_ids).0,
+        )
+        .child("strict_signing");
+
+        let mut candidates = Vec::with_capacity(batch.len());
+        let mut valid_bits = Vec::with_capacity(batch.len());
+        for idx in 0..batch.len() {
+            let token = &batch.tokens()[idx];
+            let meta = &metadata[idx];
+            let input = self.candidate_inputs[idx].clone();
+            if input.token_session_id != token.session_id {
+                return Err(OnlineError::StrictResponseCheckShapeMismatch);
+            }
+            input.validate_for::<P>()?;
+            let label = root_label.child(format!("candidate_{idx}"));
+            let (started_at, counters_before) = self.profile_start();
+            let z_share = strict_prepare_runtime_z_share::<P, _, _, _>(
+                &self.runtime,
+                &self.config,
+                &input.y_share,
+                &input.s1_share,
+                &meta.ctilde,
+                &label.child("response"),
+            )?;
+            self.profile_finish("z_response_prep", Some(idx), started_at, counters_before);
+
+            let (started_at, counters_before) = self.profile_start();
+            let mut z_decomp = ProductionCanonicalBitDecompositionState::new::<P, _, _, _>(
+                &self.runtime,
+                &self.config,
+                z_share.clone(),
+                input.z_mask_value.clone(),
+                input.z_mask_bits_by_bit.clone(),
+            )
+            .map_err(OnlineError::from)?;
+            let z_bits = strict_certify_canonical_bits::<P, _, _, _, _>(
+                &mut z_decomp,
+                &mut self.runtime,
+                &self.config,
+                &label.child("z_canonical"),
+                &mut self.entropy,
+            )?;
+            self.profile_finish(
+                "z_canonical_decomposition",
+                Some(idx),
+                started_at,
+                counters_before,
+            );
+
+            let (started_at, counters_before) = self.profile_start();
+            let mut z_bound = StrictRuntimeZBoundCheckState::new::<P, _, _, _>(
+                &self.runtime,
+                &self.config,
+                &z_bits,
+                &label.child("z_bound"),
+            )?;
+            while z_bound.lt_gamma.result().is_none() {
+                z_bound.drive_lt_gamma_step::<P, _, _, _, _>(
+                    &mut self.runtime,
+                    &self.config,
+                    &mut self.entropy,
+                )?;
+                strict_collected_unit(
+                    z_bound.collect_lt_gamma_step::<P, _, _, _>(&mut self.runtime, &self.config)?,
+                )?;
+            }
+            while z_bound.gt_upper.result().is_none() {
+                z_bound.drive_gt_upper_step::<P, _, _, _, _>(
+                    &mut self.runtime,
+                    &self.config,
+                    &mut self.entropy,
+                )?;
+                strict_collected_unit(
+                    z_bound.collect_gt_upper_step::<P, _, _, _>(&mut self.runtime, &self.config)?,
+                )?;
+            }
+            z_bound.drive_or_step::<P, _, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                &label.child("z_bound"),
+                &mut self.entropy,
+            )?;
+            strict_collected_unit(z_bound.collect_or_step::<P, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                &label.child("z_bound"),
+            )?)?;
+            self.profile_finish("z_bound_checks", Some(idx), started_at, counters_before);
+
+            let (started_at, counters_before) = self.profile_start();
+            let mut all_z_bound = StrictRuntimeAllBitsTrueState::new::<P, _, _, _>(
+                &self.runtime,
+                &self.config,
+                z_bound
+                    .result()
+                    .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?,
+                &label.child("z_bound_all"),
+            )?;
+            while all_z_bound.result().is_none() {
+                all_z_bound.drive_step::<P, _, _, _, _>(
+                    &mut self.runtime,
+                    &self.config,
+                    &mut self.entropy,
+                )?;
+                strict_collected_unit(
+                    all_z_bound.collect_step::<P, _, _, _>(&mut self.runtime, &self.config)?,
+                )?;
+            }
+            self.profile_finish("z_bound_all", Some(idx), started_at, counters_before);
+
+            let (started_at, counters_before) = self.profile_start();
+            let hint_approx = strict_runtime_hint_approx_share::<P, _, _, _>(
+                &self.runtime,
+                &self.config,
+                &self.public_key,
+                &meta.ctilde,
+                &z_share,
+                &label.child("hint_approx"),
+            )?;
+            self.profile_finish("hint_approx", Some(idx), started_at, counters_before);
+
+            let (started_at, counters_before) = self.profile_start();
+            let mut hint_decomp = ProductionCanonicalBitDecompositionState::new::<P, _, _, _>(
+                &self.runtime,
+                &self.config,
+                hint_approx,
+                input.hint_mask_value.clone(),
+                input.hint_mask_bits_by_bit.clone(),
+            )
+            .map_err(OnlineError::from)?;
+            let hint_bits_input = strict_certify_canonical_bits::<P, _, _, _, _>(
+                &mut hint_decomp,
+                &mut self.runtime,
+                &self.config,
+                &label.child("hint_canonical"),
+                &mut self.entropy,
+            )?;
+            self.profile_finish(
+                "hint_canonical_decomposition",
+                Some(idx),
+                started_at,
+                counters_before,
+            );
+
+            let (started_at, counters_before) = self.profile_start();
+            let mut hint_bits = StrictRuntimeHintBitsCheckState::new::<P, _, _, _>(
+                &self.runtime,
+                &self.config,
+                &hint_bits_input,
+                &input.w1,
+                &label.child("hint_bits"),
+            )?;
+            while hint_bits.gt_lower.result().is_none() {
+                hint_bits.drive_gt_lower_step::<P, _, _, _, _>(
+                    &mut self.runtime,
+                    &self.config,
+                    &mut self.entropy,
+                )?;
+                strict_collected_unit(
+                    hint_bits
+                        .collect_gt_lower_step::<P, _, _, _>(&mut self.runtime, &self.config)?,
+                )?;
+            }
+            while hint_bits.lt_upper.result().is_none() {
+                hint_bits.drive_lt_upper_step::<P, _, _, _, _>(
+                    &mut self.runtime,
+                    &self.config,
+                    &mut self.entropy,
+                )?;
+                strict_collected_unit(
+                    hint_bits
+                        .collect_lt_upper_step::<P, _, _, _>(&mut self.runtime, &self.config)?,
+                )?;
+            }
+            hint_bits.drive_interval_and_step::<P, _, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                &label.child("hint_bits"),
+                &mut self.entropy,
+            )?;
+            strict_collected_unit(hint_bits.collect_interval_and_step::<P, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                &label.child("hint_bits"),
+            )?)?;
+            hint_bits.drive_wrap_or_step::<P, _, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                &label.child("hint_bits"),
+                &mut self.entropy,
+            )?;
+            strict_collected_unit(hint_bits.collect_wrap_or_and_finalize::<P, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                &label.child("hint_bits"),
+            )?)?;
+            self.profile_finish(
+                "hint_highbits_checks",
+                Some(idx),
+                started_at,
+                counters_before,
+            );
+            let h_bits = hint_bits
+                .hint_bits()
+                .cloned()
+                .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+            let (started_at, counters_before) = self.profile_start();
+            let mut hint_weight = StrictRuntimeHintWeightCheckState::new::<P, _, _, _>(
+                &self.runtime,
+                &self.config,
+                &h_bits,
+                &label.child("hint_weight"),
+            )?;
+            while hint_weight.result().is_none() {
+                hint_weight.drive_step::<P, _, _, _, _>(
+                    &mut self.runtime,
+                    &self.config,
+                    &mut self.entropy,
+                )?;
+                strict_collected_unit(
+                    hint_weight.collect_step::<P, _, _, _>(&mut self.runtime, &self.config)?,
+                )?;
+            }
+            self.profile_finish("hint_weight_check", Some(idx), started_at, counters_before);
+
+            let (started_at, counters_before) = self.profile_start();
+            let mut valid = StrictRuntimeValidBitState::new();
+            valid.drive_step::<P, _, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                all_z_bound
+                    .result()
+                    .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?,
+                hint_weight
+                    .result()
+                    .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?,
+                &label.child("valid"),
+                &mut self.entropy,
+            )?;
+            strict_collected_unit(valid.collect_step::<P, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                &label.child("valid"),
+            )?)?;
+            self.profile_finish("valid_bit", Some(idx), started_at, counters_before);
+            let valid_bit = valid
+                .result()
+                .cloned()
+                .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+            valid_bits.push(valid_bit.clone());
+            candidates.push(
+                StrictRuntimeCandidateHandle::new_runtime_prepared(
+                    meta.priority,
+                    meta.ctilde.clone(),
+                    z_share,
+                )
+                .with_z_bound_ok(
+                    all_z_bound
+                        .result()
+                        .cloned()
+                        .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?,
+                )
+                .with_h_bits(h_bits.clone())
+                .with_hint_ok(
+                    hint_weight
+                        .result()
+                        .cloned()
+                        .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?,
+                )
+                .with_valid(valid_bit),
+            );
+        }
+
+        let priorities = candidates
+            .iter()
+            .map(StrictRuntimeCandidateHandle::priority)
+            .collect::<Vec<_>>();
+        let (started_at, counters_before) = self.profile_start();
+        let mut selection = StrictRuntimePrioritySelectionState::new::<P, _, _, _>(
+            &self.runtime,
+            &self.config,
+            &priorities,
+            &valid_bits,
+            &root_label.child("priority_selection"),
+        )?;
+        while !selection.is_done() {
+            selection.drive_step::<P, _, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                &valid_bits,
+                &root_label.child("priority_selection"),
+                &mut self.entropy,
+            )?;
+            strict_collected_unit(selection.collect_step::<P, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                &valid_bits,
+                &root_label.child("priority_selection"),
+            )?)?;
+        }
+        let selected_bits = selection
+            .selected_bits()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        let any_valid = selection
+            .any_valid_bit()
+            .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)?;
+        self.profile_finish("priority_selection", None, started_at, counters_before);
+
+        let (started_at, counters_before) = self.profile_start();
+        let selection_residual = self
+            .runtime
+            .one_hot_sum_minus_one::<P>(
+                &self.config,
+                &selected_bits,
+                &root_label.child("priority_selection/one_hot"),
+            )
+            .map_err(OnlineError::from)?;
+        self.runtime
+            .drive_private_selection_check_share_vec::<P>(
+                &self.config,
+                &selection_residual,
+                &root_label.child("priority_selection/one_hot"),
+            )
+            .map_err(OnlineError::from)?;
+        strict_collected_unit(
+            self.runtime
+                .collect_private_selection_check_share_vec::<P>(
+                    &self.config,
+                    &root_label.child("priority_selection/one_hot"),
+                )
+                .map_err(OnlineError::from)?,
+        )?;
+        self.profile_finish("one_hot_selection_check", None, started_at, counters_before);
+
+        let (started_at, counters_before) = self.profile_start();
+        self.runtime
+            .drive_open_bit_share_vec::<P>(
+                &self.config,
+                &any_valid,
+                &root_label.child("any_valid/open"),
+            )
+            .map_err(OnlineError::from)?;
+        let opened_any_valid = strict_collected_value(
+            self.runtime
+                .collect_open_bit_share_vec::<P>(&self.config, &root_label.child("any_valid/open"))
+                .map_err(OnlineError::from)?,
+        )?;
+        match opened_any_valid.as_slice() {
+            [1] => {}
+            [0] => return Err(OnlineError::GenericBatchFailure),
+            _ => return Err(OnlineError::StrictResponseCheckShapeMismatch),
+        }
+        self.profile_finish("any_valid_opening", None, started_at, counters_before);
+
+        let (started_at, counters_before) = self.profile_start();
+        let selected_priority_share = strict_selected_public_lanes_share::<P, _, _, _>(
+            &self.runtime,
+            &self.config,
+            &selected_bits,
+            &priorities
+                .iter()
+                .map(|priority| priority.0.to_vec())
+                .collect::<Vec<_>>(),
+            &root_label.child("selected_priority"),
+        )?;
+        self.runtime
+            .drive_open_share_vec::<P>(
+                &self.config,
+                &selected_priority_share,
+                &root_label.child("selected_priority/open"),
+            )
+            .map_err(OnlineError::from)?;
+        let selected_priority_bytes = strict_u8_lanes_from_opening(&strict_collected_value(
+            self.runtime
+                .collect_open_share_vec::<P>(
+                    &self.config,
+                    &root_label.child("selected_priority/open"),
+                )
+                .map_err(OnlineError::from)?,
+        )?)?;
+        let selected_priority = StrictCandidatePriority(
+            selected_priority_bytes
+                .try_into()
+                .map_err(|_| OnlineError::StrictResponseCheckShapeMismatch)?,
+        );
+        self.profile_finish(
+            "selected_priority_opening",
+            None,
+            started_at,
+            counters_before,
+        );
+
+        let (started_at, counters_before) = self.profile_start();
+        let selected_ctilde_share = strict_selected_public_lanes_share::<P, _, _, _>(
+            &self.runtime,
+            &self.config,
+            &selected_bits,
+            &metadata
+                .iter()
+                .map(|candidate| candidate.ctilde.clone())
+                .collect::<Vec<_>>(),
+            &root_label.child("selected_ctilde"),
+        )?;
+        self.runtime
+            .drive_open_share_vec::<P>(
+                &self.config,
+                &selected_ctilde_share,
+                &root_label.child("selected_ctilde/open"),
+            )
+            .map_err(OnlineError::from)?;
+        let selected_ctilde = strict_u8_lanes_from_opening(&strict_collected_value(
+            self.runtime
+                .collect_open_share_vec::<P>(
+                    &self.config,
+                    &root_label.child("selected_ctilde/open"),
+                )
+                .map_err(OnlineError::from)?,
+        )?)?;
+        self.profile_finish("selected_ctilde_opening", None, started_at, counters_before);
+        let z_values = candidates
+            .iter()
+            .map(|candidate| candidate.z_share().clone())
+            .collect::<Vec<_>>();
+        let h_values = candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .h_bits()
+                    .cloned()
+                    .ok_or(OnlineError::StrictSigningRuntimeSlotIncomplete)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (started_at, counters_before) = self.profile_start();
+        strict_drive_selected_share_products::<P, _, _, _, _>(
+            &mut self.runtime,
+            &self.config,
+            &selected_bits,
+            &z_values,
+            &root_label.child("selected_z"),
+            &mut self.entropy,
+        )?;
+        let selected_z =
+            strict_collected_value(strict_collect_selected_share_products::<P, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                candidates.len(),
+                &root_label.child("selected_z"),
+            )?)?;
+        self.profile_finish("selected_z_product", None, started_at, counters_before);
+
+        let (started_at, counters_before) = self.profile_start();
+        strict_drive_selected_share_products::<P, _, _, _, _>(
+            &mut self.runtime,
+            &self.config,
+            &selected_bits,
+            &h_values
+                .iter()
+                .map(|bits| bits.certified_share().clone())
+                .collect::<Vec<_>>(),
+            &root_label.child("selected_h"),
+            &mut self.entropy,
+        )?;
+        let selected_h_share =
+            strict_collected_value(strict_collect_selected_share_products::<P, _, _, _>(
+                &mut self.runtime,
+                &self.config,
+                candidates.len(),
+                &root_label.child("selected_h"),
+            )?)?;
+        let selected_h = ProductionBitShareVec::from_certified_share(selected_h_share);
+        self.profile_finish("selected_h_product", None, started_at, counters_before);
+
+        let (started_at, counters_before) = self.profile_start();
+        strict_drive_selected_z_opening::<P, _, _, _>(
+            &mut self.runtime,
+            &self.config,
+            &selected_z,
+            &root_label.child("selected_opening"),
+        )?;
+        let opened_z = strict_collected_value(strict_collect_selected_z_opening::<P, _, _, _>(
+            &mut self.runtime,
+            &self.config,
+            &root_label.child("selected_opening"),
+        )?)?;
+        self.profile_finish("selected_z_opening", None, started_at, counters_before);
+
+        let (started_at, counters_before) = self.profile_start();
+        strict_drive_selected_h_opening::<P, _, _, _>(
+            &mut self.runtime,
+            &self.config,
+            &selected_h,
+            &root_label.child("selected_opening"),
+        )?;
+        let opened_h = strict_collected_value(strict_collect_selected_h_opening::<P, _, _, _>(
+            &mut self.runtime,
+            &self.config,
+            &root_label.child("selected_opening"),
+        )?)?;
+        self.profile_finish("selected_h_opening", None, started_at, counters_before);
+
+        let (started_at, counters_before) = self.profile_start();
+        let runtime_evidence = self.runtime.runtime_evidence().map_err(OnlineError::from)?;
+        let certificate =
+            StrictSigningVectorRuntimeCertificate::new_for_strict_signing(runtime_evidence)?;
+        self.profile_finish("runtime_certificate", None, started_at, counters_before);
+        #[cfg(test)]
+        self.print_profile();
+        Ok(StrictRuntimeSelectedOpeningArtifact::new(
+            strict_signing_request_hash(request),
+            token_session_ids,
+            selected_priority,
+            selected_ctilde,
+            opened_z,
+            opened_h,
+            certificate,
+        ))
+    }
+}
+
+/// Release backend that obtains the selected-opening artifact from an owned
+/// distributed-runtime source after token consumption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionStrictRuntimeSelectedOpeningArtifactBackend<S> {
+    source: S,
+}
+
+impl<S> ProductionStrictRuntimeSelectedOpeningArtifactBackend<S> {
+    /// Creates a release backend from an app-driven runtime artifact source.
+    pub fn new(source: S) -> Self {
+        Self { source }
+    }
+
+    /// Returns the underlying artifact source.
+    pub const fn source(&self) -> &S {
+        &self.source
+    }
+
+    /// Consumes the backend and returns the underlying artifact source.
+    pub fn into_source(self) -> S {
+        self.source
+    }
+}
+
+impl<P, S> StrictPrivateSigningBackend<P>
+    for ProductionStrictRuntimeSelectedOpeningArtifactBackend<S>
+where
+    P: MlDsaParams,
+    S: StrictRuntimeSelectedOpeningArtifactSource<P>,
+{
+    fn sign_consumed_batch(
+        &mut self,
+        request: &StrictSignRequest,
+        tr: &[u8; 64],
+        batch: ConsumedBccCertifiedTokenBatch,
+    ) -> Result<StrictSelectedSignature, OnlineError> {
+        let artifact = self
+            .source
+            .produce_selected_opening_artifact(request, tr, &batch)?;
+        StrictPrivateSigningBackend::<P>::sign_consumed_batch(
+            &mut ProductionStrictRuntimeSelectedOpeningBackend::new(artifact),
+            request,
+            tr,
+            batch,
+        )
+    }
+}
+
+/// Concrete strict artifact source that adapts the canonical vector component
+/// stack into the selected-opening artifact handoff.
+///
+/// This source does not expose the component-stack selected output as a release
+/// signature. It runs the canonical response/check/select/open boundaries
+/// internally and returns only the artifact consumed by
+/// [`ProductionStrictRuntimeSelectedOpeningArtifactBackend`].
+#[cfg(any(test, feature = "scaffold-dev"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionStrictVectorMpcArtifactSource<SP> {
+    public_key: Vec<u8>,
+    share_provider: SP,
+    runtime_certificate: StrictSigningVectorRuntimeCertificate,
+}
+
+#[cfg(any(test, feature = "scaffold-dev"))]
+impl<SP> ProductionStrictVectorMpcArtifactSource<SP> {
+    /// Creates an artifact source from a share provider and durable runtime
+    /// evidence.
+    pub fn new(
+        public_key: Vec<u8>,
+        share_provider: SP,
+        runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+    ) -> Result<Self, OnlineError> {
+        Ok(Self {
+            public_key,
+            share_provider,
+            runtime_certificate: StrictSigningVectorRuntimeCertificate::new(runtime_evidence)?,
+        })
+    }
+
+    /// Creates an artifact source from a pre-validated runtime certificate.
+    pub fn with_certificate(
+        public_key: Vec<u8>,
+        share_provider: SP,
+        runtime_certificate: StrictSigningVectorRuntimeCertificate,
+    ) -> Self {
+        Self {
+            public_key,
+            share_provider,
+            runtime_certificate,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "scaffold-dev"))]
+impl<P, SP> StrictRuntimeSelectedOpeningArtifactSource<P>
+    for ProductionStrictVectorMpcArtifactSource<SP>
+where
+    P: MlDsaParams,
+    SP: StrictPolynomialShareProvider,
+{
+    fn produce_selected_opening_artifact(
+        &mut self,
+        request: &StrictSignRequest,
+        tr: &[u8; 64],
+        batch: &ConsumedBccCertifiedTokenBatch,
+    ) -> Result<StrictRuntimeSelectedOpeningArtifact, OnlineError> {
+        let metadata = strict_candidate_metadata_batch::<P>(request, batch, tr);
+        let mut driver = StrictResponseCheckPhaseDriver::new();
+        driver.accept_metadata(batch.len())?;
+
+        let mut prepare = ProductionVectorResponsePreparationBackend::new(
+            self.public_key.clone(),
+            &self.share_provider,
+        );
+        let prepared =
+            <ProductionVectorResponsePreparationBackend<&SP> as StrictResponsePreparationBackend<
+                P,
+            >>::prepare_private_responses(&mut prepare, request, tr, batch, &metadata)?;
+        prepared.validate_len(batch.len())?;
+        driver.accept_shared_responses(batch.len())?;
+
+        let mut bounds = ProductionVectorResponseBoundCheckBackend;
+        let (candidates, bound_evidence) =
+            <ProductionVectorResponseBoundCheckBackend as StrictResponseBoundCheckBackend<
+                P,
+            >>::check_response_bounds(&mut bounds, &metadata, prepared.candidates, &mut driver)?;
+        bound_evidence.validate_for_batch::<P>(batch.len())?;
+
+        let mut hints = ProductionVectorHintCheckBackend;
+        let w1_refs = prepared
+            .w1_vectors
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let (candidates, hint_evidence) =
+            <ProductionVectorHintCheckBackend as StrictHintCheckBackend<P>>::check_hints(
+                &mut hints,
+                &metadata,
+                candidates,
+                &prepared.public_key,
+                &w1_refs,
+                &mut driver,
+            )?;
+        hint_evidence.validate_for_batch::<P>(batch.len())?;
+
+        let mut selector = ProductionVectorPrivateSelectionBackend::new();
+        let (selected, selection_evidence) =
+            selector.select_candidate(&metadata, candidates, &mut driver)?;
+        selection_evidence.validate_for_batch(batch.len())?;
+
+        let selected_ctilde = selected.ctilde.clone();
+        let selected_z = selected.response.clone();
+        let selected_h = selected
+            .hint
+            .clone()
+            .ok_or(OnlineError::GenericBatchFailure)?;
+        let mut opener = ProductionVectorSelectedOpeningBackend::new();
+        let (_signature, opening_evidence) =
+            opener.open_selected(&selection_evidence, selected, &mut driver)?;
+        opening_evidence.validate_for_selection(&selection_evidence)?;
+        driver.counters()?.validate_for_batch(batch.len())?;
+
+        Ok(StrictRuntimeSelectedOpeningArtifact::new(
+            strict_signing_request_hash(request),
+            batch
+                .tokens()
+                .iter()
+                .map(|token| token.session_id)
+                .collect(),
+            opening_evidence.selected_priority,
+            selected_ctilde,
+            selected_z,
+            selected_h,
+            self.runtime_certificate.clone(),
+        ))
+    }
+}
+
+/// Release backend that consumes only a distributed runtime selected-opening
+/// artifact.
+///
+/// Unlike the local component stack, this backend does not compute responses,
+/// checks, selection, or openings. It validates that the supplied artifact is
+/// bound to the request and consumed token batch, then encodes the final
+/// signature from selected material only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionStrictRuntimeSelectedOpeningBackend {
+    artifact: Option<StrictRuntimeSelectedOpeningArtifact>,
+}
+
+impl ProductionStrictRuntimeSelectedOpeningBackend {
+    /// Creates a backend from one selected-opening runtime artifact.
+    pub fn new(artifact: StrictRuntimeSelectedOpeningArtifact) -> Self {
+        Self {
+            artifact: Some(artifact),
+        }
+    }
+}
+
+impl<P: MlDsaParams> StrictPrivateSigningBackend<P>
+    for ProductionStrictRuntimeSelectedOpeningBackend
+{
+    fn sign_consumed_batch(
+        &mut self,
+        request: &StrictSignRequest,
+        tr: &[u8; 64],
+        batch: ConsumedBccCertifiedTokenBatch,
+    ) -> Result<StrictSelectedSignature, OnlineError> {
+        let artifact = self
+            .artifact
+            .take()
+            .ok_or(OnlineError::StrictSigningSessionAlreadyFinished)?;
+        if artifact.request_hash != strict_signing_request_hash(request) {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        let token_session_ids = batch
+            .tokens()
+            .iter()
+            .map(|token| token.session_id)
+            .collect::<Vec<_>>();
+        if artifact.token_session_ids != token_session_ids {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        let selected_metadata = batch
+            .tokens()
+            .iter()
+            .map(|token| strict_candidate_metadata::<P>(request, token, tr))
+            .find(|metadata| metadata.priority == artifact.selected_priority)
+            .ok_or(OnlineError::GenericBatchFailure)?;
+        if selected_metadata.ctilde != artifact.selected_ctilde {
+            return Err(OnlineError::StrictResponseCheckShapeMismatch);
+        }
+        let selected = strict_build_selected_signature_output::<P>(
+            request,
+            batch.len(),
+            artifact.selected_priority,
+            &artifact.selected_ctilde,
+            &artifact.selected_z,
+            &artifact.selected_h,
+        )?;
+        Ok(selected.with_vector_runtime_certificate(
+            artifact
+                .runtime_certificate
+                .into_selected_opening_artifact(),
+        ))
     }
 }
 
@@ -2223,6 +5311,7 @@ where
                 response,
                 bound_ok: None,
                 hint_ok: None,
+                hint: None,
                 signature: None,
             });
         }
@@ -2299,19 +5388,19 @@ impl<P: MlDsaParams> StrictHintCheckBackend<P> for ProductionVectorHintCheckBack
                 })
                 .and_then(|approx| {
                     compute_talus_hint_polyvec::<P>(&approx, w1).map_err(OnlineError::from)
-                })
-                .and_then(|hint| {
-                    signature_encode::<P>(&handle.ctilde, &handle.response, &hint)
-                        .map(|bytes| FinalSignature { bytes })
-                        .map_err(OnlineError::from)
                 });
             match result {
-                Ok(signature) => {
+                Ok(hint) => {
+                    let signature = signature_encode::<P>(&handle.ctilde, &handle.response, &hint)
+                        .map(|bytes| FinalSignature { bytes })
+                        .map_err(OnlineError::from)?;
                     handle.hint_ok = Some(true);
+                    handle.hint = Some(hint);
                     handle.signature = Some(signature);
                 }
                 Err(_) => {
                     handle.hint_ok = Some(false);
+                    handle.hint = None;
                     handle.signature = None;
                 }
             }
@@ -3302,6 +6391,14 @@ where
     V: FinalVerifier,
 {
     validate_strict_sign_request::<P>(request, &batch)?;
+    #[cfg(feature = "production-release-checks")]
+    {
+        for token in &batch.tokens {
+            ensure_certified_token_release_valid(token).map_err(|_| {
+                OnlineError::TokenPool(TokenPoolError::NotCertified(token.session_id))
+            })?;
+        }
+    }
     counters.attempts = counters.attempts.saturating_add(1);
 
     for session_id in batch.session_ids() {
@@ -3324,7 +6421,11 @@ where
         .validate_for_batch(strict_token_count)?;
     #[cfg(feature = "production-release-checks")]
     {
-        if selected.vector_runtime_certificate.is_none() {
+        if !selected
+            .vector_runtime_certificate
+            .as_ref()
+            .is_some_and(|certificate| certificate.is_selected_opening_artifact_bound())
+        {
             return Err(OnlineError::StrictSigningRuntimeSlotIncomplete);
         }
     }
@@ -3826,14 +6927,37 @@ impl fmt::Display for Hex32 {
 
 #[cfg(test)]
 mod tests {
+    #![cfg_attr(feature = "production-release-checks", allow(dead_code))]
+
     use super::*;
     use crate::local::{
-        certify_preprocessing_token, Commitment, NonceCommitment, PartyPreprocessInput,
-        SessionRegistry,
+        certify_preprocessing_token, preprocessing_runtime_transcript_aggregate_hash, Commitment,
+        NonceCommitment, PartyPreprocessInput, PreprocessingCertificationRuntimeTranscripts,
+        PreprocessingVectorRuntimeCertificate, SessionRegistry,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
-    use talus_core::MlDsa65;
+    use talus_core::{Coeff, MlDsa65};
+
+    #[derive(Clone, Debug, Default)]
+    struct TestProductionVectorEntropy {
+        next: u64,
+    }
+
+    impl ProductionVectorItMpcEntropy for TestProductionVectorEntropy {
+        fn fill_field_coefficients<P: MlDsaParams>(
+            &mut self,
+            _label: &Power2RoundTranscriptLabel,
+            count: usize,
+        ) -> Result<Vec<Coeff>, DkgError> {
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                self.next = self.next.saturating_add(1);
+                out.push((self.next % P::Q as u64) as Coeff);
+            }
+            Ok(out)
+        }
+    }
 
     fn session(byte: u8) -> SessionId {
         SessionId([byte; 32])
@@ -3873,6 +6997,18 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "production-release-checks")]
+    fn strict_request_one_party() -> StrictSignRequest {
+        StrictSignRequest {
+            protocol_version: ONLINE_PROTOCOL_VERSION,
+            suite: MlDsa65::NAME,
+            signing_set: vec![PartyId(1)],
+            message: b"message".to_vec(),
+            external_mu: None,
+            context: b"ctx".to_vec(),
+        }
+    }
+
     fn release_vector_runtime_evidence() -> ProductionVectorItMpcRuntimeEvidence {
         ProductionVectorItMpcRuntimeEvidence {
             counters: talus_dkg::PrimeFieldMpcCounters {
@@ -3881,13 +7017,13 @@ mod tests {
                 broadcasts: 3,
                 wire_bytes: 512,
                 durable_log_bytes: 1024,
-                vector_lanes: 128,
+                vector_lanes: 10_000,
                 multiplication_layers: 4,
-                vector_mul_lanes: 64,
-                vector_opening_lanes: 16,
-                vector_assert_zero_lanes: 16,
-                random_bits: 16,
-                local_public_mul_lanes: 16,
+                vector_mul_lanes: 10_000,
+                vector_opening_lanes: 10_000,
+                vector_assert_zero_lanes: 10_000,
+                random_bits: 10_000,
+                local_public_mul_lanes: 10_000,
                 ..talus_dkg::PrimeFieldMpcCounters::default()
             },
             coverage: talus_dkg::ProductionVectorItMpcRuntimeCoverage {
@@ -3900,9 +7036,64 @@ mod tests {
                 equality_to_public: true,
                 bit_sum_or_threshold_check: true,
                 private_one_hot_selection: true,
+                preprocessing_masked_broadcast: true,
+                preprocessing_carry_compare: true,
+                preprocessing_cef_bcc: true,
             },
             transcript_hash: [0x6b; 32],
         }
+    }
+
+    fn release_vector_runtime_evidence_for_token(
+        token: &CertifiedToken,
+    ) -> ProductionVectorItMpcRuntimeEvidence {
+        let mut evidence = release_vector_runtime_evidence();
+        evidence.transcript_hash = preprocessing_runtime_transcript_aggregate_hash(
+            token.session_id,
+            token.transcript_hash,
+            PreprocessingCertificationRuntimeTranscripts {
+                masked_broadcast: token
+                    .certification_evidence
+                    .masked_broadcast
+                    .expect("masked-broadcast evidence")
+                    .runtime_transcript_hash,
+                carry_compare: token
+                    .certification_evidence
+                    .carry_compare
+                    .expect("carry evidence")
+                    .runtime_transcript_hash,
+                bcc: token
+                    .certification_evidence
+                    .bcc
+                    .expect("bcc evidence")
+                    .runtime_transcript_hash,
+            },
+        )
+        .expect("aggregate preprocessing runtime transcript");
+        evidence
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    fn release_valid_token(byte: u8, parties: &[u16]) -> CertifiedToken {
+        let token = token(byte, parties);
+        let certificate = PreprocessingVectorRuntimeCertificate::for_token(
+            &token,
+            release_vector_runtime_evidence_for_token(&token),
+        )
+        .expect("preprocessing runtime certificate");
+        token.with_vector_runtime_certificate(certificate)
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    fn release_valid_zero_w1_token(byte: u8, parties: &[u16]) -> CertifiedToken {
+        let mut token = token(byte, parties);
+        token.w1.fill(0);
+        let certificate = PreprocessingVectorRuntimeCertificate::for_token(
+            &token,
+            release_vector_runtime_evidence_for_token(&token),
+        )
+        .expect("preprocessing runtime certificate");
+        token.with_vector_runtime_certificate(certificate)
     }
 
     #[derive(Clone, Default)]
@@ -4103,7 +7294,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Eq, PartialEq)]
     struct TestStrictShareProvider {
         shares: Vec<(SessionId, PartyId, PolyVec, PolyVec)>,
     }
@@ -4313,6 +7504,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_batch_rejects_uncertified_shape_errors() {
         assert_eq!(
@@ -4341,6 +7533,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn strict_release_batch_requires_preprocessing_runtime_certificates() {
+        let left = token(5, &[1, 2]);
+        let right = token(6, &[1, 2]);
+        assert_eq!(
+            BccCertifiedTokenBatch::new_release_validated(vec![left, right], 2)
+                .map(|batch| batch.len()),
+            Err(OnlineError::TokenPool(TokenPoolError::NotCertified(
+                session(5)
+            )))
+        );
+
+        let left = token(7, &[1, 2]);
+        let left_certificate = PreprocessingVectorRuntimeCertificate::for_token(
+            &left,
+            release_vector_runtime_evidence_for_token(&left),
+        )
+        .expect("left preprocessing runtime certificate");
+        let left = left.with_vector_runtime_certificate(left_certificate);
+        let right = token(8, &[1, 2]);
+        let right_certificate = PreprocessingVectorRuntimeCertificate::for_token(
+            &right,
+            release_vector_runtime_evidence_for_token(&right),
+        )
+        .expect("right preprocessing runtime certificate");
+        let right = right.with_vector_runtime_certificate(right_certificate);
+        assert_eq!(
+            BccCertifiedTokenBatch::new_release_validated(vec![left, right], 2)
+                .map(|batch| batch.len()),
+            Ok(2)
+        );
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[test]
+    fn strict_signing_release_checks_reject_uncertified_tokens_before_consumption() {
+        let new_err = BccCertifiedTokenBatch::new(vec![token(9, &[1, 2]), token(10, &[1, 2])], 2)
+            .expect_err("release-mode batch constructor rejects uncertified tokens");
+        assert_eq!(
+            new_err,
+            OnlineError::TokenPool(TokenPoolError::NotCertified(session(9)))
+        );
+
+        let first = token(9, &[1, 2]);
+        let second = token(10, &[1, 2]);
+        let expected_sessions = vec![first.session_id, second.session_id];
+        let batch = BccCertifiedTokenBatch {
+            signer_set: first.signer_set.clone(),
+            tokens: vec![first, second],
+        };
+        let mut store = SharedConsumedStore::default();
+        let consumed_ref = store.consumed.clone();
+        let mut backend = AssertConsumedBackend {
+            consumed: consumed_ref,
+            expected_sessions,
+            calls: 0,
+            signature: vec![1, 2, 3],
+            bad_shape: false,
+        };
+        let mut counters = SigningCounters::default();
+
+        let err = sign_strict_no_rejected_z::<MlDsa65, _, _, _>(
+            &strict_request(),
+            &[0x42; 64],
+            batch,
+            &mut store,
+            &mut counters,
+            &mut backend,
+            &AcceptSignature,
+        )
+        .expect_err("release mode rejects non-release preprocessing token");
+
+        assert_eq!(
+            err,
+            OnlineError::TokenPool(TokenPoolError::NotCertified(session(9)))
+        );
+        assert!(store.consumed.borrow().is_empty());
+        assert_eq!(backend.calls, 0);
+        assert_eq!(counters, SigningCounters::default());
+    }
+
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_consumes_batch_before_private_backend() {
         let first = token(11, &[1, 2]);
@@ -4380,6 +7654,7 @@ mod tests {
         assert_eq!(counters.signatures_returned, 1);
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn production_strict_stack_drives_all_private_boundaries() {
         let first = token(31, &[1, 2]);
@@ -4415,6 +7690,334 @@ mod tests {
     }
 
     #[test]
+    fn strict_vector_runtime_adapter_attaches_certificate_from_runtime_evidence() {
+        let first = token(35, &[1, 2]);
+        let second = token(36, &[1, 2]);
+        let consumed_batch = ConsumedBccCertifiedTokenBatch {
+            signer_set: first.signer_set.clone(),
+            tokens: vec![first, second],
+        };
+        let mut backend = ProductionStrictSigningVectorMpcRuntimeBackend::new(
+            ProductionStrictSigningBackend::new(
+                StackPrepare {
+                    public_key: vec![7],
+                    accepted_index: Some(0),
+                },
+                StackBounds,
+                StackHints,
+                StackSelect,
+                StackOpen,
+            ),
+            release_vector_runtime_evidence(),
+        )
+        .expect("strict signing runtime adapter");
+
+        let selected = StrictPrivateSigningBackend::<MlDsa65>::sign_consumed_batch(
+            &mut backend,
+            &strict_request(),
+            &[0x35; 64],
+            consumed_batch,
+        )
+        .expect("strict signing output");
+
+        let certificate = selected
+            .vector_runtime_certificate()
+            .expect("runtime certificate is attached to selected output");
+        assert_eq!(
+            certificate.source(),
+            StrictSigningRuntimeCertificateSource::RuntimeEvidenceOnly
+        );
+        assert!(certificate.runtime_evidence().counters.vector_lanes > 0);
+        assert!(
+            certificate
+                .runtime_evidence()
+                .coverage
+                .private_one_hot_selection
+        );
+        assert_eq!(selected.signature.bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn strict_vector_runtime_adapter_rejects_incomplete_runtime_evidence() {
+        let mut evidence = release_vector_runtime_evidence();
+        evidence.coverage.private_one_hot_selection = false;
+        let backend = ProductionStrictSigningBackend::new(
+            StackPrepare {
+                public_key: vec![7],
+                accepted_index: Some(0),
+            },
+            StackBounds,
+            StackHints,
+            StackSelect,
+            StackOpen,
+        );
+
+        let result = ProductionStrictSigningVectorMpcRuntimeBackend::new(backend, evidence);
+        assert!(matches!(
+            result,
+            Err(OnlineError::StrictSigningRuntimeSlotIncomplete)
+        ));
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[test]
+    fn strict_release_signing_rejects_local_stack_without_runtime_certificate() {
+        let first = release_valid_token(37, &[1, 2]);
+        let second = release_valid_token(38, &[1, 2]);
+        let batch =
+            BccCertifiedTokenBatch::new_release_validated(vec![first, second], 2).expect("batch");
+        let mut store = SharedConsumedStore::default();
+        let mut counters = SigningCounters::default();
+        let mut backend = ProductionStrictSigningBackend::new(
+            StackPrepare {
+                public_key: vec![7],
+                accepted_index: Some(0),
+            },
+            StackBounds,
+            StackHints,
+            StackSelect,
+            StackOpen,
+        );
+
+        let err = sign_strict_no_rejected_z::<MlDsa65, _, _, _>(
+            &strict_request(),
+            &[0x37; 64],
+            batch,
+            &mut store,
+            &mut counters,
+            &mut backend,
+            &AcceptSignature,
+        )
+        .expect_err("release signing rejects uncertified strict-signing runtime");
+
+        assert_eq!(err, OnlineError::StrictSigningRuntimeSlotIncomplete);
+        assert_eq!(counters.tokens_consumed, 2);
+        assert_eq!(counters.signatures_returned, 0);
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[test]
+    fn strict_session_release_rejects_local_stack_without_runtime_certificate() {
+        let first = release_valid_token(39, &[1, 2]);
+        let second = release_valid_token(40, &[1, 2]);
+        let batch =
+            BccCertifiedTokenBatch::new_release_validated(vec![first, second], 2).expect("batch");
+        let store = SharedConsumedStore::default();
+        let consumed = store.consumed.clone();
+        let backend = ProductionStrictSigningBackend::new(
+            StackPrepare {
+                public_key: vec![7],
+                accepted_index: Some(0),
+            },
+            StackBounds,
+            StackHints,
+            StackSelect,
+            StackOpen,
+        );
+        let mut session = StrictSigningSession::<MlDsa65, _, _, _>::start(
+            strict_request(),
+            [0x39; 64],
+            batch,
+            store,
+            backend,
+            AcceptSignature,
+        )
+        .expect("start strict session");
+
+        let err = session
+            .finish()
+            .expect_err("release session rejects missing signing runtime evidence");
+
+        assert_eq!(err, OnlineError::StrictSigningRuntimeSlotIncomplete);
+        assert_eq!(consumed.borrow().len(), 2);
+        assert_eq!(session.phase(), StrictSigningSessionPhase::Failed);
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[test]
+    fn strict_session_release_rejects_generic_runtime_evidence_wrapper() {
+        let first = release_valid_token(41, &[1, 2]);
+        let second = release_valid_token(42, &[1, 2]);
+        let batch =
+            BccCertifiedTokenBatch::new_release_validated(vec![first, second], 2).expect("batch");
+        let backend = ProductionStrictSigningVectorMpcRuntimeBackend::new(
+            ProductionStrictSigningBackend::new(
+                StackPrepare {
+                    public_key: vec![7],
+                    accepted_index: Some(0),
+                },
+                StackBounds,
+                StackHints,
+                StackSelect,
+                StackOpen,
+            ),
+            release_vector_runtime_evidence(),
+        )
+        .expect("runtime-certified backend");
+        let mut session = StrictSigningSession::<MlDsa65, _, _, _>::start(
+            strict_request(),
+            [0x41; 64],
+            batch,
+            SharedConsumedStore::default(),
+            backend,
+            AcceptSignature,
+        )
+        .expect("start strict session");
+
+        let err = session
+            .finish()
+            .expect_err("release session rejects generic runtime-evidence wrapper");
+
+        assert_eq!(err, OnlineError::StrictSigningRuntimeSlotIncomplete);
+        assert_eq!(session.phase(), StrictSigningSessionPhase::Failed);
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[test]
+    fn strict_session_release_accepts_selected_opening_artifact_backend() {
+        let first = release_valid_zero_w1_token(43, &[1, 2]);
+        let second = release_valid_zero_w1_token(44, &[1, 2]);
+        let provider = zero_strict_share_provider(&[&first, &second]);
+        let batch =
+            BccCertifiedTokenBatch::new_release_validated(vec![first, second], 2).expect("batch");
+        let request = strict_request();
+        let tr = [0x43; 64];
+        let source = ProductionStrictVectorMpcArtifactSource::new(
+            vec![0u8; MlDsa65::PK_LEN],
+            provider,
+            release_vector_runtime_evidence(),
+        )
+        .expect("strict vector artifact source");
+        let backend = ProductionStrictRuntimeSelectedOpeningArtifactBackend::new(source);
+        let mut session = StrictSigningSession::<
+            MlDsa65,
+            ProductionStrictRuntimeSelectedOpeningArtifactBackend<
+                ProductionStrictVectorMpcArtifactSource<TestStrictShareProvider>,
+            >,
+            _,
+            _,
+        >::start_release_validated(
+            request,
+            tr,
+            batch,
+            SharedConsumedStore::default(),
+            backend,
+            AcceptMlDsa65Length,
+        )
+        .expect("start strict session");
+
+        let signature = session
+            .finish()
+            .expect("release session accepts selected-opening artifact backend");
+
+        assert_eq!(signature.bytes.len(), MlDsa65::SIG_LEN);
+        assert_eq!(session.phase(), StrictSigningSessionPhase::Finished);
+        assert_eq!(session.counters().signatures_returned, 1);
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[test]
+    #[ignore = "requires a multi-party app-driven vector MPC scheduler to deliver runtime phases"]
+    fn strict_session_release_uses_live_vector_mpc_artifact_source() {
+        let token = release_valid_zero_w1_token(45, &[1]);
+        let token_session_id = token.session_id;
+        let batch =
+            BccCertifiedTokenBatch::new_release_validated(vec![token], 1).expect("release batch");
+        let request = strict_request_one_party();
+        let tr = [0x45; 64];
+        let (config, runtime, label) = strict_test_vector_runtime_one_party(45);
+        let y_lanes = vec![0; MlDsa65::L * MlDsa65::N];
+        let s1_lanes = vec![0; MlDsa65::L * MlDsa65::N];
+        let z_mask_lanes = vec![0; MlDsa65::L * MlDsa65::N];
+        let hint_mask_lanes = vec![0; MlDsa65::K * MlDsa65::N];
+        let z_bits = (0..23)
+            .map(|bit| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &label.child(format!("z_mask_bit_{bit}")),
+                        vec![0; MlDsa65::L * MlDsa65::N],
+                    )
+                    .expect("z mask bit")
+            })
+            .collect::<Vec<_>>();
+        let hint_bits = (0..23)
+            .map(|bit| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &label.child(format!("hint_mask_bit_{bit}")),
+                        vec![0; MlDsa65::K * MlDsa65::N],
+                    )
+                    .expect("hint mask bit")
+            })
+            .collect::<Vec<_>>();
+        let input = StrictRuntimeCandidateShareInput {
+            token_session_id,
+            y_share: runtime
+                .share_vec_from_local_lanes::<MlDsa65>(&config, &label.child("y"), y_lanes)
+                .expect("y share"),
+            s1_share: runtime
+                .share_vec_from_local_lanes::<MlDsa65>(&config, &label.child("s1"), s1_lanes)
+                .expect("s1 share"),
+            z_mask_value: runtime
+                .share_vec_from_local_lanes::<MlDsa65>(
+                    &config,
+                    &label.child("z_mask"),
+                    z_mask_lanes,
+                )
+                .expect("z mask"),
+            z_mask_bits_by_bit: z_bits,
+            hint_mask_value: runtime
+                .share_vec_from_local_lanes::<MlDsa65>(
+                    &config,
+                    &label.child("hint_mask"),
+                    hint_mask_lanes,
+                )
+                .expect("hint mask"),
+            hint_mask_bits_by_bit: hint_bits,
+            w1: vec![0; MlDsa65::K * MlDsa65::N],
+        };
+        let source = ProductionStrictLiveVectorMpcArtifactSource::new(
+            config,
+            runtime,
+            TestProductionVectorEntropy::default(),
+            vec![0u8; MlDsa65::PK_LEN],
+            vec![input],
+        );
+        let backend = ProductionStrictRuntimeSelectedOpeningArtifactBackend::new(source);
+        let mut session = StrictSigningSession::<
+            MlDsa65,
+            ProductionStrictRuntimeSelectedOpeningArtifactBackend<
+                ProductionStrictLiveVectorMpcArtifactSource<
+                    LatestRoundInMemoryTransport,
+                    talus_dkg::InMemoryPrimeFieldMpcWireMessageLog,
+                    talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog,
+                    TestProductionVectorEntropy,
+                >,
+            >,
+            _,
+            _,
+        >::start_release_validated(
+            request,
+            tr,
+            batch,
+            SharedConsumedStore::default(),
+            backend,
+            AcceptMlDsa65Length,
+        )
+        .expect("start strict session");
+
+        let signature = session
+            .finish()
+            .expect("live vector runtime source signs selected material");
+
+        assert_eq!(signature.bytes.len(), MlDsa65::SIG_LEN);
+        assert_eq!(session.phase(), StrictSigningSessionPhase::Finished);
+    }
+
+    #[cfg(not(feature = "production-release-checks"))]
+    #[test]
     fn strict_production_backend_constructor_uses_canonical_component_stack() {
         let first = zero_w1_token(81, &[1, 2]);
         let second = zero_w1_token(82, &[1, 2]);
@@ -4440,6 +8043,7 @@ mod tests {
         assert_eq!(counters.signatures_returned, 1);
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_no_valid_batch_consumes_tokens_and_returns_generic_failure_only() {
         let first = token(83, &[1, 2]);
@@ -4494,6 +8098,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_request_rejects_forked_signing_set_before_token_consumption() {
         let first = token(85, &[1, 2]);
@@ -4594,6 +8199,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_drives_finish_and_rejects_transport_until_runtime_lands() {
         let first = token(33, &[1, 2]);
@@ -4666,6 +8272,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_routes_strict_mpc_wire_messages_and_persists_hashes() {
         let first = token(44, &[1, 2]);
@@ -4755,6 +8362,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_delegates_to_distributed_runtime_and_tracks_completion() {
         let first = token(48, &[1, 2]);
@@ -4834,6 +8442,7 @@ mod tests {
         assert_eq!(runtime.broadcast_calls, 0);
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_rejects_out_of_order_runtime_completion() {
         let first = token(50, &[1, 2]);
@@ -4873,6 +8482,7 @@ mod tests {
         assert!(session.completed_runtime_slots().is_empty());
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_enforces_runtime_sender_and_phase_discipline() {
         let first = token(54, &[1, 2]);
@@ -4936,6 +8546,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_rejects_completion_before_required_senders_arrive() {
         let first = token(56, &[1, 2]);
@@ -4979,6 +8590,7 @@ mod tests {
         assert!(!progress[0].completed);
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_rejects_malformed_strict_mpc_wire_messages() {
         let first = token(46, &[1, 2]);
@@ -5068,6 +8680,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_failure_is_terminal_after_consumption() {
         let first = token(36, &[1, 2]);
@@ -5112,6 +8725,7 @@ mod tests {
         assert_eq!(final_signature, None);
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_persists_start_and_finished_cursor() {
         let first = token(38, &[1, 2]);
@@ -5163,6 +8777,7 @@ mod tests {
         assert_eq!(finished.runtime_slot, None);
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_persists_every_runtime_slot() {
         let first = zero_w1_token(42, &[1, 2]);
@@ -5250,6 +8865,7 @@ mod tests {
     }
 
     #[cfg(feature = "std")]
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_signing_session_restart_preserves_accepted_wire_hashes_before_completion() {
         let cursor_path = strict_session_store_path("wire-restart");
@@ -5335,6 +8951,7 @@ mod tests {
     }
 
     #[cfg(feature = "std")]
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn file_strict_signing_cursor_survives_reopen_and_blocks_consumed_batch_reuse() {
         let cursor_path = strict_session_store_path("cursor-reopen");
@@ -5476,6 +9093,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_final_verify_failure_consumes_without_output() {
         let first = token(21, &[1, 2]);
@@ -5516,6 +9134,7 @@ mod tests {
         assert_eq!(counters.final_verify_failures, 1);
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn strict_response_check_shape_is_enforced_before_output() {
         let first = token(24, &[1, 2]);
@@ -5755,5 +9374,699 @@ mod tests {
                 .expect("release vector runtime certificate");
         let selected = selected.with_vector_runtime_certificate(certificate.clone());
         assert_eq!(selected.vector_runtime_certificate(), Some(&certificate));
+    }
+
+    #[test]
+    fn strict_vector_candidate_handle_debug_redacts_rejected_material() {
+        let handle = StrictVectorCandidateHandle {
+            priority: StrictCandidatePriority([0x81; 32]),
+            ctilde: vec![0x82; 32],
+            response: PolyVec::zero(MlDsa65::L),
+            bound_ok: Some(false),
+            hint_ok: Some(false),
+            hint: None,
+            signature: Some(FinalSignature {
+                bytes: vec![0x83; MlDsa65::SIG_LEN],
+            }),
+        };
+
+        let debug = format!("{handle:?}");
+        assert!(debug.contains("priority"));
+        for forbidden in [
+            "ctilde",
+            "response",
+            "bound_ok",
+            "hint_ok",
+            "signature",
+            "0x82",
+            "0x83",
+            "valid",
+            "invalid",
+            "failure",
+            "hint",
+        ] {
+            assert!(
+                !debug.contains(forbidden),
+                "candidate debug leaked {forbidden}: {debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_runtime_response_preparation_builds_runtime_z_handle() {
+        let config = DkgConfig::new::<MlDsa65>(
+            2,
+            vec![PartyId(1), PartyId(2), PartyId(3)],
+            talus_dkg::KeygenEpoch(7),
+        )
+        .expect("config");
+        let transport = talus_wire::InMemoryTransport::new(1, vec![1, 2, 3]).expect("transport");
+        let state = talus_dkg::TransportPrimeFieldMpcStateMachine::new(
+            config.clone(),
+            PartyId(1),
+            transport,
+        )
+        .expect("state machine");
+        let party_runtime = talus_dkg::TransportPrimeFieldMpcPartyRuntime::new(
+            state,
+            talus_dkg::InMemoryPrimeFieldMpcWireMessageLog::default(),
+        );
+        let runtime = ProductionVectorPrimeFieldMpcRuntime::new(
+            talus_dkg::CursoredTransportPrimeFieldMpcPartyRuntime::new(
+                party_runtime,
+                talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog::default(),
+            ),
+        );
+        let label = Power2RoundTranscriptLabel::root(&config, [0x91; 32])
+            .child("strict_signing")
+            .child("candidate_0");
+        let lane_count = MlDsa65::L * MlDsa65::N;
+        let y_share = runtime
+            .share_vec_from_local_lanes::<MlDsa65>(&config, &label.child("y"), vec![3; lane_count])
+            .expect("y share");
+        let s1_share = runtime
+            .share_vec_from_local_lanes::<MlDsa65>(&config, &label.child("s1"), vec![1; lane_count])
+            .expect("s1 share");
+        let ctilde = vec![0x44; MlDsa65::CTILDE_LEN];
+
+        let z_share = strict_prepare_runtime_z_share::<MlDsa65, _, _, _>(
+            &runtime,
+            &config,
+            &y_share,
+            &s1_share,
+            &ctilde,
+            &label.child("response"),
+        )
+        .expect("runtime z share");
+        let candidate = StrictRuntimeCandidateHandle::new_runtime_prepared(
+            StrictCandidatePriority([0x92; 32]),
+            ctilde,
+            z_share,
+        );
+
+        assert_eq!(candidate.z_share().len(), lane_count);
+        assert_eq!(candidate.ctilde().len(), MlDsa65::CTILDE_LEN);
+        let debug = format!("{candidate:?}");
+        assert!(debug.contains("z_share"));
+        assert!(!debug.contains("lanes"));
+        assert!(!debug.contains("ctilde:"));
+        assert!(!debug.contains("response"));
+    }
+
+    fn strict_test_vector_runtime(
+        epoch: u64,
+    ) -> (
+        DkgConfig,
+        ProductionVectorPrimeFieldMpcRuntime<
+            talus_wire::InMemoryTransport,
+            talus_dkg::InMemoryPrimeFieldMpcWireMessageLog,
+            talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog,
+        >,
+        Power2RoundTranscriptLabel,
+    ) {
+        let config = DkgConfig::new::<MlDsa65>(
+            2,
+            vec![PartyId(1), PartyId(2), PartyId(3)],
+            talus_dkg::KeygenEpoch(epoch),
+        )
+        .expect("config");
+        let transport = talus_wire::InMemoryTransport::new(1, vec![1, 2, 3]).expect("transport");
+        let state = talus_dkg::TransportPrimeFieldMpcStateMachine::new(
+            config.clone(),
+            PartyId(1),
+            transport,
+        )
+        .expect("state machine");
+        let party_runtime = talus_dkg::TransportPrimeFieldMpcPartyRuntime::new(
+            state,
+            talus_dkg::InMemoryPrimeFieldMpcWireMessageLog::default(),
+        );
+        let runtime = ProductionVectorPrimeFieldMpcRuntime::new(
+            talus_dkg::CursoredTransportPrimeFieldMpcPartyRuntime::new(
+                party_runtime,
+                talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog::default(),
+            ),
+        );
+        let label = Power2RoundTranscriptLabel::root(&config, [0x93; 32]).child("strict_signing");
+        (config, runtime, label)
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    fn strict_test_vector_runtime_one_party(
+        epoch: u64,
+    ) -> (
+        DkgConfig,
+        ProductionVectorPrimeFieldMpcRuntime<
+            LatestRoundInMemoryTransport,
+            talus_dkg::InMemoryPrimeFieldMpcWireMessageLog,
+            talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog,
+        >,
+        Power2RoundTranscriptLabel,
+    ) {
+        let config = DkgConfig::new::<MlDsa65>(1, vec![PartyId(1)], talus_dkg::KeygenEpoch(epoch))
+            .expect("config");
+        let transport = LatestRoundInMemoryTransport::new(1, vec![1]).expect("transport");
+        let state = talus_dkg::TransportPrimeFieldMpcStateMachine::new(
+            config.clone(),
+            PartyId(1),
+            transport,
+        )
+        .expect("state machine");
+        let party_runtime = talus_dkg::TransportPrimeFieldMpcPartyRuntime::new(
+            state,
+            talus_dkg::InMemoryPrimeFieldMpcWireMessageLog::default(),
+        );
+        let runtime = ProductionVectorPrimeFieldMpcRuntime::new(
+            talus_dkg::CursoredTransportPrimeFieldMpcPartyRuntime::new(
+                party_runtime,
+                talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog::default(),
+            ),
+        );
+        let label = Power2RoundTranscriptLabel::root(&config, [0x44; 32]).child("strict_signing");
+        (config, runtime, label)
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct LatestRoundInMemoryTransport {
+        inner: talus_wire::InMemoryTransport,
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    impl LatestRoundInMemoryTransport {
+        fn new(local_party_id: u16, parties: Vec<u16>) -> Result<Self, talus_wire::TransportError> {
+            talus_wire::InMemoryTransport::new(local_party_id, parties).map(|inner| Self { inner })
+        }
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    impl AuthenticatedP2pTransport for LatestRoundInMemoryTransport {
+        fn send_private(
+            &mut self,
+            receiver_party_id: u16,
+            message: talus_wire::WireMessage,
+        ) -> Result<(), talus_wire::TransportError> {
+            self.inner.send_private(receiver_party_id, message)
+        }
+
+        fn collect_private_round(
+            &self,
+            receiver_party_id: u16,
+            expected_round: talus_wire::RoundId,
+            expected: &talus_wire::ExpectedContext,
+        ) -> Result<Vec<talus_wire::WireMessage>, talus_wire::TransportError> {
+            let mut latest_by_sender = std::collections::BTreeMap::new();
+            for delivery in self.inner.private_messages() {
+                if delivery.receiver_party_id != receiver_party_id
+                    || delivery.message.header.round != expected_round
+                {
+                    continue;
+                }
+                latest_by_sender.insert(
+                    delivery.message.header.sender_party_id,
+                    delivery.message.clone(),
+                );
+            }
+            let messages = latest_by_sender.into_values().collect::<Vec<_>>();
+            talus_wire::validate_round_batch(&messages, expected_round, expected)
+                .map_err(talus_wire::TransportError::Wire)?;
+            Ok(messages)
+        }
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    impl EquivocationResistantBroadcast for LatestRoundInMemoryTransport {
+        fn broadcast(
+            &mut self,
+            message: talus_wire::WireMessage,
+        ) -> Result<(), talus_wire::TransportError> {
+            self.inner.broadcast(message)
+        }
+
+        fn collect_broadcast_view(
+            &self,
+            observer_party_id: u16,
+            expected_round: talus_wire::RoundId,
+            expected: &talus_wire::ExpectedContext,
+        ) -> Result<Vec<talus_wire::WireMessage>, talus_wire::TransportError> {
+            let mut latest_by_sender = std::collections::BTreeMap::new();
+            for delivery in self.inner.broadcast_deliveries() {
+                if delivery.observer_party_id != observer_party_id
+                    || delivery.message.header.round != expected_round
+                {
+                    continue;
+                }
+                latest_by_sender.insert(
+                    delivery.message.header.sender_party_id,
+                    delivery.message.clone(),
+                );
+            }
+            let messages = latest_by_sender.into_values().collect::<Vec<_>>();
+            talus_wire::validate_round_batch(&messages, expected_round, expected)
+                .map_err(talus_wire::TransportError::Wire)?;
+            Ok(messages)
+        }
+
+        fn collect_equivocation_checked_round(
+            &self,
+            expected_round: talus_wire::RoundId,
+            expected: &talus_wire::ExpectedContext,
+        ) -> Result<Vec<talus_wire::WireMessage>, talus_wire::TransportError> {
+            let mut canonical = Vec::new();
+            for observer in &expected.allowed_parties {
+                let view = self.collect_broadcast_view(*observer, expected_round, expected)?;
+                if view.len() != expected.allowed_parties.len() {
+                    return Err(talus_wire::TransportError::IncompleteBroadcastView {
+                        observer_party_id: *observer,
+                        expected: expected.allowed_parties.len(),
+                        got: view.len(),
+                    });
+                }
+                for message in view {
+                    let sender = message.header.sender_party_id;
+                    match canonical
+                        .iter()
+                        .position(|known: &talus_wire::WireMessage| {
+                            known.header.sender_party_id == sender
+                        }) {
+                        Some(idx) => {
+                            if talus_wire::encode_message(&canonical[idx])
+                                .map_err(talus_wire::TransportError::Wire)?
+                                != talus_wire::encode_message(&message)
+                                    .map_err(talus_wire::TransportError::Wire)?
+                            {
+                                return Err(talus_wire::TransportError::Equivocation { sender });
+                            }
+                        }
+                        None => canonical.push(message),
+                    }
+                }
+            }
+            canonical.sort_by_key(|message| message.header.sender_party_id);
+            talus_wire::validate_round_batch(&canonical, expected_round, expected)
+                .map_err(talus_wire::TransportError::Wire)?;
+            Ok(canonical)
+        }
+    }
+
+    #[test]
+    fn strict_runtime_hint_and_weight_states_are_runtime_owned() {
+        let (config, runtime, label) = strict_test_vector_runtime(8);
+        let lane_count = MlDsa65::K * MlDsa65::N;
+        let r_bits = (0..23)
+            .map(|bit| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &label.child(format!("r_bit_{bit}")),
+                        vec![0; lane_count],
+                    )
+                    .expect("bit share")
+            })
+            .collect::<Vec<_>>();
+        let w1 = vec![0u32; lane_count];
+
+        let hint_state = StrictRuntimeHintBitsCheckState::new::<MlDsa65, _, _, _>(
+            &runtime,
+            &config,
+            &r_bits,
+            &w1,
+            &label.child("hint_bits"),
+        )
+        .expect("hint state");
+        assert!(hint_state.hint_bits().is_none());
+
+        let h_bits = runtime
+            .bit_share_vec_from_local_lanes::<MlDsa65>(
+                &config,
+                &label.child("h_bits"),
+                vec![0; lane_count],
+            )
+            .expect("h bits");
+        let weight_state = StrictRuntimeHintWeightCheckState::new::<MlDsa65, _, _, _>(
+            &runtime,
+            &config,
+            &h_bits,
+            &label.child("hint_weight"),
+        )
+        .expect("hint weight state");
+        assert!(weight_state.result().is_none());
+
+        let all_bits_state = StrictRuntimeAllBitsTrueState::new::<MlDsa65, _, _, _>(
+            &runtime,
+            &config,
+            &h_bits,
+            &label.child("all_hint_bits_true"),
+        )
+        .expect("all bits state");
+        assert!(all_bits_state.result().is_none());
+    }
+
+    #[test]
+    fn strict_runtime_hint_approx_and_selection_handles_do_not_prebuild_signature() {
+        let (config, mut runtime, label) = strict_test_vector_runtime(9);
+        let z_lane_count = MlDsa65::L * MlDsa65::N;
+        let z_share = runtime
+            .share_vec_from_local_lanes::<MlDsa65>(
+                &config,
+                &label.child("z"),
+                vec![0; z_lane_count],
+            )
+            .expect("z share");
+        let public_key = vec![0u8; MlDsa65::PK_LEN];
+        let ctilde = vec![0x24; MlDsa65::CTILDE_LEN];
+        let approx = strict_runtime_hint_approx_share::<MlDsa65, _, _, _>(
+            &runtime,
+            &config,
+            &public_key,
+            &ctilde,
+            &z_share,
+            &label.child("hint_approx"),
+        )
+        .expect("hint approx");
+        assert_eq!(approx.len(), MlDsa65::K * MlDsa65::N);
+
+        let selected = runtime
+            .bit_share_vec_from_local_lanes::<MlDsa65>(&config, &label.child("selected"), vec![1])
+            .expect("selected bit");
+        let selected_bits = vec![selected];
+        let values = vec![z_share.clone()];
+        let mut entropy = TestProductionVectorEntropy::default();
+        strict_drive_selected_share_products::<MlDsa65, _, _, _, _>(
+            &mut runtime,
+            &config,
+            &selected_bits,
+            &values,
+            &label.child("selected_z"),
+            &mut entropy,
+        )
+        .expect("drive selected product");
+
+        let candidate = StrictRuntimeCandidateHandle::new_runtime_prepared(
+            StrictCandidatePriority([0x94; 32]),
+            ctilde,
+            z_share,
+        );
+        let debug = format!("{candidate:?}");
+        assert!(!debug.contains("signature"));
+        assert!(!debug.contains("response"));
+        assert!(!debug.contains("lanes"));
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[test]
+    fn strict_selected_public_metadata_uses_private_selected_bit_not_min_priority() {
+        let (config, mut runtime, label) = strict_test_vector_runtime_one_party(91);
+        let selected_bits = vec![
+            runtime
+                .bit_share_vec_from_local_lanes::<MlDsa65>(
+                    &config,
+                    &label.child("selected_0"),
+                    vec![0],
+                )
+                .expect("unselected bit"),
+            runtime
+                .bit_share_vec_from_local_lanes::<MlDsa65>(
+                    &config,
+                    &label.child("selected_1"),
+                    vec![1],
+                )
+                .expect("selected bit"),
+        ];
+        let public_priorities = vec![vec![1u8; 32], vec![2u8; 32]];
+        let priority_share = strict_selected_public_lanes_share::<MlDsa65, _, _, _>(
+            &runtime,
+            &config,
+            &selected_bits,
+            &public_priorities,
+            &label.child("selected_priority"),
+        )
+        .expect("selected priority share");
+        runtime
+            .drive_open_share_vec::<MlDsa65>(
+                &config,
+                &priority_share,
+                &label.child("selected_priority/open"),
+            )
+            .expect("drive priority open");
+        let opened_priority = strict_collected_value(
+            runtime
+                .collect_open_share_vec::<MlDsa65>(&config, &label.child("selected_priority/open"))
+                .expect("collect priority open"),
+        )
+        .expect("opened priority");
+
+        assert_eq!(
+            strict_u8_lanes_from_opening(&opened_priority).expect("priority bytes"),
+            vec![2u8; 32],
+            "selected public metadata must follow the private one-hot bit, not the lowest public priority"
+        );
+    }
+
+    #[test]
+    fn strict_selected_output_builder_encodes_only_selected_material() {
+        let request = strict_request();
+        let selected_priority = StrictCandidatePriority([0x95; 32]);
+        let ctilde = vec![0x25; MlDsa65::CTILDE_LEN];
+        let z = PolyVec::zero(MlDsa65::L);
+        let h = PolyVec::zero(MlDsa65::K);
+
+        let selected = strict_build_selected_signature_output::<MlDsa65>(
+            &request,
+            3,
+            selected_priority,
+            &ctilde,
+            &z,
+            &h,
+        )
+        .expect("selected signature output");
+
+        assert_eq!(selected.evidence.token_count, 3);
+        assert_eq!(selected.evidence.selected_priority, selected_priority);
+        selected
+            .evidence
+            .response_check_counters
+            .validate_for_batch(3)
+            .expect("coarse counters");
+        assert!(selected.vector_runtime_certificate().is_none());
+        assert_eq!(&selected.signature.bytes[..MlDsa65::CTILDE_LEN], &ctilde);
+        let debug = format!("{selected:?}");
+        assert!(!debug.contains("valid_j"));
+        assert!(!debug.contains("failure"));
+        assert!(!debug.contains("unselected"));
+    }
+
+    fn strict_selected_opening_artifact_for_test(
+        request: &StrictSignRequest,
+        tr: &[u8; 64],
+        batch: &ConsumedBccCertifiedTokenBatch,
+        selected_index: usize,
+    ) -> StrictRuntimeSelectedOpeningArtifact {
+        let metadata = strict_candidate_metadata_batch::<MlDsa65>(request, batch, tr);
+        let selected = metadata
+            .get(selected_index)
+            .expect("selected test metadata exists");
+        StrictRuntimeSelectedOpeningArtifact::new(
+            strict_signing_request_hash(request),
+            batch.session_ids_for_test(),
+            selected.priority,
+            selected.ctilde.clone(),
+            PolyVec::zero(MlDsa65::L),
+            PolyVec::zero(MlDsa65::K),
+            StrictSigningVectorRuntimeCertificate::new(release_vector_runtime_evidence())
+                .expect("strict signing runtime certificate"),
+        )
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    fn strict_selected_opening_artifact_from_batch_for_test(
+        request: &StrictSignRequest,
+        tr: &[u8; 64],
+        batch: &BccCertifiedTokenBatch,
+        selected_index: usize,
+    ) -> StrictRuntimeSelectedOpeningArtifact {
+        let metadata = batch
+            .tokens
+            .iter()
+            .map(|token| strict_candidate_metadata::<MlDsa65>(request, token, tr))
+            .collect::<Vec<_>>();
+        let selected = metadata
+            .get(selected_index)
+            .expect("selected test metadata exists");
+        StrictRuntimeSelectedOpeningArtifact::new(
+            strict_signing_request_hash(request),
+            batch.session_ids(),
+            selected.priority,
+            selected.ctilde.clone(),
+            PolyVec::zero(MlDsa65::L),
+            PolyVec::zero(MlDsa65::K),
+            StrictSigningVectorRuntimeCertificate::new(release_vector_runtime_evidence())
+                .expect("strict signing runtime certificate"),
+        )
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FixedSelectedOpeningArtifactSource {
+        artifact: Option<StrictRuntimeSelectedOpeningArtifact>,
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    impl FixedSelectedOpeningArtifactSource {
+        fn new(artifact: StrictRuntimeSelectedOpeningArtifact) -> Self {
+            Self {
+                artifact: Some(artifact),
+            }
+        }
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    impl StrictRuntimeSelectedOpeningArtifactSource<MlDsa65> for FixedSelectedOpeningArtifactSource {
+        fn produce_selected_opening_artifact(
+            &mut self,
+            _request: &StrictSignRequest,
+            _tr: &[u8; 64],
+            _batch: &ConsumedBccCertifiedTokenBatch,
+        ) -> Result<StrictRuntimeSelectedOpeningArtifact, OnlineError> {
+            self.artifact
+                .take()
+                .ok_or(OnlineError::StrictSigningSessionAlreadyFinished)
+        }
+    }
+
+    #[test]
+    fn strict_runtime_selected_opening_backend_accepts_bound_artifact_only() {
+        let request = strict_request();
+        let tr = [0x96; 64];
+        let first = token(96, &[1, 2]);
+        let second = token(97, &[1, 2]);
+        let consumed_batch = ConsumedBccCertifiedTokenBatch {
+            signer_set: first.signer_set.clone(),
+            tokens: vec![first, second],
+        };
+        let artifact = strict_selected_opening_artifact_for_test(&request, &tr, &consumed_batch, 1);
+        let mut backend = ProductionStrictRuntimeSelectedOpeningBackend::new(artifact.clone());
+
+        let selected = StrictPrivateSigningBackend::<MlDsa65>::sign_consumed_batch(
+            &mut backend,
+            &request,
+            &tr,
+            consumed_batch,
+        )
+        .expect("selected opening artifact signs");
+
+        assert_eq!(selected.evidence.token_count, 2);
+        assert_eq!(
+            selected.evidence.selected_priority,
+            artifact.selected_priority
+        );
+        assert_eq!(
+            &selected.signature.bytes[..MlDsa65::CTILDE_LEN],
+            artifact.selected_ctilde.as_slice()
+        );
+        let certificate = selected
+            .vector_runtime_certificate()
+            .expect("selected opening artifact carries runtime certificate");
+        assert!(
+            certificate
+                .runtime_evidence()
+                .coverage
+                .private_one_hot_selection
+        );
+        assert_eq!(
+            StrictPrivateSigningBackend::<MlDsa65>::sign_consumed_batch(
+                &mut backend,
+                &request,
+                &tr,
+                ConsumedBccCertifiedTokenBatch {
+                    signer_set: vec![PartyId(1), PartyId(2)],
+                    tokens: vec![token(98, &[1, 2]), token(99, &[1, 2])],
+                },
+            ),
+            Err(OnlineError::StrictSigningSessionAlreadyFinished)
+        );
+    }
+
+    #[test]
+    fn strict_runtime_selected_opening_backend_rejects_unbound_artifacts() {
+        let request = strict_request();
+        let tr = [0x97; 64];
+        let consumed_batch = ConsumedBccCertifiedTokenBatch {
+            signer_set: vec![PartyId(1), PartyId(2)],
+            tokens: vec![token(101, &[1, 2]), token(102, &[1, 2])],
+        };
+
+        let mut wrong_request =
+            strict_selected_opening_artifact_for_test(&request, &tr, &consumed_batch, 0);
+        wrong_request.request_hash = [0xAA; 32];
+        let mut backend = ProductionStrictRuntimeSelectedOpeningBackend::new(wrong_request);
+        assert_eq!(
+            StrictPrivateSigningBackend::<MlDsa65>::sign_consumed_batch(
+                &mut backend,
+                &request,
+                &tr,
+                ConsumedBccCertifiedTokenBatch {
+                    signer_set: vec![PartyId(1), PartyId(2)],
+                    tokens: vec![token(101, &[1, 2]), token(102, &[1, 2])],
+                },
+            ),
+            Err(OnlineError::StrictResponseCheckShapeMismatch)
+        );
+
+        let mut wrong_tokens =
+            strict_selected_opening_artifact_for_test(&request, &tr, &consumed_batch, 0);
+        wrong_tokens.token_session_ids.reverse();
+        let mut backend = ProductionStrictRuntimeSelectedOpeningBackend::new(wrong_tokens);
+        assert_eq!(
+            StrictPrivateSigningBackend::<MlDsa65>::sign_consumed_batch(
+                &mut backend,
+                &request,
+                &tr,
+                ConsumedBccCertifiedTokenBatch {
+                    signer_set: vec![PartyId(1), PartyId(2)],
+                    tokens: vec![token(101, &[1, 2]), token(102, &[1, 2])],
+                },
+            ),
+            Err(OnlineError::StrictResponseCheckShapeMismatch)
+        );
+
+        let mut wrong_ctilde =
+            strict_selected_opening_artifact_for_test(&request, &tr, &consumed_batch, 0);
+        wrong_ctilde.selected_ctilde[0] ^= 1;
+        let mut backend = ProductionStrictRuntimeSelectedOpeningBackend::new(wrong_ctilde);
+        assert_eq!(
+            StrictPrivateSigningBackend::<MlDsa65>::sign_consumed_batch(
+                &mut backend,
+                &request,
+                &tr,
+                ConsumedBccCertifiedTokenBatch {
+                    signer_set: vec![PartyId(1), PartyId(2)],
+                    tokens: vec![token(101, &[1, 2]), token(102, &[1, 2])],
+                },
+            ),
+            Err(OnlineError::StrictResponseCheckShapeMismatch)
+        );
+    }
+
+    #[test]
+    fn strict_runtime_selected_opening_artifact_debug_redacts_selected_material() {
+        let request = strict_request();
+        let tr = [0x98; 64];
+        let first = token(103, &[1, 2]);
+        let second = token(104, &[1, 2]);
+        let consumed_batch = ConsumedBccCertifiedTokenBatch {
+            signer_set: first.signer_set.clone(),
+            tokens: vec![first, second],
+        };
+        let artifact = strict_selected_opening_artifact_for_test(&request, &tr, &consumed_batch, 0);
+
+        let debug = format!("{artifact:?}");
+        assert!(debug.contains("selected_ctilde_len"));
+        assert!(debug.contains("<opened-selected-redacted>"));
+        assert!(!debug.contains("selected_z: PolyVec"));
+        assert!(!debug.contains("selected_h: PolyVec"));
+        assert!(!debug.contains("valid_j"));
+        assert!(!debug.contains("unselected"));
+        assert!(!debug.contains("failure"));
     }
 }

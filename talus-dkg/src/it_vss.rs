@@ -1396,6 +1396,63 @@ pub(crate) fn it_vss_public_coin_share_from_wire(
     }
 }
 
+pub(crate) fn wire_it_vss_audit_record(
+    record: &ProductionItVssAuditRecord,
+) -> DkgItVssAuditRecordPayload {
+    DkgItVssAuditRecordPayload {
+        dealer_party_id: record.dealer.0,
+        holder_party_id: record.holder.0,
+        receiver_party_id: record.receiver.0,
+        label_hash: record.label_hash,
+        tag_index: record.tag_index,
+        audited_receiver_tag: record.audited_receiver_tag.clone(),
+        audited_receiver_tag_hash: record.audited_receiver_tag_hash,
+    }
+}
+
+pub(crate) fn it_vss_audit_record_from_wire(
+    payload: &DkgItVssAuditRecordPayload,
+) -> ProductionItVssAuditRecord {
+    ProductionItVssAuditRecord {
+        dealer: PartyId(payload.dealer_party_id),
+        holder: PartyId(payload.holder_party_id),
+        receiver: PartyId(payload.receiver_party_id),
+        label_hash: payload.label_hash,
+        tag_index: payload.tag_index,
+        audited_receiver_tag: payload.audited_receiver_tag.clone(),
+        audited_receiver_tag_hash: payload.audited_receiver_tag_hash,
+        discard_after_audit: DiscardAfterAudit,
+    }
+}
+
+pub(crate) fn wire_it_vss_consistency_record(
+    record: &ProductionItVssConsistencyRecord,
+) -> DkgItVssConsistencyRecordPayload {
+    DkgItVssConsistencyRecordPayload {
+        dealer_party_id: record.dealer.0,
+        holder_party_id: record.holder.0,
+        label_hash: record.label_hash,
+        round: record.round,
+        challenge_bit: record.challenge_bit,
+        masked_eval: record.masked_eval.clone(),
+        masked_eval_hash: record.masked_eval_hash,
+    }
+}
+
+pub(crate) fn it_vss_consistency_record_from_wire(
+    payload: &DkgItVssConsistencyRecordPayload,
+) -> ProductionItVssConsistencyRecord {
+    ProductionItVssConsistencyRecord {
+        dealer: PartyId(payload.dealer_party_id),
+        holder: PartyId(payload.holder_party_id),
+        label_hash: payload.label_hash,
+        round: payload.round,
+        challenge_bit: payload.challenge_bit,
+        masked_eval: payload.masked_eval.clone(),
+        masked_eval_hash: payload.masked_eval_hash,
+    }
+}
+
 pub(crate) fn wire_it_vss_certificate(
     certificate: &VerifiedItVssSharingCertificate,
 ) -> DkgItVssCertificatePayload {
@@ -1542,6 +1599,24 @@ pub fn encode_it_vss_public_coin_share_artifact(share: &ProductionItVssPublicCoi
     ))
 }
 
+/// Canonically encodes public IT-VSS audit/discard records.
+pub fn encode_it_vss_public_audit_records_artifact(
+    records: &[ProductionItVssAuditRecord],
+) -> Vec<u8> {
+    wire_encode_dkg_it_vss_artifact_payload(&DkgItVssArtifactPayload::PublicAuditRecords(
+        records.iter().map(wire_it_vss_audit_record).collect(),
+    ))
+}
+
+/// Canonically encodes public IT-VSS vector consistency records.
+pub fn encode_it_vss_public_consistency_records_artifact(
+    records: &[ProductionItVssConsistencyRecord],
+) -> Vec<u8> {
+    wire_encode_dkg_it_vss_artifact_payload(&DkgItVssArtifactPayload::PublicConsistencyRecords(
+        records.iter().map(wire_it_vss_consistency_record).collect(),
+    ))
+}
+
 /// Decodes one IT-VSS public-coin share artifact.
 pub fn decode_it_vss_public_coin_share_artifact(
     bytes: &[u8],
@@ -1555,6 +1630,47 @@ pub fn decode_it_vss_public_coin_share_artifact(
         DkgItVssArtifactPayload::PublicCommitment(_)
         | DkgItVssArtifactPayload::PublicPrecommitment(_)
         | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+        | DkgItVssArtifactPayload::PublicAuditRecords(_)
+        | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
+        | DkgItVssArtifactPayload::ComplaintResolution(_) => Err(DkgError::PrimeFieldMpcTransport),
+    }
+}
+
+/// Decodes public IT-VSS audit/discard records.
+pub fn decode_it_vss_public_audit_records_artifact(
+    bytes: &[u8],
+) -> Result<Vec<ProductionItVssAuditRecord>, DkgError> {
+    match wire_decode_dkg_it_vss_artifact_payload(bytes)
+        .map_err(|_| DkgError::PrimeFieldMpcTransport)?
+    {
+        DkgItVssArtifactPayload::PublicAuditRecords(records) => {
+            Ok(records.iter().map(it_vss_audit_record_from_wire).collect())
+        }
+        DkgItVssArtifactPayload::PublicCommitment(_)
+        | DkgItVssArtifactPayload::PublicPrecommitment(_)
+        | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+        | DkgItVssArtifactPayload::PublicCoinShare(_)
+        | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
+        | DkgItVssArtifactPayload::ComplaintResolution(_) => Err(DkgError::PrimeFieldMpcTransport),
+    }
+}
+
+/// Decodes public IT-VSS vector consistency records.
+pub fn decode_it_vss_public_consistency_records_artifact(
+    bytes: &[u8],
+) -> Result<Vec<ProductionItVssConsistencyRecord>, DkgError> {
+    match wire_decode_dkg_it_vss_artifact_payload(bytes)
+        .map_err(|_| DkgError::PrimeFieldMpcTransport)?
+    {
+        DkgItVssArtifactPayload::PublicConsistencyRecords(records) => Ok(records
+            .iter()
+            .map(it_vss_consistency_record_from_wire)
+            .collect()),
+        DkgItVssArtifactPayload::PublicCommitment(_)
+        | DkgItVssArtifactPayload::PublicPrecommitment(_)
+        | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+        | DkgItVssArtifactPayload::PublicCoinShare(_)
+        | DkgItVssArtifactPayload::PublicAuditRecords(_)
         | DkgItVssArtifactPayload::ComplaintResolution(_) => Err(DkgError::PrimeFieldMpcTransport),
     }
 }
@@ -1572,6 +1688,8 @@ pub fn decode_it_vss_public_commitment_artifact(
         DkgItVssArtifactPayload::PublicPrecommitment(_)
         | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
         | DkgItVssArtifactPayload::PublicCoinShare(_)
+        | DkgItVssArtifactPayload::PublicAuditRecords(_)
+        | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
         | DkgItVssArtifactPayload::ComplaintResolution(_) => Err(DkgError::PrimeFieldMpcTransport),
     }
 }
@@ -1589,6 +1707,8 @@ pub fn decode_it_vss_public_precommitment_artifact(
         DkgItVssArtifactPayload::PublicCommitment(_)
         | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
         | DkgItVssArtifactPayload::PublicCoinShare(_)
+        | DkgItVssArtifactPayload::PublicAuditRecords(_)
+        | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
         | DkgItVssArtifactPayload::ComplaintResolution(_) => Err(DkgError::PrimeFieldMpcTransport),
     }
 }
@@ -1612,6 +1732,8 @@ pub fn decode_it_vss_complaint_resolution_artifact(
         DkgItVssArtifactPayload::PublicCommitment(_)
         | DkgItVssArtifactPayload::PublicPrecommitment(_)
         | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+        | DkgItVssArtifactPayload::PublicAuditRecords(_)
+        | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
         | DkgItVssArtifactPayload::PublicCoinShare(_) => Err(DkgError::PrimeFieldMpcTransport),
         DkgItVssArtifactPayload::ComplaintResolution(resolution) => {
             it_vss_resolution_from_wire(&resolution)
@@ -1648,6 +1770,28 @@ pub(crate) fn validate_it_vss_complaint_resolution_for_backend(
         if resolution.rejected_dealers.contains(&dealer) {
             return Err(DkgError::ItVssResolutionDealerOverlap { dealer });
         }
+    }
+
+    let mut complaint_keys = Vec::with_capacity(resolution.complaints.len());
+    for complaint in &resolution.complaints {
+        if !config.parties.contains(&complaint.complainant) {
+            return Err(DkgError::UnknownParty(complaint.complainant));
+        }
+        if !config.parties.contains(&complaint.dealer) {
+            return Err(DkgError::UnknownParty(complaint.dealer));
+        }
+        if !config.parties.contains(&complaint.receiver) {
+            return Err(DkgError::UnknownParty(complaint.receiver));
+        }
+        let key = (complaint.complainant, complaint.dealer, complaint.receiver);
+        if complaint_keys.contains(&key) {
+            return Err(DkgError::DuplicateComplaint {
+                complainant: complaint.complainant,
+                dealer: complaint.dealer,
+                receiver: complaint.receiver,
+            });
+        }
+        complaint_keys.push(key);
     }
 
     let mut commitment_keys = Vec::with_capacity(public_commitments.len());
@@ -2432,7 +2576,7 @@ fn production_it_vss_eval_vector_polynomial(
     Ok(out)
 }
 
-fn production_it_vss_metadata_hash(
+pub(crate) fn production_it_vss_metadata_hash(
     label_hash: [u8; 32],
     dealer: PartyId,
     vector_len: usize,
@@ -2463,6 +2607,41 @@ fn production_it_vss_metadata_hash(
     hasher.finalize().into()
 }
 
+pub(crate) fn verify_production_it_vss_public_metadata_hash(
+    commitment: &ItVssPublicCommitment,
+    vector_len: usize,
+    public_coin_hash: [u8; 32],
+    public_audit_hash: [u8; 32],
+    public_consistency_hash: [u8; 32],
+    audit_tags: usize,
+    consistency_rounds: usize,
+) -> Result<ProductionItVssSecurityParams, DkgError> {
+    if audit_tags == 0 || consistency_rounds == 0 {
+        return Err(DkgError::MissingDkgSetupCertificate);
+    }
+    for retained_tags in 1..=64 {
+        let params = ProductionItVssSecurityParams {
+            audit_tags,
+            retained_tags,
+            consistency_rounds,
+            ..ProductionItVssSecurityParams::default()
+        };
+        let expected = production_it_vss_metadata_hash(
+            commitment.label_hash,
+            commitment.dealer,
+            vector_len,
+            params,
+            Some(public_coin_hash),
+            public_audit_hash,
+            public_consistency_hash,
+        );
+        if expected == commitment.public_metadata_hash {
+            return Ok(params);
+        }
+    }
+    Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked)
+}
+
 fn production_it_vss_precommitment_hash(
     label_hash: [u8; 32],
     dealer: PartyId,
@@ -2486,7 +2665,7 @@ fn production_it_vss_precommitment_hash(
     hasher.finalize().into()
 }
 
-fn production_it_vss_consistency_challenge_bit_with_coin(
+pub(crate) fn production_it_vss_consistency_challenge_bit_with_coin(
     label_hash: [u8; 32],
     public_coin_hash: Option<[u8; 32]>,
     round: usize,
@@ -2605,7 +2784,7 @@ pub fn production_it_vss_public_coin_transcript(
     })
 }
 
-fn hash_production_it_vss_consistency_records(
+pub(crate) fn hash_production_it_vss_consistency_records(
     records: &[ProductionItVssConsistencyRecord],
 ) -> [u8; 32] {
     let mut records = records.to_vec();
@@ -2626,16 +2805,12 @@ fn hash_production_it_vss_consistency_records(
         hasher.update(record.label_hash);
         hasher.update(record.round.to_le_bytes());
         hasher.update([record.challenge_bit]);
+        hasher.update(hash_opened_vector_consistency_masked_eval_payload(
+            &record.masked_eval,
+        ));
         hasher.update(record.masked_eval_hash);
     }
     hasher.finalize().into()
-}
-
-fn hash_it_vss_fq_vec(hasher: &mut Sha3_256, values: &[ItVssFq]) {
-    hasher.update((values.len() as u32).to_le_bytes());
-    for value in values {
-        hasher.update(value.value().to_le_bytes());
-    }
 }
 
 fn encode_production_it_vss_share(
@@ -2948,10 +3123,67 @@ pub struct ProductionItVssAuditRecord {
     pub label_hash: [u8; 32],
     /// Audited tag index within the holder/receiver pair.
     pub tag_index: u16,
+    /// Public encoding of the opened audited receiver-side tag. This is safe
+    /// only for audited tags because the tag is discarded immediately after
+    /// audit; retained receiver-side tags must never be serialized here.
+    pub audited_receiver_tag: Vec<u8>,
     /// Hash of the public audited receiver-side tag.
     pub audited_receiver_tag_hash: [u8; 32],
     /// Marker that this tag is discarded and not retained.
     pub discard_after_audit: DiscardAfterAudit,
+}
+
+pub(crate) fn hash_opened_audited_vector_receiver_tag_payload(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS-DKG-IT-VSS-v1/opened-audited-vector-tag");
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+pub(crate) fn validate_opened_audited_vector_receiver_tag_payload(
+    bytes: &[u8],
+    holder: PartyId,
+    receiver: PartyId,
+    tag_index: u16,
+) -> Result<(), DkgError> {
+    const HEADER_LEN: usize = 2 + 2 + 2 + 4 + 4;
+    if bytes.len() < HEADER_LEN {
+        return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+    }
+    let read_u16 =
+        |offset: usize| -> u16 { u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) };
+    let read_u32 = |offset: usize| -> u32 {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    };
+    let encoded_holder = PartyId(read_u16(0));
+    let encoded_receiver = PartyId(read_u16(2));
+    let encoded_tag_index = read_u16(4);
+    let b = read_u32(6);
+    let c_len = read_u32(10) as usize;
+    if encoded_holder != holder || encoded_receiver != receiver || encoded_tag_index != tag_index {
+        return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+    }
+    ItVssFq::nonzero(b)?;
+    let expected_len = HEADER_LEN
+        .checked_add(
+            c_len
+                .checked_mul(4)
+                .ok_or(DkgError::Backend("audited vector tag length overflow"))?,
+        )
+        .ok_or(DkgError::Backend("audited vector tag length overflow"))?;
+    if c_len == 0 || bytes.len() != expected_len {
+        return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+    }
+    for idx in 0..c_len {
+        let offset = HEADER_LEN + idx * 4;
+        ItVssFq::new(read_u32(offset))?;
+    }
+    Ok(())
 }
 
 /// Public vector-polynomial consistency record for one holder and challenge
@@ -2972,8 +3204,112 @@ pub struct ProductionItVssConsistencyRecord {
     pub round: u16,
     /// Public challenge bit.
     pub challenge_bit: u8,
+    /// Public encoding of the opened masked evaluation vector for this holder
+    /// and consistency round.
+    pub masked_eval: Vec<u8>,
     /// Hash of the public masked evaluation vector.
     pub masked_eval_hash: [u8; 32],
+}
+
+pub(crate) fn encode_opened_vector_consistency_masked_eval_payload(
+    dealer: PartyId,
+    holder: PartyId,
+    label_hash: [u8; 32],
+    round: u16,
+    challenge_bit: u8,
+    values: &[ItVssFq],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&dealer.0.to_le_bytes());
+    out.extend_from_slice(&holder.0.to_le_bytes());
+    out.extend_from_slice(&label_hash);
+    out.extend_from_slice(&round.to_le_bytes());
+    out.push(challenge_bit);
+    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    for value in values {
+        out.extend_from_slice(&value.value().to_le_bytes());
+    }
+    out
+}
+
+pub(crate) fn hash_opened_vector_consistency_masked_eval_payload(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS-DKG-IT-VSS-v1/public-consistency-masked-eval");
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+pub(crate) fn validate_opened_vector_consistency_masked_eval_payload(
+    bytes: &[u8],
+    dealer: PartyId,
+    holder: PartyId,
+    label_hash: [u8; 32],
+    round: u16,
+    challenge_bit: u8,
+) -> Result<(), DkgError> {
+    const HEADER_LEN: usize = 2 + 2 + 32 + 2 + 1 + 4;
+    if bytes.len() < HEADER_LEN {
+        return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+    }
+    let read_u16 =
+        |offset: usize| -> u16 { u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) };
+    let read_u32 = |offset: usize| -> u32 {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    };
+    let encoded_dealer = PartyId(read_u16(0));
+    let encoded_holder = PartyId(read_u16(2));
+    let mut encoded_label = [0u8; 32];
+    encoded_label.copy_from_slice(&bytes[4..36]);
+    let encoded_round = read_u16(36);
+    let encoded_challenge_bit = bytes[38];
+    let value_len = read_u32(39) as usize;
+    if encoded_dealer != dealer
+        || encoded_holder != holder
+        || encoded_label != label_hash
+        || encoded_round != round
+        || encoded_challenge_bit != challenge_bit
+    {
+        return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+    }
+    let expected_len = HEADER_LEN
+        .checked_add(
+            value_len
+                .checked_mul(4)
+                .ok_or(DkgError::Backend("consistency masked eval length overflow"))?,
+        )
+        .ok_or(DkgError::Backend("consistency masked eval length overflow"))?;
+    if value_len == 0 || bytes.len() != expected_len {
+        return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+    }
+    for idx in 0..value_len {
+        let offset = HEADER_LEN + idx * 4;
+        ItVssFq::new(read_u32(offset))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn opened_vector_consistency_masked_eval_len(bytes: &[u8]) -> Result<usize, DkgError> {
+    const HEADER_LEN: usize = 2 + 2 + 32 + 2 + 1 + 4;
+    if bytes.len() < HEADER_LEN {
+        return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+    }
+    let value_len = u32::from_le_bytes([bytes[39], bytes[40], bytes[41], bytes[42]]) as usize;
+    let expected_len = HEADER_LEN
+        .checked_add(
+            value_len
+                .checked_mul(4)
+                .ok_or(DkgError::Backend("consistency masked eval length overflow"))?,
+        )
+        .ok_or(DkgError::Backend("consistency masked eval length overflow"))?;
+    if value_len == 0 || bytes.len() != expected_len {
+        return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+    }
+    Ok(value_len)
 }
 
 fn hash_production_it_vss_audit_record(record: &ProductionItVssAuditRecord) -> [u8; 32] {
@@ -2984,6 +3320,9 @@ fn hash_production_it_vss_audit_record(record: &ProductionItVssAuditRecord) -> [
     hasher.update(record.receiver.0.to_le_bytes());
     hasher.update(record.label_hash);
     hasher.update(record.tag_index.to_le_bytes());
+    hasher.update(hash_opened_audited_vector_receiver_tag_payload(
+        &record.audited_receiver_tag,
+    ));
     hasher.update(record.audited_receiver_tag_hash);
     hasher.finalize().into()
 }
@@ -3118,18 +3457,17 @@ pub fn production_it_vss_public_audit_records_from_output(
                 }
                 let audited =
                     AuditedVectorReceiverTag::new(holder, receiver, tag_index, b, c.clone())?;
+                let audited_receiver_tag = encode_it_vss_audited_vector_receiver_tag(&audited);
                 records.push(ProductionItVssAuditRecord {
                     dealer: commitment.dealer,
                     holder,
                     receiver,
                     label_hash: commitment.label_hash,
                     tag_index,
-                    audited_receiver_tag_hash: {
-                        let mut hasher = Sha3_256::new();
-                        hasher.update(b"TALUS-DKG-IT-VSS-v1/opened-audited-vector-tag");
-                        hasher.update(encode_it_vss_audited_vector_receiver_tag(&audited));
-                        hasher.finalize().into()
-                    },
+                    audited_receiver_tag_hash: hash_opened_audited_vector_receiver_tag_payload(
+                        &audited_receiver_tag,
+                    ),
+                    audited_receiver_tag,
                     discard_after_audit: DiscardAfterAudit,
                 });
             }
@@ -3207,21 +3545,22 @@ pub fn production_it_vss_public_consistency_records_from_output_with_coin(
                     }
                 })
                 .collect::<Vec<_>>();
-            let mut hasher = Sha3_256::new();
-            hasher.update(b"TALUS-DKG-IT-VSS-v1/public-consistency-masked-eval");
-            hasher.update(delivery.dealer.0.to_le_bytes());
-            hasher.update(delivery.receiver.0.to_le_bytes());
-            hasher.update(delivery.label_hash);
-            hasher.update(round.to_le_bytes());
-            hasher.update([challenge_bit]);
-            hash_it_vss_fq_vec(&mut hasher, &masked_eval);
+            let masked_eval = encode_opened_vector_consistency_masked_eval_payload(
+                delivery.dealer,
+                delivery.receiver,
+                delivery.label_hash,
+                round,
+                challenge_bit,
+                &masked_eval,
+            );
             records.push(ProductionItVssConsistencyRecord {
                 dealer: delivery.dealer,
                 holder: delivery.receiver,
                 label_hash: delivery.label_hash,
                 round,
                 challenge_bit,
-                masked_eval_hash: hasher.finalize().into(),
+                masked_eval_hash: hash_opened_vector_consistency_masked_eval_payload(&masked_eval),
+                masked_eval,
             });
         }
     }
@@ -3684,28 +4023,31 @@ impl ProductionItVssBackend for ProductionInformationCheckingVssBackend {
         complaints: &[DkgComplaintPayload],
     ) -> Result<ItVssComplaintResolution, DkgError> {
         config.validate()?;
-        let mut rejected_dealers = Vec::new();
-        for complaint in complaints {
-            if complaint.reason != DkgComplaintReason::InvalidVssShare {
-                return Err(DkgError::UnsupportedComplaintReason(complaint.reason));
+        if !complaints.is_empty() {
+            for complaint in complaints {
+                if complaint.reason != DkgComplaintReason::InvalidVssShare {
+                    return Err(DkgError::UnsupportedComplaintReason(complaint.reason));
+                }
+                let evidence =
+                    decode_it_vss_information_check_complaint_evidence(&complaint.evidence)?;
+                let commitment = public_commitments
+                    .iter()
+                    .find(|commitment| {
+                        commitment.dealer == complaint.dealer
+                            && commitment.label_hash == evidence.label_hash
+                            && commitment.backend_id == self.backend_id()
+                    })
+                    .ok_or(DkgError::ItVssCertificateMissingCommitment {
+                        dealer: complaint.dealer,
+                        label_hash: evidence.label_hash,
+                    })?;
+                validate_it_vss_information_check_complaint_evidence(
+                    config, commitment, &evidence,
+                )?;
             }
-            let evidence = decode_it_vss_information_check_complaint_evidence(&complaint.evidence)?;
-            let commitment = public_commitments
-                .iter()
-                .find(|commitment| {
-                    commitment.dealer == complaint.dealer
-                        && commitment.label_hash == evidence.label_hash
-                        && commitment.backend_id == self.backend_id()
-                })
-                .ok_or(DkgError::ItVssCertificateMissingCommitment {
-                    dealer: complaint.dealer,
-                    label_hash: evidence.label_hash,
-                })?;
-            validate_it_vss_information_check_complaint_evidence(config, commitment, &evidence)?;
-            if !rejected_dealers.contains(&complaint.dealer) {
-                rejected_dealers.push(complaint.dealer);
-            }
+            return Err(DkgError::ItVssAbortNoBlame);
         }
+        let rejected_dealers = Vec::new();
 
         let accepted_dealers = config
             .parties

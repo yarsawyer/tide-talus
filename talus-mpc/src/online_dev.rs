@@ -1328,6 +1328,8 @@ fn validate_public_commitment_len<P: MlDsaParams>(
 }
 #[cfg(test)]
 mod tests {
+    #![cfg_attr(feature = "production-release-checks", allow(unused_imports))]
+
     use super::*;
     use crate::local::{
         certify_preprocessing_token, CertifiedToken, Commitment, NonceCommitment,
@@ -1657,6 +1659,7 @@ mod tests {
                     transcript_hash: [0u8; 32],
                 },
                 power2round_runtime: None,
+                power2round_setup_input_hash: None,
                 setup: None,
             },
         }
@@ -2329,6 +2332,7 @@ mod tests {
         assert_eq!(counters.signatures_returned, 1);
     }
 
+    #[cfg(not(feature = "production-release-checks"))]
     #[test]
     fn local_strict_backend_signs_without_clear_partial_transport() {
         let (token, request) = zero_w1_token_and_request();

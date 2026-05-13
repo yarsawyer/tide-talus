@@ -36,7 +36,8 @@ use talus_wire::{
     encode_dkg_small_residue_payload as wire_encode_dkg_small_residue_payload, encode_message,
     validate_round_batch, AuthenticatedP2pTransport, DkgCommitPayload as WireDkgCommitPayload,
     DkgComplaintPayload as WireDkgComplaintPayload, DkgItVssArtifactPayload,
-    DkgItVssCertificatePayload, DkgItVssComplaintPayload, DkgItVssPublicCoinSharePayload,
+    DkgItVssAuditRecordPayload, DkgItVssCertificatePayload, DkgItVssComplaintPayload,
+    DkgItVssConsistencyRecordPayload, DkgItVssPublicCoinSharePayload,
     DkgItVssPublicCommitmentPayload, DkgItVssPublicPrecommitmentPayload, DkgItVssResolutionPayload,
     DkgPrimeFieldMpcPayload, DkgSharePayload as WireDkgSharePayload,
     DkgSmallResiduePayload as WireDkgSmallResiduePayload, EquivocationResistantBroadcast,
@@ -1854,6 +1855,20 @@ fn dkg_wire_message_replay_key(
                         label_hash: Some(share.label_hash),
                     }
                 }
+                DkgItVssArtifactPayload::PublicAuditRecords(_) => {
+                    DkgWireLogicalKey::ItVssArtifact {
+                        kind: 6,
+                        dealer: Some(sender),
+                        label_hash: None,
+                    }
+                }
+                DkgItVssArtifactPayload::PublicConsistencyRecords(_) => {
+                    DkgWireLogicalKey::ItVssArtifact {
+                        kind: 7,
+                        dealer: Some(sender),
+                        label_hash: None,
+                    }
+                }
                 DkgItVssArtifactPayload::ComplaintResolution(_) => {
                     DkgWireLogicalKey::ItVssArtifact {
                         kind: 2,
@@ -2212,6 +2227,28 @@ where
         )
     }
 
+    /// Broadcasts replayable public IT-VSS audit/discard records.
+    pub fn broadcast_it_vss_public_audit_records_logged(
+        &mut self,
+        records: &[ProductionItVssAuditRecord],
+    ) -> Result<(), DkgError> {
+        self.broadcast_logged(
+            DkgTransportPhase::ItVssArtifact,
+            encode_it_vss_public_audit_records_artifact(records),
+        )
+    }
+
+    /// Broadcasts replayable public IT-VSS vector consistency records.
+    pub fn broadcast_it_vss_public_consistency_records_logged(
+        &mut self,
+        records: &[ProductionItVssConsistencyRecord],
+    ) -> Result<(), DkgError> {
+        self.broadcast_logged(
+            DkgTransportPhase::ItVssArtifact,
+            encode_it_vss_public_consistency_records_artifact(records),
+        )
+    }
+
     /// Sends a VSS private share with durable sent logging.
     pub fn send_vss_share_logged(
         &mut self,
@@ -2565,6 +2602,44 @@ where
         Ok(())
     }
 
+    /// Persists IT-VSS public audit/discard records as accepted broadcast
+    /// records.
+    pub fn persist_it_vss_public_audit_records_logged(
+        &mut self,
+        records: &[ProductionItVssAuditRecord],
+    ) -> Result<(), DkgError> {
+        let payload = encode_it_vss_public_audit_records_artifact(records);
+        let message = self
+            .state
+            .wire_message(DkgTransportPhase::ItVssArtifact, payload);
+        self.wire_log
+            .persist_dkg_wire_message(&DkgWireMessageRecord {
+                direction: PrimeFieldMpcWireDirection::AcceptedBroadcast,
+                peer: None,
+                message,
+            })?;
+        Ok(())
+    }
+
+    /// Persists IT-VSS vector consistency records as accepted broadcast
+    /// records.
+    pub fn persist_it_vss_public_consistency_records_logged(
+        &mut self,
+        records: &[ProductionItVssConsistencyRecord],
+    ) -> Result<(), DkgError> {
+        let payload = encode_it_vss_public_consistency_records_artifact(records);
+        let message = self
+            .state
+            .wire_message(DkgTransportPhase::ItVssArtifact, payload);
+        self.wire_log
+            .persist_dkg_wire_message(&DkgWireMessageRecord {
+                direction: PrimeFieldMpcWireDirection::AcceptedBroadcast,
+                peer: None,
+                message,
+            })?;
+        Ok(())
+    }
+
     /// Persists the IT-VSS complaint-resolution artifact without duplicating
     /// public commitments that were already accepted through the phase driver.
     pub fn persist_it_vss_resolution_logged(
@@ -2609,6 +2684,8 @@ where
                 }
                 DkgItVssArtifactPayload::PublicPrecommitment(_) => {}
                 DkgItVssArtifactPayload::PublicCoinShare(_) => {}
+                DkgItVssArtifactPayload::PublicAuditRecords(_) => {}
+                DkgItVssArtifactPayload::PublicConsistencyRecords(_) => {}
                 DkgItVssArtifactPayload::ComplaintResolution(next) => {
                     if resolution.is_some() {
                         return Err(DkgError::PrimeFieldMpcReplayDetected);
@@ -2855,6 +2932,8 @@ where
                 }
                 DkgItVssArtifactPayload::PublicPrecommitment(_) => {}
                 DkgItVssArtifactPayload::PublicCoinShare(_) => {}
+                DkgItVssArtifactPayload::PublicAuditRecords(_) => {}
+                DkgItVssArtifactPayload::PublicConsistencyRecords(_) => {}
                 DkgItVssArtifactPayload::ComplaintResolution(_) => {}
             }
         }
@@ -2875,6 +2954,8 @@ where
                 }
                 DkgItVssArtifactPayload::PublicCommitment(_)
                 | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+                | DkgItVssArtifactPayload::PublicAuditRecords(_)
+                | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
                 | DkgItVssArtifactPayload::ComplaintResolution(_)
                 | DkgItVssArtifactPayload::PublicCoinShare(_) => {}
             }
@@ -2900,11 +2981,59 @@ where
                 DkgItVssArtifactPayload::PublicCommitment(_)
                 | DkgItVssArtifactPayload::PublicPrecommitment(_)
                 | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+                | DkgItVssArtifactPayload::PublicAuditRecords(_)
+                | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
                 | DkgItVssArtifactPayload::ComplaintResolution(_)
                 | DkgItVssArtifactPayload::PublicCoinShare(_) => {}
             }
         }
         Ok(shares)
+    }
+
+    fn it_vss_public_audit_records_from_messages(
+        &self,
+        messages: Vec<WireMessage>,
+    ) -> Result<Vec<ProductionItVssAuditRecord>, DkgError> {
+        let mut records = Vec::new();
+        for message in messages {
+            match wire_decode_dkg_it_vss_artifact_payload(&message.payload)
+                .map_err(|_| DkgError::PrimeFieldMpcTransport)?
+            {
+                DkgItVssArtifactPayload::PublicAuditRecords(next) => {
+                    records.extend(next.iter().map(it_vss_audit_record_from_wire));
+                }
+                DkgItVssArtifactPayload::PublicCommitment(_)
+                | DkgItVssArtifactPayload::PublicPrecommitment(_)
+                | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+                | DkgItVssArtifactPayload::PublicCoinShare(_)
+                | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
+                | DkgItVssArtifactPayload::ComplaintResolution(_) => {}
+            }
+        }
+        Ok(records)
+    }
+
+    fn it_vss_public_consistency_records_from_messages(
+        &self,
+        messages: Vec<WireMessage>,
+    ) -> Result<Vec<ProductionItVssConsistencyRecord>, DkgError> {
+        let mut records = Vec::new();
+        for message in messages {
+            match wire_decode_dkg_it_vss_artifact_payload(&message.payload)
+                .map_err(|_| DkgError::PrimeFieldMpcTransport)?
+            {
+                DkgItVssArtifactPayload::PublicConsistencyRecords(next) => {
+                    records.extend(next.iter().map(it_vss_consistency_record_from_wire));
+                }
+                DkgItVssArtifactPayload::PublicCommitment(_)
+                | DkgItVssArtifactPayload::PublicPrecommitment(_)
+                | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+                | DkgItVssArtifactPayload::PublicCoinShare(_)
+                | DkgItVssArtifactPayload::PublicAuditRecords(_)
+                | DkgItVssArtifactPayload::ComplaintResolution(_) => {}
+            }
+        }
+        Ok(records)
     }
 }
 
@@ -3394,6 +3523,70 @@ pub struct ItVssBatchedDealerOutput {
     pub public_commitments: Vec<ItVssPublicCommitment>,
     /// Directed private deliveries for all vector-domain sharings.
     pub deliveries: Vec<ItVssPrivateShareDelivery>,
+}
+
+fn it_vss_dealer_outputs_from_batched_output(
+    output: &ItVssBatchedDealerOutput,
+) -> Result<Vec<ItVssDealerOutput>, DkgError> {
+    let mut out = Vec::with_capacity(output.public_commitments.len());
+    for commitment in &output.public_commitments {
+        let deliveries = output
+            .deliveries
+            .iter()
+            .filter(|delivery| {
+                delivery.dealer == commitment.dealer && delivery.label_hash == commitment.label_hash
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if deliveries.is_empty() {
+            return Err(DkgError::MissingDkgSetupCertificate);
+        }
+        out.push(ItVssDealerOutput {
+            public_commitment: commitment.clone(),
+            deliveries,
+        });
+    }
+    Ok(out)
+}
+
+fn production_it_vss_public_audit_records_from_batched_output(
+    config: &DkgConfig,
+    output: &ItVssBatchedDealerOutput,
+    params: ProductionItVssSecurityParams,
+) -> Result<Vec<ProductionItVssAuditRecord>, DkgError> {
+    let mut records = Vec::new();
+    for dealer_output in it_vss_dealer_outputs_from_batched_output(output)? {
+        records.extend(production_it_vss_public_audit_records_from_output(
+            config,
+            &dealer_output,
+            params,
+        )?);
+    }
+    Ok(records)
+}
+
+fn production_it_vss_public_consistency_records_from_batched_output(
+    config: &DkgConfig,
+    output: &ItVssBatchedDealerOutput,
+    params: ProductionItVssSecurityParams,
+    public_coin_transcripts: &[ProductionItVssPublicCoinTranscript],
+) -> Result<Vec<ProductionItVssConsistencyRecord>, DkgError> {
+    let mut records = Vec::new();
+    for dealer_output in it_vss_dealer_outputs_from_batched_output(output)? {
+        let transcript = public_coin_transcripts
+            .iter()
+            .find(|transcript| transcript.label_hash == dealer_output.public_commitment.label_hash)
+            .ok_or(DkgError::MissingDkgSetupCertificate)?;
+        records.extend(
+            production_it_vss_public_consistency_records_from_output_with_coin(
+                config,
+                &dealer_output,
+                params,
+                Some(transcript.coin_hash),
+            )?,
+        );
+    }
+    Ok(records)
 }
 
 /// One dealer's bounded-sampler contribution to a whole ML-DSA secret vector.
@@ -4085,6 +4278,7 @@ impl ProductionNativeDkgAssemblyOutput {
         complaints: Vec<DkgComplaintPayload>,
     ) -> Result<Self, DkgError> {
         ensure_native_dkg_assembly_parts_allowed_for_release(&certificate, &key_packages)?;
+        ensure_power2round_setup_binding_matches_config(&public.config, public.rho, &certificate)?;
         Ok(Self {
             public,
             key_packages,
@@ -4754,6 +4948,7 @@ where
         material,
         s1_packages,
         setup_certificate,
+        public_commitments,
         accepted_dealers,
         rejected_dealers,
         complaints,
@@ -4762,11 +4957,15 @@ where
     let t_share = shared_t_party_share_vec::<P, B>(&shared_t, local_party, power2round.backend())?;
     let power2round_output =
         power2round.power2round_t1_from_share_vec::<P>(config, shared_t.assembly_label, t_share)?;
+    let power2round_output = power2round_output.with_setup_input_hash(
+        production_power2round_setup_input_hash(config, rho, &setup_certificate),
+    );
     assemble_logged_native_dkg_production_parts(
         config,
         rho,
         s1_packages,
         setup_certificate,
+        public_commitments,
         accepted_dealers,
         rejected_dealers,
         complaints,
@@ -4785,6 +4984,7 @@ fn assemble_recovered_logged_native_dkg_production(
             material: _,
         s1_packages,
         setup_certificate,
+        public_commitments,
         accepted_dealers,
         rejected_dealers,
         complaints,
@@ -4794,6 +4994,7 @@ fn assemble_recovered_logged_native_dkg_production(
         rho,
         s1_packages,
         setup_certificate,
+        public_commitments,
         accepted_dealers,
         rejected_dealers,
         complaints,
@@ -4806,18 +5007,30 @@ fn assemble_logged_native_dkg_production_parts(
     rho: [u8; 32],
     s1_packages: Vec<DkgSecretShare>,
     setup_certificate: DkgSetupTranscriptCertificate,
+    public_commitments: Vec<ItVssPublicCommitment>,
     accepted_dealers: Vec<PartyId>,
     rejected_dealers: Vec<PartyId>,
     complaints: Vec<DkgComplaintPayload>,
     power2round_output: ProductionPower2RoundOutput,
 ) -> Result<ProductionNativeDkgAssemblyOutput, DkgError> {
-    let (public, mut certificate) = assemble_public_output_from_production_power2round(
+    let expected_power2round_setup_input_hash =
+        production_power2round_setup_input_hash(config, rho, &setup_certificate);
+    if power2round_output.setup_input_hash() != Some(expected_power2round_setup_input_hash) {
+        return Err(DkgError::Power2RoundEvidenceRequired);
+    }
+    let (mut public, mut certificate) = assemble_public_output_from_production_power2round(
         config,
         rho,
         &accepted_dealers,
         power2round_output,
     )?;
+    apply_production_it_vss_artifacts_to_public_output(
+        &mut public,
+        &public_commitments,
+        &accepted_dealers,
+    )?;
     certificate.setup = Some(setup_certificate);
+    certificate.power2round_setup_input_hash = Some(expected_power2round_setup_input_hash);
     let key_packages =
         dkg_key_packages_from_public_output(&public, s1_packages, certificate.clone())?;
 
@@ -4836,6 +5049,7 @@ struct RecoveredLoggedNativeDkgSetup {
     material: SharedMldsaSecretMaterial,
     s1_packages: Vec<DkgSecretShare>,
     setup_certificate: DkgSetupTranscriptCertificate,
+    public_commitments: Vec<ItVssPublicCommitment>,
     accepted_dealers: Vec<PartyId>,
     rejected_dealers: Vec<PartyId>,
     complaints: Vec<DkgComplaintPayload>,
@@ -4905,6 +5119,7 @@ where
         material,
         s1_packages,
         setup_certificate,
+        public_commitments,
         accepted_dealers,
         rejected_dealers,
         complaints,
@@ -5011,6 +5226,7 @@ where
         material,
         s1_packages,
         setup_certificate,
+        public_commitments: recovered_it_vss_public_commitments,
         accepted_dealers,
         rejected_dealers,
         complaints,
@@ -5066,6 +5282,9 @@ where
         &resolution,
         expected_backend,
     )?;
+    ensure_it_vss_artifact_log_uses_batched_vector_labels_for_release(config, runtime.wire_log())?;
+    ensure_it_vss_public_coin_flow_complete_for_release(config, runtime.wire_log())?;
+    ensure_it_vss_public_audit_consistency_complete_for_release(config, runtime.wire_log())?;
     Ok((public_commitments, resolution))
 }
 
@@ -5638,6 +5857,81 @@ where
         .iter()
         .map(|commit| commit.pairwise_seed_commitment.clone())
         .collect();
+    output.keygen_transcript_hash = output.transcript_binding();
+    output.validate_binding()
+}
+
+fn production_it_vss_dealer_commitment_summary(
+    config: &DkgConfig,
+    dealer: PartyId,
+    commitments: &[ItVssPublicCommitment],
+) -> Result<[u8; 32], DkgError> {
+    if !config.parties.contains(&dealer) {
+        return Err(DkgError::UnknownParty(dealer));
+    }
+    let mut dealer_commitments = commitments
+        .iter()
+        .filter(|commitment| commitment.dealer == dealer)
+        .collect::<Vec<_>>();
+    if dealer_commitments.is_empty() {
+        return Err(DkgError::ItVssCertificateMissingCommitment {
+            dealer,
+            label_hash: [0u8; 32],
+        });
+    }
+    dealer_commitments.sort_by_key(|commitment| commitment.label_hash);
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS-DKG-v1/production-it-vss-dealer-public-summary");
+    hasher.update(config.transcript_hash().0);
+    hasher.update(dealer.0.to_le_bytes());
+    hasher.update((dealer_commitments.len() as u32).to_le_bytes());
+    for commitment in dealer_commitments {
+        if commitment.backend_id != ItVssBackendId::ProductionInformationChecking {
+            return Err(DkgError::ItVssCertificateBackendMismatch);
+        }
+        hasher.update(hash_it_vss_public_commitment(commitment));
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn apply_production_it_vss_artifacts_to_public_output(
+    output: &mut DkgPublicOutput,
+    public_commitments: &[ItVssPublicCommitment],
+    accepted_dealers: &[PartyId],
+) -> Result<(), DkgError> {
+    validate_accepted_dealer_subset(&output.config, accepted_dealers)?;
+    let expected_keys = expected_sampler_vector_it_vss_keys(
+        &output.config,
+        &[SecretVectorKind::S1, SecretVectorKind::S2],
+    )?;
+    let selected_commitments =
+        select_expected_it_vss_public_commitments(public_commitments, &expected_keys)?;
+    if selected_commitments.len() != expected_keys.len() {
+        return Err(DkgError::MissingDkgSetupCertificate);
+    }
+    output.vss_commitments = selected_commitments
+        .iter()
+        .filter(|commitment| accepted_dealers.contains(&commitment.dealer))
+        .map(|commitment| VssCommitment {
+            bytes: encode_it_vss_public_commitment_artifact(commitment),
+        })
+        .collect();
+    output.pairwise_seed_commitments = output
+        .config
+        .parties
+        .iter()
+        .copied()
+        .map(|party| {
+            Ok(PairwiseSeedCommitment {
+                party,
+                commitment: production_it_vss_dealer_commitment_summary(
+                    &output.config,
+                    party,
+                    &selected_commitments,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, DkgError>>()?;
     output.keygen_transcript_hash = output.transcript_binding();
     output.validate_binding()
 }
@@ -6864,6 +7158,46 @@ where
         )
     }
 
+    /// Finishes DKG assembly and immediately applies the full release-context
+    /// gate.
+    ///
+    /// This is the preferred application boundary for release material because
+    /// it composes:
+    ///
+    /// - typed production native DKG output;
+    /// - durable setup wire log;
+    /// - durable setup phase cursors;
+    /// - production coordinator/backend readiness;
+    /// - ML-KEM / ML-DSA / reliable-broadcast transport evidence.
+    pub fn finish_release_validated(
+        mut self,
+        readiness: ProductionNativeDkgCoordinatorReadiness,
+        transport_evidence: &NativeDkgTransportEvidence,
+    ) -> Result<ProductionNativeDkgAssemblyOutput, DkgError> {
+        self.advance()?;
+        if !self.setup_complete() {
+            return Err(DkgError::MissingDkgSetupCertificate);
+        }
+        let power2round_output = self
+            .power2round_output
+            .take()
+            .ok_or(DkgError::Power2RoundEvidenceRequired)?;
+        let output = assemble_logged_native_dkg_production_from_logs::<P, _, _>(
+            &self.config,
+            self.rho,
+            self.runtime.runtime_mut(),
+            &mut self.sampler,
+            power2round_output,
+        )?;
+        output.ensure_context_allowed_for_release(
+            self.runtime.runtime().wire_log(),
+            self.runtime.cursor_log(),
+            readiness,
+            transport_evidence,
+        )?;
+        Ok(output)
+    }
+
     /// Finishes DKG assembly by driving the test/dev generic Power2Round
     /// backend from certified setup logs.
     ///
@@ -7057,6 +7391,55 @@ where
                             .broadcast_it_vss_public_commitment_batch_logged(
                                 &output.public_commitments,
                             )?;
+                        let audit_records =
+                            production_it_vss_public_audit_records_from_batched_output(
+                                &self.config,
+                                &output,
+                                self.it_vss_backend.params(),
+                            )?;
+                        self.runtime
+                            .runtime_mut()
+                            .broadcast_it_vss_public_audit_records_logged(&audit_records)?;
+                        self.runtime.cursor_log_mut().persist_setup_phase_cursor(
+                            &DkgSetupPhaseCursor {
+                                phase: DkgTransportPhase::ItVssArtifact,
+                                state: DkgSetupPhaseCursorState::Sent,
+                                receiver: None,
+                                vector: None,
+                                coefficient_index: None,
+                                it_vss_phase: Some(
+                                    ProductionItVssComplaintPhase::BroadcastPublicAudits,
+                                ),
+                                expected: audit_records.len(),
+                                got: audit_records.len(),
+                            },
+                        )?;
+                        let consistency_records =
+                            production_it_vss_public_consistency_records_from_batched_output(
+                                &self.config,
+                                &output,
+                                self.it_vss_backend.params(),
+                                &self.public_coin_transcripts,
+                            )?;
+                        self.runtime
+                            .runtime_mut()
+                            .broadcast_it_vss_public_consistency_records_logged(
+                                &consistency_records,
+                            )?;
+                        self.runtime.cursor_log_mut().persist_setup_phase_cursor(
+                            &DkgSetupPhaseCursor {
+                                phase: DkgTransportPhase::ItVssArtifact,
+                                state: DkgSetupPhaseCursorState::Sent,
+                                receiver: None,
+                                vector: None,
+                                coefficient_index: None,
+                                it_vss_phase: Some(
+                                    ProductionItVssComplaintPhase::BroadcastConsistencyRecords,
+                                ),
+                                expected: consistency_records.len(),
+                                got: consistency_records.len(),
+                            },
+                        )?;
                         for &receiver in &self.config.parties {
                             if receiver == self.local_party() {
                                 continue;
@@ -7072,7 +7455,7 @@ where
                                 .send_it_vss_private_delivery_batch_logged(receiver, &deliveries)?;
                         }
                         self.phase = NativeDkgSessionPhase::FinalCommitments { sent: true };
-                        continue;
+                        return Ok(());
                     }
 
                     let expected_keys = expected_sampler_vector_it_vss_keys(
@@ -7090,6 +7473,48 @@ where
                         &expected_keys,
                     )?;
                     if public_commitments.len() != expected_keys.len() {
+                        return Ok(());
+                    }
+                    self.phase =
+                        NativeDkgSessionPhase::PublicAuditConsistency { public_commitments };
+                    continue;
+                }
+                NativeDkgSessionPhase::PublicAuditConsistency {
+                    ref public_commitments,
+                } => {
+                    let public_commitments = public_commitments.clone();
+                    let expected_keys = expected_sampler_vector_it_vss_keys(
+                        &self.config,
+                        native_dkg_session_vectors(),
+                    )?;
+                    let audit_records =
+                        match self.collect_expected_it_vss_public_audit_records(&expected_keys) {
+                            Ok(records) => records,
+                            Err(DkgError::MissingRoundMessages { .. }) => return Ok(()),
+                            Err(err) => return Err(err),
+                        };
+                    if audit_records.is_empty() {
+                        return Ok(());
+                    }
+                    self.phase = NativeDkgSessionPhase::PublicConsistency { public_commitments };
+                    continue;
+                }
+                NativeDkgSessionPhase::PublicConsistency {
+                    ref public_commitments,
+                } => {
+                    let public_commitments = public_commitments.clone();
+                    let expected_keys = expected_sampler_vector_it_vss_keys(
+                        &self.config,
+                        native_dkg_session_vectors(),
+                    )?;
+                    let consistency_records = match self
+                        .collect_expected_it_vss_public_consistency_records(&expected_keys)
+                    {
+                        Ok(records) => records,
+                        Err(DkgError::MissingRoundMessages { .. }) => return Ok(()),
+                        Err(err) => return Err(err),
+                    };
+                    if consistency_records.is_empty() {
                         return Ok(());
                     }
                     self.phase = NativeDkgSessionPhase::VerifyPrivate { public_commitments };
@@ -7204,10 +7629,21 @@ where
             Some(ProductionItVssComplaintPhase::BroadcastPublicCommitments) => {
                 if latest.state == DkgSetupPhaseCursorState::Collected {
                     let public_commitments = self.recover_expected_public_commitments_from_log()?;
-                    Ok(NativeDkgSessionPhase::VerifyPrivate { public_commitments })
+                    Ok(NativeDkgSessionPhase::PublicAuditConsistency { public_commitments })
                 } else {
                     Ok(NativeDkgSessionPhase::FinalCommitments { sent: true })
                 }
+            }
+            Some(ProductionItVssComplaintPhase::BroadcastPublicAudits)
+                if latest.state == DkgSetupPhaseCursorState::Collected =>
+            {
+                let public_commitments = self.recover_expected_public_commitments_from_log()?;
+                Ok(NativeDkgSessionPhase::PublicConsistency { public_commitments })
+            }
+            Some(ProductionItVssComplaintPhase::BroadcastPublicAudits)
+            | Some(ProductionItVssComplaintPhase::BroadcastConsistencyRecords) => {
+                let public_commitments = self.recover_expected_public_commitments_from_log()?;
+                Ok(NativeDkgSessionPhase::PublicAuditConsistency { public_commitments })
             }
             Some(ProductionItVssComplaintPhase::DeliverPrivateShares)
             | Some(ProductionItVssComplaintPhase::VerifyPrivateDeliveries)
@@ -7542,6 +7978,128 @@ where
         Ok(commitments)
     }
 
+    fn collect_expected_it_vss_public_audit_records(
+        &mut self,
+        expected_keys: &[(PartyId, [u8; 32])],
+    ) -> Result<Vec<ProductionItVssAuditRecord>, DkgError> {
+        let messages = match self.collect_it_vss_artifact_messages_matching(
+            self.config.parties.len(),
+            |message| match wire_decode_dkg_it_vss_artifact_payload(&message.payload) {
+                Ok(DkgItVssArtifactPayload::PublicAuditRecords(ref records)) => {
+                    !records.is_empty()
+                        && records.iter().all(|record| {
+                            expected_keys.iter().any(|(dealer, label_hash)| {
+                                *dealer == PartyId(record.dealer_party_id)
+                                    && *label_hash == record.label_hash
+                            })
+                        })
+                }
+                _ => false,
+            },
+        ) {
+            Ok(messages) => messages,
+            Err(DkgError::MissingRoundMessages { expected, got, .. }) => {
+                self.runtime
+                    .cursor_log_mut()
+                    .persist_setup_phase_cursor(&DkgSetupPhaseCursor {
+                        phase: DkgTransportPhase::ItVssArtifact,
+                        state: DkgSetupPhaseCursorState::Waiting,
+                        receiver: None,
+                        vector: None,
+                        coefficient_index: None,
+                        it_vss_phase: Some(ProductionItVssComplaintPhase::BroadcastPublicAudits),
+                        expected,
+                        got,
+                    })?;
+                return Err(DkgError::MissingRoundMessages {
+                    round: DkgRound::Commit,
+                    expected,
+                    got,
+                });
+            }
+            Err(err) => return Err(err),
+        };
+        let records = self
+            .runtime
+            .runtime()
+            .it_vss_public_audit_records_from_messages(messages)?;
+        self.runtime
+            .cursor_log_mut()
+            .persist_setup_phase_cursor(&DkgSetupPhaseCursor {
+                phase: DkgTransportPhase::ItVssArtifact,
+                state: DkgSetupPhaseCursorState::Collected,
+                receiver: None,
+                vector: None,
+                coefficient_index: None,
+                it_vss_phase: Some(ProductionItVssComplaintPhase::BroadcastPublicAudits),
+                expected: self.config.parties.len(),
+                got: self.config.parties.len(),
+            })?;
+        Ok(records)
+    }
+
+    fn collect_expected_it_vss_public_consistency_records(
+        &mut self,
+        expected_keys: &[(PartyId, [u8; 32])],
+    ) -> Result<Vec<ProductionItVssConsistencyRecord>, DkgError> {
+        let messages = match self.collect_it_vss_artifact_messages_matching(
+            self.config.parties.len(),
+            |message| match wire_decode_dkg_it_vss_artifact_payload(&message.payload) {
+                Ok(DkgItVssArtifactPayload::PublicConsistencyRecords(ref records)) => {
+                    !records.is_empty()
+                        && records.iter().all(|record| {
+                            expected_keys.iter().any(|(dealer, label_hash)| {
+                                *dealer == PartyId(record.dealer_party_id)
+                                    && *label_hash == record.label_hash
+                            })
+                        })
+                }
+                _ => false,
+            },
+        ) {
+            Ok(messages) => messages,
+            Err(DkgError::MissingRoundMessages { expected, got, .. }) => {
+                self.runtime
+                    .cursor_log_mut()
+                    .persist_setup_phase_cursor(&DkgSetupPhaseCursor {
+                        phase: DkgTransportPhase::ItVssArtifact,
+                        state: DkgSetupPhaseCursorState::Waiting,
+                        receiver: None,
+                        vector: None,
+                        coefficient_index: None,
+                        it_vss_phase: Some(
+                            ProductionItVssComplaintPhase::BroadcastConsistencyRecords,
+                        ),
+                        expected,
+                        got,
+                    })?;
+                return Err(DkgError::MissingRoundMessages {
+                    round: DkgRound::Commit,
+                    expected,
+                    got,
+                });
+            }
+            Err(err) => return Err(err),
+        };
+        let records = self
+            .runtime
+            .runtime()
+            .it_vss_public_consistency_records_from_messages(messages)?;
+        self.runtime
+            .cursor_log_mut()
+            .persist_setup_phase_cursor(&DkgSetupPhaseCursor {
+                phase: DkgTransportPhase::ItVssArtifact,
+                state: DkgSetupPhaseCursorState::Collected,
+                receiver: None,
+                vector: None,
+                coefficient_index: None,
+                it_vss_phase: Some(ProductionItVssComplaintPhase::BroadcastConsistencyRecords),
+                expected: self.config.parties.len(),
+                got: self.config.parties.len(),
+            })?;
+        Ok(records)
+    }
+
     fn collect_it_vss_artifact_messages_matching<F>(
         &mut self,
         expected_count: usize,
@@ -7645,6 +8203,12 @@ enum NativeDkgSessionPhase {
     },
     FinalCommitments {
         sent: bool,
+    },
+    PublicAuditConsistency {
+        public_commitments: Vec<ItVssPublicCommitment>,
+    },
+    PublicConsistency {
+        public_commitments: Vec<ItVssPublicCommitment>,
     },
     VerifyPrivate {
         public_commitments: Vec<ItVssPublicCommitment>,
@@ -9304,6 +9868,8 @@ pub fn ensure_it_vss_artifact_log_allowed_for_release<L: DkgWireMessageLog>(
                 }
             }
             DkgItVssArtifactPayload::PublicPrecommitment(_) => {}
+            DkgItVssArtifactPayload::PublicAuditRecords(_) => {}
+            DkgItVssArtifactPayload::PublicConsistencyRecords(_) => {}
             DkgItVssArtifactPayload::ComplaintResolution(resolution) => {
                 for certificate in resolution.certificates {
                     if ItVssBackendId::from_u8(certificate.backend_id)
@@ -9401,6 +9967,8 @@ fn recover_it_vss_artifacts_from_dkg_wire_records(
                 }
             }
             DkgItVssArtifactPayload::PublicPrecommitment(_) => {}
+            DkgItVssArtifactPayload::PublicAuditRecords(_) => {}
+            DkgItVssArtifactPayload::PublicConsistencyRecords(_) => {}
             DkgItVssArtifactPayload::ComplaintResolution(next) => {
                 if resolution.is_some() {
                     return Err(DkgError::PrimeFieldMpcReplayDetected);
@@ -9431,6 +9999,8 @@ fn recover_it_vss_public_precommitments_from_dkg_wire_records(
             }
             DkgItVssArtifactPayload::PublicCommitment(_)
             | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+            | DkgItVssArtifactPayload::PublicAuditRecords(_)
+            | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
             | DkgItVssArtifactPayload::ComplaintResolution(_)
             | DkgItVssArtifactPayload::PublicCoinShare(_) => {}
         }
@@ -9457,10 +10027,66 @@ fn recover_it_vss_public_coin_shares_from_dkg_wire_records(
             DkgItVssArtifactPayload::PublicCommitment(_)
             | DkgItVssArtifactPayload::PublicPrecommitment(_)
             | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+            | DkgItVssArtifactPayload::PublicAuditRecords(_)
+            | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
             | DkgItVssArtifactPayload::ComplaintResolution(_) => {}
         }
     }
     Ok(shares)
+}
+
+fn recover_it_vss_public_audit_records_from_dkg_wire_records(
+    records: &[DkgWireMessageRecord],
+) -> Result<Vec<ProductionItVssAuditRecord>, DkgError> {
+    let mut out = Vec::new();
+    for record in records {
+        if record.direction != PrimeFieldMpcWireDirection::AcceptedBroadcast
+            || record.message.header.payload_kind != PayloadKind::DkgItVssArtifact
+        {
+            continue;
+        }
+        match wire_decode_dkg_it_vss_artifact_payload(&record.message.payload)
+            .map_err(|_| DkgError::PrimeFieldMpcTransport)?
+        {
+            DkgItVssArtifactPayload::PublicAuditRecords(records) => {
+                out.extend(records.iter().map(it_vss_audit_record_from_wire));
+            }
+            DkgItVssArtifactPayload::PublicCommitment(_)
+            | DkgItVssArtifactPayload::PublicPrecommitment(_)
+            | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+            | DkgItVssArtifactPayload::PublicCoinShare(_)
+            | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
+            | DkgItVssArtifactPayload::ComplaintResolution(_) => {}
+        }
+    }
+    Ok(out)
+}
+
+fn recover_it_vss_public_consistency_records_from_dkg_wire_records(
+    records: &[DkgWireMessageRecord],
+) -> Result<Vec<ProductionItVssConsistencyRecord>, DkgError> {
+    let mut out = Vec::new();
+    for record in records {
+        if record.direction != PrimeFieldMpcWireDirection::AcceptedBroadcast
+            || record.message.header.payload_kind != PayloadKind::DkgItVssArtifact
+        {
+            continue;
+        }
+        match wire_decode_dkg_it_vss_artifact_payload(&record.message.payload)
+            .map_err(|_| DkgError::PrimeFieldMpcTransport)?
+        {
+            DkgItVssArtifactPayload::PublicConsistencyRecords(records) => {
+                out.extend(records.iter().map(it_vss_consistency_record_from_wire));
+            }
+            DkgItVssArtifactPayload::PublicCommitment(_)
+            | DkgItVssArtifactPayload::PublicPrecommitment(_)
+            | DkgItVssArtifactPayload::PublicCommitmentBatch(_)
+            | DkgItVssArtifactPayload::PublicCoinShare(_)
+            | DkgItVssArtifactPayload::PublicAuditRecords(_)
+            | DkgItVssArtifactPayload::ComplaintResolution(_) => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Ensures a production release certificate is matched by the encoded setup
@@ -9619,6 +10245,385 @@ pub fn ensure_it_vss_public_coin_flow_complete_for_release<L: DkgWireMessageLog>
     Ok(())
 }
 
+/// Ensures the public IT-VSS log contains replayable audit/discard and
+/// vector-polynomial consistency transcripts for every release-capable
+/// `s1`/`s2` vector sharing.
+pub fn ensure_it_vss_public_audit_consistency_complete_for_release<L: DkgWireMessageLog>(
+    config: &DkgConfig,
+    log: &L,
+) -> Result<(), DkgError> {
+    config.validate()?;
+    let labels = sampler_vector_it_vss_sharing_labels(
+        config,
+        &[SecretVectorKind::S1, SecretVectorKind::S2],
+    )?;
+    let expected_keys = labels
+        .iter()
+        .map(|label| (label.dealer, label.label_hash))
+        .collect::<Vec<_>>();
+    let audit_records =
+        recover_it_vss_public_audit_records_from_dkg_wire_records(log.dkg_wire_records())?;
+    let consistency_records =
+        recover_it_vss_public_consistency_records_from_dkg_wire_records(log.dkg_wire_records())?;
+    let (public_commitments, _) =
+        recover_it_vss_artifacts_from_dkg_wire_records(log.dkg_wire_records())?;
+    let selected_commitments =
+        select_expected_it_vss_public_commitments(&public_commitments, &expected_keys)?;
+    if selected_commitments.len() != expected_keys.len() {
+        return Err(DkgError::MissingDkgSetupCertificate);
+    }
+    let coin_shares =
+        recover_it_vss_public_coin_shares_from_dkg_wire_records(log.dkg_wire_records())?;
+    let mut public_coin_hash_by_label = std::collections::BTreeMap::new();
+    for &(_, label_hash) in &expected_keys {
+        let shares = coin_shares
+            .iter()
+            .filter(|share| share.label_hash == label_hash)
+            .copied()
+            .collect::<Vec<_>>();
+        let transcript = production_it_vss_public_coin_transcript(config, label_hash, &shares)?;
+        public_coin_hash_by_label.insert(label_hash, transcript.coin_hash);
+    }
+
+    let mut audit_seen = std::collections::BTreeSet::new();
+    for record in &audit_records {
+        if !expected_keys
+            .iter()
+            .any(|&(dealer, label_hash)| dealer == record.dealer && label_hash == record.label_hash)
+            || !config.parties.contains(&record.holder)
+            || !config.parties.contains(&record.receiver)
+        {
+            return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+        }
+        ensure_public_payload_excludes_retained_receiver_tags(&record.audited_receiver_tag)?;
+        validate_opened_audited_vector_receiver_tag_payload(
+            &record.audited_receiver_tag,
+            record.holder,
+            record.receiver,
+            record.tag_index,
+        )?;
+        if hash_opened_audited_vector_receiver_tag_payload(&record.audited_receiver_tag)
+            != record.audited_receiver_tag_hash
+        {
+            return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+        }
+        if !audit_seen.insert((
+            record.dealer.0,
+            record.holder.0,
+            record.receiver.0,
+            record.label_hash,
+            record.tag_index,
+        )) {
+            return Err(DkgError::PrimeFieldMpcReplayDetected);
+        }
+    }
+
+    let mut consistency_seen = std::collections::BTreeSet::new();
+    for record in &consistency_records {
+        if !expected_keys
+            .iter()
+            .any(|&(dealer, label_hash)| dealer == record.dealer && label_hash == record.label_hash)
+            || !config.parties.contains(&record.holder)
+            || record.challenge_bit > 1
+        {
+            return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+        }
+        ensure_public_payload_excludes_retained_receiver_tags(&record.masked_eval)?;
+        validate_opened_vector_consistency_masked_eval_payload(
+            &record.masked_eval,
+            record.dealer,
+            record.holder,
+            record.label_hash,
+            record.round,
+            record.challenge_bit,
+        )?;
+        if hash_opened_vector_consistency_masked_eval_payload(&record.masked_eval)
+            != record.masked_eval_hash
+        {
+            return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+        }
+        let public_coin_hash = public_coin_hash_by_label
+            .get(&record.label_hash)
+            .copied()
+            .ok_or(DkgError::MissingDkgSetupCertificate)?;
+        let expected_challenge_bit = production_it_vss_consistency_challenge_bit_with_coin(
+            record.label_hash,
+            Some(public_coin_hash),
+            record.round as usize,
+        );
+        if record.challenge_bit != expected_challenge_bit {
+            return Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked);
+        }
+        if !consistency_seen.insert((
+            record.dealer.0,
+            record.holder.0,
+            record.label_hash,
+            record.round,
+        )) {
+            return Err(DkgError::PrimeFieldMpcReplayDetected);
+        }
+    }
+
+    for &(dealer, label_hash) in &expected_keys {
+        let mut expected_audit_tag_count = None;
+        let mut expected_consistency_round_count = None;
+        let mut expected_vector_len = None;
+        for &holder in &config.parties {
+            for &receiver in &config.parties {
+                let mut tag_indices = audit_seen
+                    .iter()
+                    .filter_map(
+                        |&(seen_dealer, seen_holder, seen_receiver, seen_label_hash, tag_index)| {
+                            if seen_dealer == dealer.0
+                                && seen_holder == holder.0
+                                && seen_receiver == receiver.0
+                                && seen_label_hash == label_hash
+                            {
+                                Some(tag_index)
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                if tag_indices.is_empty() {
+                    return Err(DkgError::MissingDkgSetupCertificate);
+                }
+                tag_indices.sort_unstable();
+                for (expected, actual) in tag_indices.iter().copied().enumerate() {
+                    if actual as usize != expected {
+                        return Err(DkgError::MissingDkgSetupCertificate);
+                    }
+                }
+                match expected_audit_tag_count {
+                    Some(expected) if expected != tag_indices.len() => {
+                        return Err(DkgError::MissingDkgSetupCertificate);
+                    }
+                    None => expected_audit_tag_count = Some(tag_indices.len()),
+                    _ => {}
+                }
+            }
+            let mut rounds = consistency_seen
+                .iter()
+                .filter_map(|&(seen_dealer, seen_holder, seen_label_hash, round)| {
+                    if seen_dealer == dealer.0
+                        && seen_holder == holder.0
+                        && seen_label_hash == label_hash
+                    {
+                        Some(round)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if rounds.is_empty() {
+                return Err(DkgError::MissingDkgSetupCertificate);
+            }
+            rounds.sort_unstable();
+            for (expected, actual) in rounds.iter().copied().enumerate() {
+                if actual as usize != expected {
+                    return Err(DkgError::MissingDkgSetupCertificate);
+                }
+            }
+            match expected_consistency_round_count {
+                Some(expected) if expected != rounds.len() => {
+                    return Err(DkgError::MissingDkgSetupCertificate);
+                }
+                None => expected_consistency_round_count = Some(rounds.len()),
+                _ => {}
+            }
+            for record in consistency_records.iter().filter(|record| {
+                record.dealer == dealer
+                    && record.holder == holder
+                    && record.label_hash == label_hash
+            }) {
+                let value_len = opened_vector_consistency_masked_eval_len(&record.masked_eval)?;
+                match expected_vector_len {
+                    Some(expected) if expected != value_len => {
+                        return Err(DkgError::ItVssVectorLengthMismatch {
+                            expected,
+                            got: value_len,
+                        });
+                    }
+                    None => expected_vector_len = Some(value_len),
+                    _ => {}
+                }
+            }
+        }
+        let commitment = selected_commitments
+            .iter()
+            .find(|commitment| commitment.dealer == dealer && commitment.label_hash == label_hash)
+            .ok_or(DkgError::MissingDkgSetupCertificate)?;
+        let public_coin_hash = public_coin_hash_by_label
+            .get(&label_hash)
+            .copied()
+            .ok_or(DkgError::MissingDkgSetupCertificate)?;
+        let audit_for_key = audit_records
+            .iter()
+            .filter(|record| record.dealer == dealer && record.label_hash == label_hash)
+            .cloned()
+            .collect::<Vec<_>>();
+        let consistency_for_key = consistency_records
+            .iter()
+            .filter(|record| record.dealer == dealer && record.label_hash == label_hash)
+            .cloned()
+            .collect::<Vec<_>>();
+        verify_production_it_vss_public_metadata_hash(
+            commitment,
+            expected_vector_len.ok_or(DkgError::MissingDkgSetupCertificate)?,
+            public_coin_hash,
+            hash_production_it_vss_audit_records(&audit_for_key),
+            hash_production_it_vss_consistency_records(&consistency_for_key),
+            expected_audit_tag_count.ok_or(DkgError::MissingDkgSetupCertificate)?,
+            expected_consistency_round_count.ok_or(DkgError::MissingDkgSetupCertificate)?,
+        )?;
+    }
+    ensure_it_vss_public_audit_consistency_order_for_release(log.dkg_wire_records(), &expected_keys)
+}
+
+/// Public replay result for the durable vector IT-VSS setup transcript.
+///
+/// This is the observer-facing Phase 2 boundary: it reconstructs the public
+/// `s1`/`s2` vector IT-VSS transcript from durable wire logs and reaches the
+/// same accepted/rejected dealer decision as the persisted complaint
+/// resolution. It does not inspect private deliveries or retained receiver
+/// tags.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayedItVssPublicLogDecision {
+    /// Dealers accepted by the replayed complaint-resolution artifact.
+    pub accepted_dealers: Vec<PartyId>,
+    /// Dealers rejected by the replayed complaint-resolution artifact.
+    pub rejected_dealers: Vec<PartyId>,
+    /// Hash of replayed public IT-VSS commitments.
+    pub public_artifact_hash: [u8; 32],
+    /// Hash of the replayed complaint-resolution artifact.
+    pub resolution_hash: [u8; 32],
+    /// Hash of replayed public audit/discard records.
+    pub public_audit_hash: [u8; 32],
+    /// Hash of replayed public vector consistency records.
+    pub public_consistency_hash: [u8; 32],
+    /// Transcript hash binding the replay decision to the DKG config and all
+    /// replayed public artifacts.
+    pub replay_transcript_hash: [u8; 32],
+}
+
+/// Replays durable public vector IT-VSS logs and returns the accepted/rejected
+/// dealer decision.
+///
+/// This is stricter than a presence scan: it validates the production vector
+/// label set, public-coin flow, audit/consistency phase order, complaint
+/// resolution shape, and one certificate for every accepted dealer/vector
+/// sharing. Later Phase 2 hardening extends this boundary with hash-level
+/// validation of opened audit tags and masked consistency evaluations.
+pub fn replay_it_vss_public_log_for_release<L: DkgWireMessageLog>(
+    config: &DkgConfig,
+    log: &L,
+) -> Result<ReplayedItVssPublicLogDecision, DkgError> {
+    config.validate()?;
+    ensure_it_vss_artifact_log_allowed_for_release(log)?;
+    ensure_dkg_setup_log_excludes_forbidden_release_payloads(log)?;
+    ensure_it_vss_artifact_log_uses_batched_vector_labels_for_release(config, log)?;
+    ensure_it_vss_public_coin_flow_complete_for_release(config, log)?;
+    ensure_it_vss_public_audit_consistency_complete_for_release(config, log)?;
+
+    let labels = sampler_vector_it_vss_sharing_labels(
+        config,
+        &[SecretVectorKind::S1, SecretVectorKind::S2],
+    )?;
+    let expected_keys = labels
+        .iter()
+        .map(|label| (label.dealer, label.label_hash))
+        .collect::<Vec<_>>();
+
+    let precommitments =
+        recover_it_vss_public_precommitments_from_dkg_wire_records(log.dkg_wire_records())?;
+    let selected_precommitments =
+        select_expected_it_vss_public_precommitments(&precommitments, &expected_keys)?;
+    if selected_precommitments.len() != expected_keys.len() {
+        return Err(DkgError::MissingDkgSetupCertificate);
+    }
+
+    let coin_shares =
+        recover_it_vss_public_coin_shares_from_dkg_wire_records(log.dkg_wire_records())?;
+    for &(_, label_hash) in &expected_keys {
+        let shares = coin_shares
+            .iter()
+            .filter(|share| share.label_hash == label_hash)
+            .cloned()
+            .collect::<Vec<_>>();
+        production_it_vss_public_coin_transcript(config, label_hash, &shares)?;
+    }
+
+    let (public_commitments, resolution) =
+        recover_it_vss_artifacts_from_dkg_wire_records(log.dkg_wire_records())?;
+    let selected_commitments =
+        select_expected_it_vss_public_commitments(&public_commitments, &expected_keys)?;
+    let resolution = resolution.ok_or(DkgError::MissingDkgSetupCertificate)?;
+    validate_it_vss_complaint_resolution_for_backend(
+        config,
+        &selected_commitments,
+        &resolution,
+        ItVssBackendId::ProductionInformationChecking,
+    )?;
+    ensure_replayed_it_vss_resolution_covers_expected_vector_commitments(
+        &selected_commitments,
+        &resolution,
+    )?;
+
+    let audit_records =
+        recover_it_vss_public_audit_records_from_dkg_wire_records(log.dkg_wire_records())?;
+    let consistency_records =
+        recover_it_vss_public_consistency_records_from_dkg_wire_records(log.dkg_wire_records())?;
+    let public_artifact_hash = hash_it_vss_public_artifacts(&selected_commitments);
+    let resolution_hash = hash_it_vss_complaint_resolution(&resolution);
+    let public_audit_hash = hash_production_it_vss_audit_records(&audit_records);
+    let public_consistency_hash = hash_production_it_vss_consistency_records(&consistency_records);
+
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS-DKG-IT-VSS-v1/public-log-replay");
+    hasher.update(config.transcript_hash().0);
+    hasher.update(public_artifact_hash);
+    hasher.update(resolution_hash);
+    hasher.update(public_audit_hash);
+    hasher.update(public_consistency_hash);
+    let replay_transcript_hash = hasher.finalize().into();
+
+    Ok(ReplayedItVssPublicLogDecision {
+        accepted_dealers: resolution.accepted_dealers,
+        rejected_dealers: resolution.rejected_dealers,
+        public_artifact_hash,
+        resolution_hash,
+        public_audit_hash,
+        public_consistency_hash,
+        replay_transcript_hash,
+    })
+}
+
+fn ensure_replayed_it_vss_resolution_covers_expected_vector_commitments(
+    commitments: &[ItVssPublicCommitment],
+    resolution: &ItVssComplaintResolution,
+) -> Result<(), DkgError> {
+    for commitment in commitments {
+        let has_certificate = resolution.certificates.iter().any(|certificate| {
+            certificate.dealer == commitment.dealer
+                && certificate.label_hash == commitment.label_hash
+                && certificate.transcript_hash == hash_it_vss_public_commitment(commitment)
+        });
+        if resolution.accepted_dealers.contains(&commitment.dealer) {
+            if !has_certificate {
+                return Err(DkgError::ItVssResolutionMissingCertificate {
+                    dealer: commitment.dealer,
+                });
+            }
+        } else if has_certificate {
+            return Err(DkgError::ItVssResolutionUnexpectedCertificate {
+                dealer: commitment.dealer,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn ensure_it_vss_public_coin_flow_order_for_release(
     records: &[DkgWireMessageRecord],
     expected_keys: &[(PartyId, [u8; 32])],
@@ -9666,6 +10671,8 @@ fn ensure_it_vss_public_coin_flow_order_for_release(
                 DkgItVssArtifactPayload::PublicPrecommitment(_)
                 | DkgItVssArtifactPayload::PublicCommitment(_)
                 | DkgItVssArtifactPayload::PublicCoinShare(_)
+                | DkgItVssArtifactPayload::PublicAuditRecords(_)
+                | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
                 | DkgItVssArtifactPayload::ComplaintResolution(_) => {}
             }
         }
@@ -9693,6 +10700,72 @@ fn ensure_it_vss_public_coin_flow_order_for_release(
         }
     }
 
+    Ok(())
+}
+
+fn ensure_it_vss_public_audit_consistency_order_for_release(
+    records: &[DkgWireMessageRecord],
+    expected_keys: &[(PartyId, [u8; 32])],
+) -> Result<(), DkgError> {
+    for &(expected_dealer, expected_label_hash) in expected_keys {
+        let mut final_commitment_index = None;
+        let mut audit_index = None;
+        let mut consistency_index = None;
+        for (index, record) in records.iter().enumerate() {
+            if record.direction != PrimeFieldMpcWireDirection::AcceptedBroadcast
+                || record.message.header.payload_kind != PayloadKind::DkgItVssArtifact
+            {
+                continue;
+            }
+            match wire_decode_dkg_it_vss_artifact_payload(&record.message.payload)
+                .map_err(|_| DkgError::PrimeFieldMpcTransport)?
+            {
+                DkgItVssArtifactPayload::PublicCommitment(commitment)
+                    if PartyId(commitment.dealer_party_id) == expected_dealer
+                        && commitment.label_hash == expected_label_hash =>
+                {
+                    final_commitment_index.get_or_insert(index);
+                }
+                DkgItVssArtifactPayload::PublicCommitmentBatch(commitments) => {
+                    if commitments.iter().any(|commitment| {
+                        PartyId(commitment.dealer_party_id) == expected_dealer
+                            && commitment.label_hash == expected_label_hash
+                    }) {
+                        final_commitment_index.get_or_insert(index);
+                    }
+                }
+                DkgItVssArtifactPayload::PublicAuditRecords(records)
+                    if records.iter().any(|record| {
+                        PartyId(record.dealer_party_id) == expected_dealer
+                            && record.label_hash == expected_label_hash
+                    }) =>
+                {
+                    audit_index.get_or_insert(index);
+                }
+                DkgItVssArtifactPayload::PublicConsistencyRecords(records)
+                    if records.iter().any(|record| {
+                        PartyId(record.dealer_party_id) == expected_dealer
+                            && record.label_hash == expected_label_hash
+                    }) =>
+                {
+                    consistency_index.get_or_insert(index);
+                }
+                DkgItVssArtifactPayload::PublicCommitment(_)
+                | DkgItVssArtifactPayload::PublicPrecommitment(_)
+                | DkgItVssArtifactPayload::PublicCoinShare(_)
+                | DkgItVssArtifactPayload::PublicAuditRecords(_)
+                | DkgItVssArtifactPayload::PublicConsistencyRecords(_)
+                | DkgItVssArtifactPayload::ComplaintResolution(_) => {}
+            }
+        }
+        let final_commitment_index =
+            final_commitment_index.ok_or(DkgError::MissingDkgSetupCertificate)?;
+        let audit_index = audit_index.ok_or(DkgError::MissingDkgSetupCertificate)?;
+        let consistency_index = consistency_index.ok_or(DkgError::MissingDkgSetupCertificate)?;
+        if audit_index <= final_commitment_index || consistency_index <= final_commitment_index {
+            return Err(DkgError::DkgSetupIncompleteAfterRestart);
+        }
+    }
     Ok(())
 }
 
@@ -9735,6 +10808,14 @@ pub fn ensure_it_vss_phase_cursors_complete_for_release<C: DkgSetupPhaseCursorLo
         ),
         (
             ProductionItVssComplaintPhase::BroadcastPublicCommitments,
+            DkgSetupPhaseCursorState::Collected,
+        ),
+        (
+            ProductionItVssComplaintPhase::BroadcastPublicAudits,
+            DkgSetupPhaseCursorState::Collected,
+        ),
+        (
+            ProductionItVssComplaintPhase::BroadcastConsistencyRecords,
             DkgSetupPhaseCursorState::Collected,
         ),
         (
@@ -9835,6 +10916,7 @@ where
     ensure_dkg_setup_log_matches_certificate_for_release(setup_log, certificate)?;
     ensure_it_vss_artifact_log_uses_batched_vector_labels_for_release(&config, setup_log)?;
     ensure_it_vss_public_coin_flow_complete_for_release(&config, setup_log)?;
+    ensure_it_vss_public_audit_consistency_complete_for_release(&config, setup_log)?;
     ensure_native_dkg_transport_evidence_matches_config(&config, transport_evidence)?;
     Ok(config)
 }
@@ -10343,6 +11425,7 @@ fn assemble_public_output_from_t1_and_evidence(
             power2round: evidence,
             power2round_runtime: runtime_evidence,
             setup: None,
+            power2round_setup_input_hash: None,
         },
     ))
 }
@@ -10462,6 +11545,11 @@ pub fn ensure_dkg_key_package_set_allowed_for_release(
         if package.certificate != first.certificate {
             return Err(DkgError::DkgKeyPackageCertificateDisagreement);
         }
+        ensure_power2round_setup_binding_matches_config(
+            &config,
+            package.rho,
+            &package.certificate,
+        )?;
         if package.s1_share.party != package.party {
             return Err(DkgError::PartyMismatch {
                 expected: package.party,
@@ -10493,6 +11581,22 @@ fn ensure_native_dkg_assembly_parts_allowed_for_release(
 ) -> Result<DkgConfig, DkgError> {
     ensure_dkg_certificate_allowed_for_release(certificate)?;
     ensure_dkg_key_package_set_allowed_for_release(key_packages)
+}
+
+fn ensure_power2round_setup_binding_matches_config(
+    config: &DkgConfig,
+    rho: [u8; 32],
+    certificate: &PublicKeyAssemblyCertificate,
+) -> Result<(), DkgError> {
+    let setup = certificate
+        .setup
+        .as_ref()
+        .ok_or(DkgError::MissingDkgSetupCertificate)?;
+    let expected = production_power2round_setup_input_hash(config, rho, setup);
+    if certificate.power2round_setup_input_hash != Some(expected) {
+        return Err(DkgError::Power2RoundEvidenceRequired);
+    }
+    Ok(())
 }
 
 /// Durable transcript store used to bind epoch output and prevent rollback.

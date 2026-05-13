@@ -362,6 +362,52 @@ StrictSelectedOpeningBackend:
   evidence: token count, selected priority, and selected signature hash. It
   must not receive or inspect the full candidate batch.
 
+StrictRuntimeSelectedOpeningArtifact:
+  handoff object emitted by the distributed vector runtime after private
+  checks, private selection, and selected-only opening have completed. It is
+  bound to the strict signing request hash and consumed token session ids, and
+  carries only selected ctilde, selected z, selected h, and a durable
+  `StrictSigningVectorRuntimeCertificate`. It must not contain rejected
+  candidates, pass bits, failure reasons, unselected hints, or partial signer
+  responses.
+
+StrictRuntimeSelectedOpeningArtifactSource:
+  app-driven runtime source that produces the selected-opening artifact after
+  the strict session has durably consumed its fixed token batch. The release
+  session receives this source through
+  `ProductionStrictRuntimeSelectedOpeningArtifactBackend`; it does not accept
+  an already materialized artifact as its normal entry point.
+
+ProductionStrictRuntimeSelectedOpeningArtifactBackend:
+  release session backend that asks the artifact source to produce the
+  selected-opening artifact, then validates it through the selected-opening
+  consumer below. This keeps manual/test artifact construction outside the
+  normal release session boundary.
+
+ProductionStrictVectorMpcArtifactSource:
+  concrete artifact source that adapts the canonical strict vector component
+  stack into the selected-opening artifact handoff. It runs response
+  preparation, response-bound checks, hint/highbits checks, private priority
+  selection, and selected-only opening internally, then returns only selected
+  ctilde, selected z, selected h, and the validated runtime certificate.
+  Future transport work should replace its share-provider substrate with live
+  app-driven vector MPC handles without changing the release session boundary.
+
+ProductionStrictRuntimeSelectedOpeningBackend:
+  release-facing selected-opening consumer for the runtime artifact. It does
+  not recompute response checks or perform local selection. It validates that
+  the artifact matches the request, consumed token batch, selected priority,
+  and derived ctilde before encoding the final signature and attaching the
+  runtime certificate. The remaining implementation work is the app-driven
+  runtime orchestrator that produces this artifact over transport messages and
+  durable cursors.
+
+StrictSigningVectorRuntimeCertificate:
+  carries durable vector-runtime evidence plus a source marker. Release strict
+  signing accepts only certificates sourced from the selected-opening artifact
+  boundary. A generic runtime-evidence wrapper can still exist for low-level
+  tests, but it cannot make local/direct component-stack output release-valid.
+
 ProductionStrictSigningBackend:
   production-facing composition point for the strict trait stack. It wires
   private response preparation, response-bound checks, hint checks, private
@@ -407,6 +453,14 @@ Remaining cryptographic backend work:
   and proof/backend review continue under the implementation plan; any
   distributed runtime must adapt the same strict component stack rather than
   adding a separate scalarized response-check path.
+
+Performance note:
+  strict no-rejected-z signing is intentionally heavier than paper-fast TALUS
+  because rejected candidates must stay private. The production optimization
+  path is documented in `docs/production-optimization-principles.md`: batch
+  private checks by circuit layer, move eligible certified masks/material into
+  preprocessing, compact durable logs without losing replayability, and keep
+  paper-fast/clear-partial shortcuts out of production.
 
 strict_candidate_priority:
   production-visible public priority derivation used after private validity

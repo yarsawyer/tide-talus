@@ -703,6 +703,11 @@ malformed or replayed public message:
 
 False blame is worse than abort. V1 must not claim identifiable blame unless
 the evidence is public, transcript-bound, and independently verifiable.
+The normal production vector IT-VSS backend therefore treats non-empty
+hash/transcript complaint sets as `ItVssAbortNoBlame`: it validates their public
+shape, but it does not reject or blame a dealer from evidence that requires
+private delivery material to independently attribute. Test/dev backends may
+still exercise dealer-rejection mechanics for adversarial coverage.
 
 ## Transport Requirements
 
@@ -800,18 +805,43 @@ Implementation sequence:
 11. Add vector polynomial consistency mask/private-gamma and public masked
     evaluation records. [done]
 12. Replace deterministic challenge derivation with application-broadcast
-    post-commitment public coins. [pending]
+    post-commitment public coins. [done]
+13. Carry public audit/discard records as first-class DKG wire artifacts. [done]
+14. Carry public vector consistency records as first-class DKG wire artifacts. [done]
+15. Require audit/discard and consistency artifacts in release validation. [done]
+16. Add public durable-log replay verifier for vector IT-VSS accepted/rejected
+    dealer decisions. [done]
+17. Persist opened audited receiver-side tag bytes in public audit records and
+    verify their hash/header on release replay. [done]
+18. Persist opened vector consistency masked-evaluation bytes and verify their
+    hash/header/challenge bit from the public-coin transcript on release
+    replay. [done]
+19. Bind replayed audit tag counts and consistency round counts to the accepted
+    production public metadata hash for every S1/S2 vector commitment. [done]
+20. Add malformed audit/consistency adversarial replay tests for forged audit
+    hashes, retained-tag marker leakage, wrong audited-tag headers, forged
+    consistency hashes, wrong public-coin challenge bits, missing/extra rounds,
+    duplicate audit/consistency records, replayed public coins, and duplicate
+    complaint evidence. [done]
+21. Enforce v1 conservative dispute policy for the production vector backend:
+    non-empty hash/transcript complaint sets abort without dealer blame unless
+    a future public-objective proof format is introduced. [done]
 ```
 
 `ProductionInformationCheckingVssBackend` may implement the crate's
 production-method boundary. Its current normal-build implementation performs
 whole-vector Shamir sharing over `F_q`, emits receiver-private retained
 information-checking material, emits separate audited tag material, derives
-public audit/discard records only from audited tags, verifies directed private
+public audit/discard records only from audited tags, persists the opened
+audited tag bytes as public discard-only material, verifies the opened audit
+hash/header during release replay, persists opened public masked-evaluation
+vectors for vector consistency, verifies their hash/header and public-coin
+challenge bits during release replay, binds audit/consistency counts to each
+commitment's accepted public metadata hash, verifies directed private
 deliveries, and produces hash-only public complaints. Release selection remains
-gated by `ProductionItVssReadiness` until post-commitment vector polynomial
-public-coin challenges, persistence, PQ transport evidence, and
-complaint-resolution policy requirements in this document are satisfied.
+gated by `ProductionItVssReadiness` until the remaining persistence, transport
+evidence, and complaint-resolution policy requirements in this document are
+satisfied.
 External cryptographic review is tracked after implementation as audit
 metadata; it is not a prerequisite for building or exercising the
 production-shaped backend.
@@ -921,17 +951,29 @@ can be treated as accepted:
   aborted sessions rejected
 ```
 
-## Release Blockers
+## Release Readiness Status
 
-Native production IT-DKG/VSS remains blocked until:
+The Phase 2 vector IT-VSS implementation boundary is closed for current
+planning purposes:
 
 ```text
-1. Scalar IT-VSS passes the adversarial suite.
-2. Batched/vector IT-VSS is implemented and tested.
-3. Retained receiver-side tags have no public serialization path.
-4. Public beta_i reveal is absent from v1 release builds.
-5. AbortNoBlame vs blame evidence policy is implemented.
-6. Durable phase cursors and restart validation are complete.
-7. App-provided ML-KEM/ML-DSA transport conformance tests pass.
-8. External cryptographic/security review approves the backend.
+completed:
+  scalar correctness/adversarial harness
+  batched/vector IT-VSS backend and app-driver path
+  retained receiver-side tag privacy
+  no public beta_i reveal in v1
+  conservative AbortNoBlame dispute policy
+  durable phase cursors and restart validation for vector IT-VSS
+  app-supplied ML-KEM/ML-DSA transport conformance tests
+```
+
+Project-level production still depends on later phases:
+
+```text
+remaining outside Phase 2:
+  final production DKG assembly wiring
+  final preprocessing/BCC/CEF token certification
+  final strict signing over release-capable vector IT-MPC
+  full performance envelopes and optimization gates
+  external cryptographic/security review
 ```

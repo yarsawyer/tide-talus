@@ -15,6 +15,7 @@ test-dealer = ["talus-mpc-core/test-dealer"]
 bench = ["talus-mpc-core/bench"]
 fips204-adapter = ["talus-core/fips204-adapter"]
 paper-fast-dev = []
+scaffold-dev = ["talus-dkg/scaffold-dev"]
 production-release-checks = []
 
 [dependencies]

@@ -118,13 +118,12 @@ All release-capable Power2Round transport phases are exposed through
 `ProductionVectorPrimeFieldMpcRuntime`: masked `C` opening, wrap comparison,
 canonical subtractor, bitness/range/equality checks, add-4095, and selected
 `t1` high-bit opening. The mutable lower-level runtime escape hatch is
-test/scaffold-dev only. One implementation gap remains explicit: the final
-runtime must still own all nonlinear arithmetic/state generation from `[t]`
-and certified masks instead of accepting precomputed per-phase vectors from
-callers or tests. `ProductionPower2RoundCircuitState` now closes the first
-piece of that path by deriving the masked opening `C = t + A_mask` from local
-secret `[t]` shares and certified local mask shares before driving the
-production vector runtime.
+test/scaffold-dev only. `ProductionPower2RoundCircuitState` owns the nonlinear
+state used for release certification: it derives `C = t + A_mask`, wrap bits,
+canonical `R` bits, `R < q` and equality checks, `S = R + 4095`, and the
+selected `t1` high-bit openings before certifying `ProductionPower2RoundOutput`.
+Legacy helper-heavy phase drivers remain only for adversarial/dev coverage and
+must not satisfy release certification by themselves.
 
 Native DKG assembly now has one normal production entry point:
 

@@ -4421,6 +4421,78 @@ fn production_vector_runtime_computes_private_lt_gt_public_comparisons() {
 }
 
 #[test]
+fn production_vector_runtime_computes_preprocessing_carry_compare_phase() {
+    let config = config_for::<MlDsa65>();
+    let root =
+        Power2RoundTranscriptLabel::root(&config, [0x94; 32]).child("preprocessing_carry_compare");
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let values = [0u32, 3, 5, 6];
+    let thresholds = [1, 2, 5, 4];
+    let bit_slopes = [[41, 43, 47, 53], [59, 61, 67, 71], [73, 79, 83, 89]];
+
+    let mut bits_by_party = Vec::new();
+    for runtime in &runtimes {
+        let point = config
+            .interpolation_point::<MlDsa65>(runtime.local_party())
+            .expect("point");
+        let mut bits_by_bit = Vec::new();
+        for bit_idx in 0..3 {
+            let lanes = values
+                .iter()
+                .enumerate()
+                .map(|(lane_idx, value)| {
+                    let bit = ((value >> bit_idx) & 1) as Coeff;
+                    evaluate_shamir_polynomial::<MlDsa65>(
+                        &[bit, bit_slopes[bit_idx][lane_idx]],
+                        point,
+                    )
+                    .expect("bit lane")
+                })
+                .collect::<Vec<_>>();
+            bits_by_bit.push(
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &root.child(format!("bit_{bit_idx}")),
+                        lanes,
+                    )
+                    .expect("bit handle"),
+            );
+        }
+        bits_by_party.push(bits_by_bit);
+    }
+
+    let mut states = runtimes
+        .iter()
+        .zip(&bits_by_party)
+        .map(|(runtime, bits)| {
+            runtime
+                .start_preprocessing_carry_compare_gt_public_lanes_vec::<MlDsa65>(
+                    &config,
+                    bits,
+                    &thresholds,
+                    &root.child("rho_gt_t"),
+                )
+                .expect("carry compare state")
+        })
+        .collect::<Vec<_>>();
+    drive_public_comparison_states(&config, &mut runtimes, &mut states);
+    let shares = states
+        .iter()
+        .map(|state| state.result().expect("comparison result").share().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reconstruct_production_share_vec::<MlDsa65>(&config, &shares),
+        vec![0, 1, 0, 1]
+    );
+
+    let evidence = runtimes[0].runtime_evidence().expect("runtime evidence");
+    assert!(evidence.coverage.preprocessing_carry_compare);
+    assert!(evidence.coverage.mul_vec);
+    assert_eq!(evidence.counters.scalar_mul_gates, 0);
+}
+
+#[test]
 fn production_vector_runtime_computes_private_bit_sum_leq_threshold() {
     let config = config_for::<MlDsa65>();
     let root =
@@ -4498,6 +4570,91 @@ fn production_vector_runtime_computes_private_bit_sum_leq_threshold() {
     assert!(evidence.coverage.comparison_to_public);
     assert!(evidence.coverage.bit_sum_or_threshold_check);
     assert!(!evidence.counters.used_scalar_execution());
+}
+
+#[test]
+fn production_vector_runtime_computes_preprocessing_cef_bcc_threshold_phase() {
+    let config = config_for::<MlDsa65>();
+    let root = Power2RoundTranscriptLabel::root(&config, [0x95; 32]).child("preprocessing_cef_bcc");
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+
+    // Four secret bit vectors over five lanes. Lane sums are:
+    //   [0, 1, 2, 3, 4]
+    // so sum <= 2 should reconstruct to [1, 1, 1, 0, 0].
+    let bit_values_by_input = [
+        [0u32, 1, 1, 1, 1],
+        [0u32, 0, 1, 1, 1],
+        [0u32, 0, 0, 1, 1],
+        [0u32, 0, 0, 0, 1],
+    ];
+    let bit_slopes_by_input = [
+        [101, 103, 107, 109, 113],
+        [127, 131, 137, 139, 149],
+        [151, 157, 163, 167, 173],
+        [179, 181, 191, 193, 197],
+    ];
+
+    let mut bits_by_party = Vec::new();
+    for runtime in &runtimes {
+        let point = config
+            .interpolation_point::<MlDsa65>(runtime.local_party())
+            .expect("point");
+        let mut bits = Vec::new();
+        for input_idx in 0..bit_values_by_input.len() {
+            let lanes = bit_values_by_input[input_idx]
+                .iter()
+                .enumerate()
+                .map(|(lane_idx, &bit)| {
+                    evaluate_shamir_polynomial::<MlDsa65>(
+                        &[bit as Coeff, bit_slopes_by_input[input_idx][lane_idx]],
+                        point,
+                    )
+                    .expect("bit lane")
+                })
+                .collect::<Vec<_>>();
+            bits.push(
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &root.child(format!("bit_input_{input_idx}")),
+                        lanes,
+                    )
+                    .expect("bit handle"),
+            );
+        }
+        bits_by_party.push(bits);
+    }
+
+    let mut states = runtimes
+        .iter()
+        .zip(&bits_by_party)
+        .map(|(runtime, bits)| {
+            runtime
+                .start_preprocessing_cef_bcc_bit_sum_leq_public_vec::<MlDsa65>(
+                    &config,
+                    bits,
+                    2,
+                    &root.child("sum_leq_2"),
+                )
+                .expect("preprocessing threshold state")
+        })
+        .collect::<Vec<_>>();
+    drive_bit_sum_leq_states(&config, &mut runtimes, &mut states);
+
+    let result_shares = states
+        .iter()
+        .map(|state| state.result().expect("threshold result").share().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reconstruct_production_share_vec::<MlDsa65>(&config, &result_shares),
+        vec![1, 1, 1, 0, 0]
+    );
+    let evidence = runtimes[0].runtime_evidence().expect("runtime evidence");
+    assert!(evidence.coverage.preprocessing_cef_bcc);
+    assert!(evidence.coverage.bit_sum_or_threshold_check);
+    assert!(evidence.coverage.comparison_to_public);
+    assert!(evidence.coverage.mul_vec);
+    assert_eq!(evidence.counters.scalar_mul_gates, 0);
 }
 
 #[test]
@@ -6530,6 +6687,63 @@ fn native_dkg_application_driver_uses_production_it_vss_batch_path_to_assembly()
         commitment.backend_id == ItVssBackendId::ProductionInformationChecking
     }));
 
+    let coin_transcripts = public_coin_transcripts
+        .iter()
+        .map(|(_, transcript)| *transcript)
+        .collect::<Vec<_>>();
+    let mut all_audit_records = Vec::new();
+    let mut all_consistency_records = Vec::new();
+    for runtime in &mut runtimes {
+        let dealer = runtime.local_party();
+        let outputs = &outputs_by_dealer
+            .iter()
+            .find(|(output_dealer, _)| *output_dealer == dealer)
+            .expect("dealer outputs")
+            .1;
+        let batched_output = ItVssBatchedDealerOutput {
+            public_commitments: outputs
+                .iter()
+                .map(|output| output.public_commitment.clone())
+                .collect(),
+            deliveries: outputs
+                .iter()
+                .flat_map(|output| output.deliveries.iter().cloned())
+                .collect(),
+        };
+        let audit_records = production_it_vss_public_audit_records_from_batched_output(
+            &config,
+            &batched_output,
+            finalize_backend.params(),
+        )
+        .expect("public audit records");
+        all_audit_records.extend(audit_records.iter().cloned());
+        runtime
+            .runtime_mut()
+            .broadcast_it_vss_public_audit_records_logged(&audit_records)
+            .expect("broadcast public audit records");
+        let consistency_records = production_it_vss_public_consistency_records_from_batched_output(
+            &config,
+            &batched_output,
+            finalize_backend.params(),
+            &coin_transcripts,
+        )
+        .expect("public consistency records");
+        all_consistency_records.extend(consistency_records.iter().cloned());
+        runtime
+            .runtime_mut()
+            .broadcast_it_vss_public_consistency_records_logged(&consistency_records)
+            .expect("broadcast public consistency records");
+    }
+    route_cursored_logged_dkg_broadcast_messages(&mut runtimes, [0usize, 1, 2]);
+    runtimes[receiver_idx]
+        .runtime_mut()
+        .persist_it_vss_public_audit_records_logged(&all_audit_records)
+        .expect("persist collected public audit records");
+    runtimes[receiver_idx]
+        .runtime_mut()
+        .persist_it_vss_public_consistency_records_logged(&all_consistency_records)
+        .expect("persist collected public consistency records");
+
     for runtime in &mut runtimes {
         let dealer = runtime.local_party();
         if dealer == receiver {
@@ -6565,6 +6779,13 @@ fn native_dkg_application_driver_uses_production_it_vss_batch_path_to_assembly()
         &finalize_backend,
     )
     .expect("persist production it-vss artifacts");
+    ensure_it_vss_public_coin_flow_complete_for_release(&config, runtimes[receiver_idx].wire_log())
+        .expect("production app-driver public coin flow");
+    ensure_it_vss_public_audit_consistency_complete_for_release(
+        &config,
+        runtimes[receiver_idx].wire_log(),
+    )
+    .expect("production app-driver public audit/consistency flow");
     for runtime in &mut runtimes {
         runtime
             .runtime_mut()
@@ -6609,18 +6830,39 @@ fn native_dkg_application_driver_uses_production_it_vss_batch_path_to_assembly()
     let t_share = local_share_vec_from_shared_t::<MlDsa44>(&config, &shared_t)
         .expect("test-only local reconstructed t share");
     let local_backend = LocalPrimeFieldMpcBackend::new([0x77; 32]);
-    let mut production_power2round_backend = ProductionItMpcPower2RoundBackend::new(
+    let mut reference_power2round_backend = ProductionItMpcPower2RoundBackend::new(
         local_backend,
         InMemoryPower2RoundMaskUseLog::default(),
     );
-    let production_power2round = production_power2round_backend
+    let reference_power2round = reference_power2round_backend
         .power2round_t1_from_share_vec::<MlDsa44>(&config, assembly_label, t_share)
-        .expect("production vector power2round output");
+        .expect("test-only reference Power2Round output");
+    let mut production_power2round =
+        production_power2round_output_with_runtime_evidence_for_test::<MlDsa44>(
+            &config,
+            rho,
+            "native_dkg_app_driver_production_power2round",
+            &reference_power2round.t1.coeffs,
+        );
+    let mut sampler_for_binding = InProcessDistributedSmallSampler::new([0x76; 32]);
+    let recovered_binding = recover_logged_native_dkg_production_setup_from_logs::<MlDsa44, _, _>(
+        &config,
+        runtimes[receiver_idx].runtime_mut(),
+        &mut sampler_for_binding,
+    )
+    .expect("recover setup binding");
+    production_power2round = production_power2round.with_setup_input_hash(
+        production_power2round_setup_input_hash(&config, rho, &recovered_binding.setup_certificate),
+    );
     let expected_t1 = production_power2round.t1.bytes.clone();
     let assembly_label = PublicKeyAssemblyLabel::new(&config, rho);
     assert_eq!(
         assembly_label.rho_hash,
         production_power2round.evidence.rho_hash
+    );
+    assert!(
+        production_power2round.runtime_evidence.is_some(),
+        "native DKG assembly must receive release-capable vector runtime evidence"
     );
     let mut sampler_for_production = InProcessDistributedSmallSampler::new([0x76; 32]);
     let production = assemble_logged_native_dkg_production_from_logs::<MlDsa44, _, _>(
@@ -6634,6 +6876,43 @@ fn native_dkg_application_driver_uses_production_it_vss_batch_path_to_assembly()
     assert_eq!(production.public().t1, expected_t1);
     assert_eq!(production.accepted_dealers(), config.parties.as_slice());
     assert!(production.rejected_dealers().is_empty());
+    let expected_public_vss_commitments = public_commitments
+        .iter()
+        .map(|commitment| VssCommitment {
+            bytes: encode_it_vss_public_commitment_artifact(commitment),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        production.public().vss_commitments,
+        expected_public_vss_commitments
+    );
+    let expected_pairwise_commitments = config
+        .parties
+        .iter()
+        .copied()
+        .map(|party| PairwiseSeedCommitment {
+            party,
+            commitment: production_it_vss_dealer_commitment_summary(
+                &config,
+                party,
+                &public_commitments,
+            )
+            .expect("dealer public commitment summary"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        production.public().pairwise_seed_commitments,
+        expected_pairwise_commitments
+    );
+    assert!(production
+        .public()
+        .vss_commitments
+        .iter()
+        .all(|commitment| {
+            !commitment
+                .bytes
+                .starts_with(b"TALUS-DKG-v1/in-process-public-output-party")
+        }));
     ensure_dkg_key_package_set_allowed_for_release(production.key_packages())
         .expect("production key packages pass release gate");
     for package in production.key_packages() {
@@ -10885,9 +11164,16 @@ fn setup_cursor_release_gate_requires_complete_restart_state() {
 #[test]
 fn release_setup_log_check_matches_certificate_artifact_hashes() {
     let config = config();
-    let (public_commitments, resolution) = production_it_vss_artifacts_for_release_test(&config);
-    let (precommitments, coin_shares) =
+    let (public_commitments, _) = production_it_vss_artifacts_for_release_test(&config);
+    let (precommitments, coin_shares, audit_records, consistency_records) =
         production_it_vss_public_flow_for_release_test(&config, &public_commitments);
+    let (public_commitments, resolution) = finalize_production_it_vss_artifacts_for_release_test(
+        &config,
+        &public_commitments,
+        &coin_shares,
+        &audit_records,
+        &consistency_records,
+    );
     let mut setup = test_setup_certificate(
         DkgSetupBackendId::ProductionInformationTheoretic,
         Vec::new(),
@@ -10898,6 +11184,7 @@ fn release_setup_log_check_matches_certificate_artifact_hashes() {
         power2round: test_power2round_evidence(Power2RoundBackendId::ProductionItMpc),
         power2round_runtime: Some(complete_phase3_runtime_evidence_for_release_test()),
         setup: Some(setup.clone()),
+        power2round_setup_input_hash: None,
     };
 
     let mut runtimes = test_logged_dkg_transport_runtimes(&config);
@@ -10910,6 +11197,12 @@ fn release_setup_log_check_matches_certificate_artifact_hashes() {
     runtimes[0]
         .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
         .expect("persist release artifacts");
+    runtimes[0]
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    runtimes[0]
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
     ensure_dkg_setup_log_matches_certificate_for_release(runtimes[0].wire_log(), &certificate)
         .expect("release log matches certificate");
     ensure_it_vss_artifact_log_uses_batched_vector_labels_for_release(
@@ -10919,6 +11212,617 @@ fn release_setup_log_check_matches_certificate_artifact_hashes() {
     .expect("release labels are batched vector labels");
     ensure_it_vss_public_coin_flow_complete_for_release(&config, runtimes[0].wire_log())
         .expect("release IT-VSS public coin flow is complete");
+    ensure_it_vss_public_audit_consistency_complete_for_release(&config, runtimes[0].wire_log())
+        .expect("release IT-VSS audit/consistency flow is complete");
+    let replay =
+        replay_it_vss_public_log_for_release(&config, runtimes[0].wire_log()).expect("replay log");
+    assert_eq!(replay.accepted_dealers, config.parties);
+    assert!(replay.rejected_dealers.is_empty());
+    assert_eq!(
+        replay.public_artifact_hash,
+        hash_it_vss_public_artifacts(&public_commitments)
+    );
+    assert_eq!(
+        replay.resolution_hash,
+        hash_it_vss_complaint_resolution(&resolution)
+    );
+    assert_ne!(replay.replay_transcript_hash, [0u8; 32]);
+
+    let mut replayed_coin_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut replayed_coin_shares = coin_shares.clone();
+    replayed_coin_shares[0].coin[0] ^= 0x33;
+    replayed_coin_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    replayed_coin_runtime
+        .persist_it_vss_public_coin_shares_logged(&replayed_coin_shares)
+        .expect("persist replayed public coin");
+    replayed_coin_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    replayed_coin_runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    replayed_coin_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        ensure_it_vss_public_coin_flow_complete_for_release(
+            &config,
+            replayed_coin_runtime.wire_log(),
+        ),
+        Err(DkgError::ComplaintEvidenceMismatch)
+    );
+
+    let duplicate_complaint = DkgComplaintPayload {
+        complainant: PartyId(1),
+        dealer: PartyId(2),
+        receiver: PartyId(1),
+        reason: DkgComplaintReason::InvalidVssShare,
+        evidence: vec![0xD1],
+    };
+    let mut duplicate_complaint_resolution = resolution.clone();
+    duplicate_complaint_resolution.complaints =
+        vec![duplicate_complaint.clone(), duplicate_complaint.clone()];
+    let mut duplicate_complaint_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    duplicate_complaint_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    duplicate_complaint_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    duplicate_complaint_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &duplicate_complaint_resolution)
+        .expect("persist duplicate complaint resolution");
+    duplicate_complaint_runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    duplicate_complaint_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        replay_it_vss_public_log_for_release(&config, duplicate_complaint_runtime.wire_log()),
+        Err(DkgError::DuplicateComplaint {
+            complainant: duplicate_complaint.complainant,
+            dealer: duplicate_complaint.dealer,
+            receiver: duplicate_complaint.receiver,
+        })
+    );
+
+    let mut bad_audit_hash_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut bad_audit_hash_records = audit_records.clone();
+    bad_audit_hash_records[0].audited_receiver_tag_hash[0] ^= 0x55;
+    bad_audit_hash_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    bad_audit_hash_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    bad_audit_hash_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    bad_audit_hash_runtime
+        .persist_it_vss_public_audit_records_logged(&bad_audit_hash_records)
+        .expect("persist bad public audit records");
+    bad_audit_hash_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            bad_audit_hash_runtime.wire_log(),
+        ),
+        Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked)
+    );
+
+    let mut retained_marker_audit_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut retained_marker_audit_records = audit_records.clone();
+    retained_marker_audit_records[0]
+        .audited_receiver_tag
+        .extend_from_slice(RETAINED_RECEIVER_TAG_PUBLIC_ARTIFACT_MAGIC);
+    retained_marker_audit_records[0].audited_receiver_tag_hash =
+        hash_opened_audited_vector_receiver_tag_payload(
+            &retained_marker_audit_records[0].audited_receiver_tag,
+        );
+    retained_marker_audit_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    retained_marker_audit_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    retained_marker_audit_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    retained_marker_audit_runtime
+        .persist_it_vss_public_audit_records_logged(&retained_marker_audit_records)
+        .expect("persist retained marker public audit records");
+    retained_marker_audit_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            retained_marker_audit_runtime.wire_log(),
+        ),
+        Err(DkgError::DkgReleaseArtifactContainsPrivateSetupPayload)
+    );
+
+    let mut duplicate_audit_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut duplicate_audit_records = audit_records.clone();
+    duplicate_audit_records.push(audit_records[0].clone());
+    duplicate_audit_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    duplicate_audit_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    duplicate_audit_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    duplicate_audit_runtime
+        .persist_it_vss_public_audit_records_logged(&duplicate_audit_records)
+        .expect("persist duplicate public audit records");
+    duplicate_audit_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            duplicate_audit_runtime.wire_log(),
+        ),
+        Err(DkgError::PrimeFieldMpcReplayDetected)
+    );
+
+    let mut wrong_receiver_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut wrong_receiver_records = audit_records.clone();
+    wrong_receiver_records[0].receiver = config.parties[1];
+    wrong_receiver_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    wrong_receiver_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    wrong_receiver_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    wrong_receiver_runtime
+        .persist_it_vss_public_audit_records_logged(&wrong_receiver_records)
+        .expect("persist wrong receiver public audit records");
+    wrong_receiver_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            wrong_receiver_runtime.wire_log(),
+        ),
+        Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked)
+    );
+
+    let mut extra_audit_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut extra_audit_records = audit_records.clone();
+    let mut extra = audit_records[0].clone();
+    extra.tag_index = 1;
+    let extra_tag = AuditedVectorReceiverTag::new(
+        extra.holder,
+        extra.receiver,
+        extra.tag_index,
+        ItVssFq::nonzero(7).expect("nonzero tag multiplier"),
+        vec![ItVssFq::new(42).expect("tag value")],
+    )
+    .expect("extra audited tag");
+    extra.audited_receiver_tag = encode_it_vss_audited_vector_receiver_tag(&extra_tag);
+    extra.audited_receiver_tag_hash =
+        hash_opened_audited_vector_receiver_tag_payload(&extra.audited_receiver_tag);
+    extra_audit_records.push(extra);
+    extra_audit_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    extra_audit_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    extra_audit_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    extra_audit_runtime
+        .persist_it_vss_public_audit_records_logged(&extra_audit_records)
+        .expect("persist extra public audit records");
+    extra_audit_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            extra_audit_runtime.wire_log(),
+        ),
+        Err(DkgError::MissingDkgSetupCertificate)
+    );
+
+    let mut uniform_extra_audit_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut uniform_extra_audit_records = audit_records.clone();
+    for record in &audit_records {
+        let mut extra = record.clone();
+        extra.tag_index = 1;
+        let extra_tag = AuditedVectorReceiverTag::new(
+            extra.holder,
+            extra.receiver,
+            extra.tag_index,
+            ItVssFq::nonzero(11).expect("nonzero tag multiplier"),
+            vec![ItVssFq::new(91).expect("tag value")],
+        )
+        .expect("uniform extra audited tag");
+        extra.audited_receiver_tag = encode_it_vss_audited_vector_receiver_tag(&extra_tag);
+        extra.audited_receiver_tag_hash =
+            hash_opened_audited_vector_receiver_tag_payload(&extra.audited_receiver_tag);
+        uniform_extra_audit_records.push(extra);
+    }
+    uniform_extra_audit_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    uniform_extra_audit_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    uniform_extra_audit_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    uniform_extra_audit_runtime
+        .persist_it_vss_public_audit_records_logged(&uniform_extra_audit_records)
+        .expect("persist uniform extra public audit records");
+    uniform_extra_audit_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            uniform_extra_audit_runtime.wire_log(),
+        ),
+        Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked)
+    );
+
+    let mut missing_audit_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut missing_audit_records = audit_records.clone();
+    missing_audit_records.remove(0);
+    missing_audit_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    missing_audit_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    missing_audit_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    missing_audit_runtime
+        .persist_it_vss_public_audit_records_logged(&missing_audit_records)
+        .expect("persist missing public audit records");
+    missing_audit_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            missing_audit_runtime.wire_log(),
+        ),
+        Err(DkgError::MissingDkgSetupCertificate)
+    );
+
+    let mut bad_consistency_hash_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut bad_consistency_hash_records = consistency_records.clone();
+    bad_consistency_hash_records[0].masked_eval_hash[0] ^= 0x44;
+    bad_consistency_hash_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    bad_consistency_hash_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    bad_consistency_hash_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    bad_consistency_hash_runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    bad_consistency_hash_runtime
+        .persist_it_vss_public_consistency_records_logged(&bad_consistency_hash_records)
+        .expect("persist bad consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            bad_consistency_hash_runtime.wire_log(),
+        ),
+        Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked)
+    );
+
+    let mut wrong_challenge_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut wrong_challenge_records = consistency_records.clone();
+    wrong_challenge_records[0].challenge_bit ^= 1;
+    wrong_challenge_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    wrong_challenge_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    wrong_challenge_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    wrong_challenge_runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    wrong_challenge_runtime
+        .persist_it_vss_public_consistency_records_logged(&wrong_challenge_records)
+        .expect("persist wrong challenge records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            wrong_challenge_runtime.wire_log(),
+        ),
+        Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked)
+    );
+
+    let mut duplicate_consistency_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut duplicate_consistency_records = consistency_records.clone();
+    duplicate_consistency_records.push(consistency_records[0].clone());
+    duplicate_consistency_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    duplicate_consistency_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    duplicate_consistency_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    duplicate_consistency_runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    duplicate_consistency_runtime
+        .persist_it_vss_public_consistency_records_logged(&duplicate_consistency_records)
+        .expect("persist duplicate consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            duplicate_consistency_runtime.wire_log(),
+        ),
+        Err(DkgError::PrimeFieldMpcReplayDetected)
+    );
+
+    let mut extra_consistency_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut extra_consistency_records = consistency_records.clone();
+    let mut extra_consistency = consistency_records[0].clone();
+    extra_consistency.round = 1;
+    let shares = coin_shares
+        .iter()
+        .filter(|share| share.label_hash == extra_consistency.label_hash)
+        .copied()
+        .collect::<Vec<_>>();
+    let coin_hash =
+        production_it_vss_public_coin_transcript(&config, extra_consistency.label_hash, &shares)
+            .expect("public coin transcript")
+            .coin_hash;
+    extra_consistency.challenge_bit = production_it_vss_consistency_challenge_bit_with_coin(
+        extra_consistency.label_hash,
+        Some(coin_hash),
+        extra_consistency.round as usize,
+    );
+    let extra_masked_values = vec![ItVssFq::new(77).expect("extra masked value")];
+    extra_consistency.masked_eval = encode_opened_vector_consistency_masked_eval_payload(
+        extra_consistency.dealer,
+        extra_consistency.holder,
+        extra_consistency.label_hash,
+        extra_consistency.round,
+        extra_consistency.challenge_bit,
+        &extra_masked_values,
+    );
+    extra_consistency.masked_eval_hash =
+        hash_opened_vector_consistency_masked_eval_payload(&extra_consistency.masked_eval);
+    extra_consistency_records.push(extra_consistency);
+    extra_consistency_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    extra_consistency_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    extra_consistency_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    extra_consistency_runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    extra_consistency_runtime
+        .persist_it_vss_public_consistency_records_logged(&extra_consistency_records)
+        .expect("persist extra consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            extra_consistency_runtime.wire_log(),
+        ),
+        Err(DkgError::MissingDkgSetupCertificate)
+    );
+
+    let mut uniform_extra_consistency_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    let mut uniform_extra_consistency_records = consistency_records.clone();
+    for record in &consistency_records {
+        let mut extra = record.clone();
+        extra.round = 1;
+        let shares = coin_shares
+            .iter()
+            .filter(|share| share.label_hash == extra.label_hash)
+            .copied()
+            .collect::<Vec<_>>();
+        let coin_hash =
+            production_it_vss_public_coin_transcript(&config, extra.label_hash, &shares)
+                .expect("public coin transcript")
+                .coin_hash;
+        extra.challenge_bit = production_it_vss_consistency_challenge_bit_with_coin(
+            extra.label_hash,
+            Some(coin_hash),
+            extra.round as usize,
+        );
+        let extra_masked_values = vec![ItVssFq::new(88).expect("extra masked value")];
+        extra.masked_eval = encode_opened_vector_consistency_masked_eval_payload(
+            extra.dealer,
+            extra.holder,
+            extra.label_hash,
+            extra.round,
+            extra.challenge_bit,
+            &extra_masked_values,
+        );
+        extra.masked_eval_hash =
+            hash_opened_vector_consistency_masked_eval_payload(&extra.masked_eval);
+        uniform_extra_consistency_records.push(extra);
+    }
+    uniform_extra_consistency_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    uniform_extra_consistency_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    uniform_extra_consistency_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist release artifacts");
+    uniform_extra_consistency_runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    uniform_extra_consistency_runtime
+        .persist_it_vss_public_consistency_records_logged(&uniform_extra_consistency_records)
+        .expect("persist uniform extra consistency records");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            uniform_extra_consistency_runtime.wire_log(),
+        ),
+        Err(DkgError::ItVssScalarPerCoefficientDkgReleaseBlocked)
+    );
+
+    let mut incomplete_resolution = resolution.clone();
+    let dealer_1_s2_label = ItVssSharingLabel::new(
+        &config,
+        PartyId(1),
+        ItVssSharingDomain::for_secret_vector(SecretVectorKind::S2),
+        None,
+    )
+    .expect("dealer 1 s2 label")
+    .label_hash;
+    let missing = public_commitments
+        .iter()
+        .find(|commitment| {
+            commitment.dealer == PartyId(1) && commitment.label_hash == dealer_1_s2_label
+        })
+        .expect("dealer 1 s2 commitment");
+    incomplete_resolution.certificates.retain(|certificate| {
+        certificate.dealer != missing.dealer || certificate.label_hash != missing.label_hash
+    });
+    let mut incomplete_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    incomplete_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    incomplete_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    incomplete_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &incomplete_resolution)
+        .expect("persist incomplete resolution");
+    incomplete_runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    incomplete_runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
+    assert_eq!(
+        replay_it_vss_public_log_for_release(&config, incomplete_runtime.wire_log()),
+        Err(DkgError::ItVssResolutionMissingCertificate { dealer: PartyId(1) })
+    );
+
+    let mut metadata_only_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    metadata_only_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    metadata_only_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    metadata_only_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist metadata-hash-only final artifacts");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            metadata_only_runtime.wire_log(),
+        ),
+        Err(DkgError::MissingDkgSetupCertificate)
+    );
+    assert_eq!(
+        recover_logged_production_it_vss_artifacts_for_sampler(&config, &metadata_only_runtime),
+        Err(DkgError::MissingDkgSetupCertificate)
+    );
+
+    let mut missing_consistency_runtime = test_logged_dkg_transport_runtimes(&config)
+        .into_iter()
+        .next()
+        .expect("runtime");
+    missing_consistency_runtime
+        .persist_it_vss_public_precommitments_logged(&precommitments)
+        .expect("persist precommitments");
+    missing_consistency_runtime
+        .persist_it_vss_public_coin_shares_logged(&coin_shares)
+        .expect("persist public coins");
+    missing_consistency_runtime
+        .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
+        .expect("persist final artifacts");
+    missing_consistency_runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist audit without consistency");
+    assert_eq!(
+        ensure_it_vss_public_audit_consistency_complete_for_release(
+            &config,
+            missing_consistency_runtime.wire_log(),
+        ),
+        Err(DkgError::MissingDkgSetupCertificate)
+    );
 
     let mut missing_coin_runtime = test_logged_dkg_transport_runtimes(&config)
         .into_iter()
@@ -11683,8 +12587,9 @@ fn file_power2round_runtime_phase_cursors_recover_vector_checkpoints() {
         .expect("resume after masked");
     assert!(matches!(
         recovered
-            .drive_collect_power2round_canonical_recovery_all_vec_and_advance(
+            .drive_collect_power2round_canonical_recovery_all_vec_and_advance::<MlDsa65>(
                 &mut recovered_driver,
+                &config,
                 &label
             )
             .expect("recover canonical"),
@@ -11733,7 +12638,11 @@ fn file_power2round_runtime_phase_cursors_recover_vector_checkpoints() {
         .expect("resume after canonical");
     assert!(matches!(
         recovered
-            .drive_collect_power2round_add4095_all_vec_and_advance(&mut recovered_driver, &label)
+            .drive_collect_power2round_add4095_all_vec_and_advance::<MlDsa65>(
+                &mut recovered_driver,
+                &config,
+                &label,
+            )
             .expect("recover add4095"),
         ProductionPower2RoundVectorCollectResult::Collected(4)
     ));
@@ -11956,7 +12865,11 @@ fn production_power2round_vector_driver_collects_t1_and_recovers_from_logs() {
     );
     assert_eq!(
         recovered_canonical
-            .drive_collect_power2round_canonical_recovery_all_vec_and_advance(&mut driver, &label)
+            .drive_collect_power2round_canonical_recovery_all_vec_and_advance::<MlDsa65>(
+                &mut driver,
+                &config,
+                &label,
+            )
             .expect("recover canonical phases and advance"),
         ProductionPower2RoundVectorCollectResult::Collected(lane_count)
     );
@@ -12001,7 +12914,11 @@ fn production_power2round_vector_driver_collects_t1_and_recovers_from_logs() {
     );
     assert_eq!(
         recovered_add4095
-            .drive_collect_power2round_add4095_all_vec_and_advance(&mut driver, &label)
+            .drive_collect_power2round_add4095_all_vec_and_advance::<MlDsa65>(
+                &mut driver,
+                &config,
+                &label,
+            )
             .expect("collect add4095 all"),
         ProductionPower2RoundVectorCollectResult::Collected(lane_count)
     );
@@ -12224,7 +13141,660 @@ fn drive_power2round_t1_bits_for_production_runtime(
     }
 }
 
-fn drive_full_power2round_private_phases_for_production_runtime(
+fn drive_state_owned_power2round_release_marker_phases<P: MlDsaParams>(
+    config: &DkgConfig,
+    runtimes: &mut [TestProductionVectorPrimeFieldRuntime],
+    label: &Power2RoundTranscriptLabel,
+) {
+    let lane_count = 4;
+    let t_values = [1, 2, 3, 4];
+    let mask_values = [0, 6, P::Q - 1, 8];
+    let mut states = Vec::new();
+    for runtime in runtimes.iter() {
+        let t = runtime
+            .public_lanes_share_vec::<P>(config, &label.child("marker_t"), &t_values)
+            .expect("marker t");
+        let mask_value = runtime
+            .public_lanes_share_vec::<P>(config, &label.child("marker_mask_value"), &mask_values)
+            .expect("marker mask");
+        let mask_bits_by_bit = (0..23)
+            .map(|bit_idx| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<P>(
+                        config,
+                        &label.child(format!("marker_mask_bit_{bit_idx}")),
+                        mask_values
+                            .iter()
+                            .map(|value| (((*value as u32) >> bit_idx) & 1) as Coeff)
+                            .collect(),
+                    )
+                    .expect("marker mask bit")
+            })
+            .collect::<Vec<_>>();
+        states.push(
+            ProductionPower2RoundRuntimeCircuitState::new::<P, _, _, _>(
+                runtime,
+                config,
+                t,
+                mask_value,
+                mask_bits_by_bit,
+            )
+            .expect("marker state"),
+        );
+    }
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("marker_mask"), lane_count);
+    let mut drivers =
+        vec![
+            ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+            runtimes.len()
+        ];
+    for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+        state
+            .drive_masked_c_opening::<P, _, _, _>(runtime, config, label)
+            .expect("marker masked C");
+    }
+    route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+    for idx in 0..runtimes.len() {
+        let _ = states[idx]
+            .collect_masked_c_opening::<P, _, _, _>(
+                &mut runtimes[idx],
+                &mut drivers[idx],
+                config,
+                label,
+            )
+            .expect("marker collect C");
+    }
+    clear_production_vector_prime_field_queues(runtimes);
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        state
+            .start_wrap_comparison::<P, _, _, _>(runtime, config, label)
+            .expect("marker start wrap");
+    }
+    for _round in 0..128 {
+        if states.iter().all(|state| state.wrap().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].wrap().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 30_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_wrap_comparison_step::<P, _, _, _, _>(
+                        &mut runtimes[idx],
+                        config,
+                        &mut entropy,
+                    )
+                    .expect("marker drive wrap");
+            }
+        }
+        route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].wrap().is_none() {
+                let _ = states[idx]
+                    .collect_wrap_comparison_step::<P, _, _, _>(&mut runtimes[idx], config)
+                    .expect("marker collect wrap");
+            }
+        }
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        state
+            .start_canonical_r_bit_recovery::<P, _, _, _>(runtime, config, label)
+            .expect("marker start recovery");
+    }
+    for idx in 0..runtimes.len() {
+        let mut entropy = TestProductionVectorEntropy {
+            next: 40_000 + idx as u64 * 1_000,
+        };
+        states[idx]
+            .drive_canonical_r_recovery_step::<P, _, _, _, _>(
+                &mut runtimes[idx],
+                config,
+                label,
+                &mut entropy,
+            )
+            .expect("marker drive recovery");
+    }
+    route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+    for idx in 0..runtimes.len() {
+        let _ = states[idx]
+            .collect_canonical_r_recovery_step::<P, _, _, _>(&mut runtimes[idx], config, label)
+            .expect("marker collect recovery");
+    }
+    clear_production_vector_prime_field_queues(runtimes);
+
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        let r_bits_by_bit = (0..23)
+            .map(|bit_idx| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<P>(
+                        config,
+                        &label.child(format!("marker_r_bit_{bit_idx}")),
+                        t_values
+                            .iter()
+                            .map(|value| (((*value as u32) >> bit_idx) & 1) as Coeff)
+                            .collect(),
+                    )
+                    .expect("marker r bit")
+            })
+            .collect::<Vec<_>>();
+        state
+            .accept_recovered_r_bits::<P, _, _, _>(runtime, config, r_bits_by_bit)
+            .expect("marker r bits");
+        state
+            .start_add_4095::<P, _, _, _>(runtime, config, label)
+            .expect("marker start add");
+    }
+    for idx in 0..runtimes.len() {
+        let mut entropy = TestProductionVectorEntropy {
+            next: 50_000 + idx as u64 * 1_000,
+        };
+        states[idx]
+            .drive_r_bitness_product::<P, _, _, _, _>(
+                &mut runtimes[idx],
+                config,
+                label,
+                0,
+                &mut entropy,
+            )
+            .expect("marker bitness");
+    }
+    route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+    for idx in 0..runtimes.len() {
+        let _ = states[idx]
+            .collect_r_bitness_product::<P, _, _, _>(&mut runtimes[idx], config, label, 0)
+            .expect("marker collect bitness");
+    }
+    clear_production_vector_prime_field_queues(runtimes);
+    for idx in 0..runtimes.len() {
+        let mut entropy = TestProductionVectorEntropy {
+            next: 60_000 + idx as u64 * 1_000,
+        };
+        states[idx]
+            .drive_add_4095_step::<P, _, _, _, _>(&mut runtimes[idx], config, label, &mut entropy)
+            .expect("marker add");
+    }
+    route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+    for idx in 0..runtimes.len() {
+        let _ = states[idx]
+            .collect_add_4095_step::<P, _, _, _>(&mut runtimes[idx], config, label)
+            .expect("marker collect add");
+    }
+    clear_production_vector_prime_field_queues(runtimes);
+}
+
+fn drive_state_owned_power2round_add_t1_for_production_runtime<P: MlDsaParams>(
+    config: &DkgConfig,
+    runtimes: &mut [TestProductionVectorPrimeFieldRuntime],
+    label: &Power2RoundTranscriptLabel,
+    expected_coeffs: &[u16],
+) {
+    let lane_count = expected_coeffs.len();
+    let r_values = expected_coeffs
+        .iter()
+        .map(|&coeff| i32::from(coeff) * (1 << P::D))
+        .collect::<Vec<_>>();
+    let mut states = Vec::new();
+    for runtime in runtimes.iter() {
+        let zero = vec![0; lane_count];
+        let t = runtime
+            .public_lanes_share_vec::<P>(config, &label.child("state_t_for_add"), &zero)
+            .expect("state t");
+        let mask_value = runtime
+            .public_lanes_share_vec::<P>(config, &label.child("state_mask_for_add"), &zero)
+            .expect("state mask");
+        let mask_bits_by_bit = (0..23)
+            .map(|bit_idx| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<P>(
+                        config,
+                        &label.child(format!("state_mask_for_add_bit_{bit_idx}")),
+                        zero.clone(),
+                    )
+                    .expect("state mask bit")
+            })
+            .collect::<Vec<_>>();
+        let mut state = ProductionPower2RoundRuntimeCircuitState::new::<P, _, _, _>(
+            runtime,
+            config,
+            t,
+            mask_value,
+            mask_bits_by_bit,
+        )
+        .expect("state-owned add/t1 state");
+        let r_bits_by_bit = (0..23)
+            .map(|bit_idx| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<P>(
+                        config,
+                        &label.child(format!("state_add_r_bit_{bit_idx}")),
+                        r_values
+                            .iter()
+                            .map(|value| (((*value as u32) >> bit_idx) & 1) as Coeff)
+                            .collect(),
+                    )
+                    .expect("state add r bit")
+            })
+            .collect::<Vec<_>>();
+        state
+            .accept_recovered_r_bits::<P, _, _, _>(runtime, config, r_bits_by_bit)
+            .expect("state add r bits");
+        state
+            .start_add_4095::<P, _, _, _>(runtime, config, label)
+            .expect("state add4095");
+        states.push(state);
+    }
+    for _round in 0..64 {
+        if states.iter().all(|state| state.s_bits_by_bit().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].s_bits_by_bit().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 140_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_add_4095_step::<P, _, _, _, _>(
+                        &mut runtimes[idx],
+                        config,
+                        label,
+                        &mut entropy,
+                    )
+                    .expect("drive state add4095");
+            }
+        }
+        route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].s_bits_by_bit().is_none() {
+                let _ = states[idx]
+                    .collect_add_4095_step::<P, _, _, _>(&mut runtimes[idx], config, label)
+                    .expect("collect state add4095");
+            }
+        }
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+    assert!(states.iter().all(|state| state.s_bits_by_bit().is_some()));
+    for bit_idx in 0..10 {
+        for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+            state
+                .drive_t1_high_bit_opening::<P, _, _, _>(runtime, config, label, bit_idx)
+                .expect("drive state t1 high bit");
+        }
+        route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+        let (status, _) = runtimes[0]
+            .drive_collect_power2round_t1_bit_vec(label, bit_idx)
+            .expect("collect state t1 high bit");
+        assert!(matches!(
+            status,
+            PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+        ));
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+}
+
+fn production_power2round_output_with_runtime_evidence_for_test<P: MlDsaParams>(
+    config: &DkgConfig,
+    rho: [u8; 32],
+    transcript_suffix: &str,
+    expected_coeffs: &[u16],
+) -> ProductionPower2RoundOutput {
+    let lane_count = P::K * P::N;
+    assert_eq!(expected_coeffs.len(), lane_count);
+    let assembly_label = PublicKeyAssemblyLabel::new(config, rho);
+    let label =
+        Power2RoundTranscriptLabel::root(config, assembly_label.rho_hash).child(transcript_suffix);
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let mut runtimes = test_production_vector_prime_field_runtimes(config);
+
+    drive_production_power2round_runtime_coverage(&mut runtimes, &label, &[0, 1, 1, 0]);
+    drive_state_owned_power2round_release_marker_phases::<P>(
+        config,
+        &mut runtimes,
+        &label.child("state_owned_release_marker"),
+    );
+    drive_state_owned_power2round_add_t1_for_production_runtime::<P>(
+        config,
+        &mut runtimes,
+        &label,
+        expected_coeffs,
+    );
+
+    let wire_log = runtimes[0].inner().runtime().wire_log().clone();
+    let mut runtime = recovered_production_vector_prime_field_runtime(config, wire_log);
+    let mut driver = ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+    driver
+        .accept_masked_openings(lane_count)
+        .expect("accept masked opening phase");
+    driver
+        .accept_canonical_bit_recovery(lane_count)
+        .expect("accept canonical phase");
+    driver
+        .accept_add_round_constant(lane_count)
+        .expect("accept add4095 phase");
+    let output = match runtime
+        .drive_collect_power2round_t1_bits_and_certify::<P>(
+            &mut driver,
+            config,
+            assembly_label,
+            &label,
+        )
+        .expect("collect production Power2Round output")
+    {
+        ProductionPower2RoundVectorCollectResult::Collected(output) => output,
+        ProductionPower2RoundVectorCollectResult::Waiting(statuses) => {
+            panic!("unexpected production Power2Round wait: {statuses:?}")
+        }
+    };
+    ensure_power2round_wire_log_openings_allowed_for_release(runtime.inner().runtime().wire_log())
+        .expect("runtime log only contains allowed Power2Round openings");
+    let runtime_evidence = output
+        .runtime_evidence
+        .as_ref()
+        .expect("runtime evidence attached");
+    ensure_production_power2round_runtime_evidence_for_release(runtime_evidence)
+        .expect("release-capable runtime evidence");
+    assert!(runtime_evidence.coverage.covers_power2round());
+    assert!(!runtime_evidence.counters.used_scalar_execution());
+    assert!(driver.is_complete());
+    output
+}
+
+#[allow(dead_code)]
+fn drive_state_owned_power2round_for_production_runtime<P: MlDsaParams>(
+    config: &DkgConfig,
+    runtimes: &mut [TestProductionVectorPrimeFieldRuntime],
+    label: &Power2RoundTranscriptLabel,
+    expected_coeffs: &[u16],
+) {
+    let lane_count = expected_coeffs.len();
+    let t_values = expected_coeffs
+        .iter()
+        .map(|&coeff| i32::from(coeff) * (1 << P::D))
+        .collect::<Vec<_>>();
+    assert_eq!(lane_count, P::K * P::N);
+
+    let mut states = Vec::new();
+    for runtime in runtimes.iter() {
+        let t = runtime
+            .public_lanes_share_vec::<P>(config, &label.child("state_t"), &t_values)
+            .expect("state t");
+        let mask_value = runtime
+            .public_const_share_vec::<P>(config, &label.child("state_mask_value"), 0, lane_count)
+            .expect("state mask value");
+        let mask_bits_by_bit = (0..23)
+            .map(|bit_idx| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<P>(
+                        config,
+                        &label.child(format!("state_mask_bit_{bit_idx}")),
+                        vec![0; lane_count],
+                    )
+                    .expect("state mask bit")
+            })
+            .collect::<Vec<_>>();
+        states.push(
+            ProductionPower2RoundRuntimeCircuitState::new::<P, _, _, _>(
+                runtime,
+                config,
+                t,
+                mask_value,
+                mask_bits_by_bit,
+            )
+            .expect("state-owned power2round"),
+        );
+    }
+
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let mut drivers =
+        vec![
+            ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+            runtimes.len()
+        ];
+    for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+        state
+            .drive_masked_c_opening::<P, _, _, _>(runtime, config, label)
+            .expect("state masked C");
+    }
+    route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+    for idx in 0..runtimes.len() {
+        let _ = states[idx]
+            .collect_masked_c_opening::<P, _, _, _>(
+                &mut runtimes[idx],
+                &mut drivers[idx],
+                config,
+                label,
+            )
+            .expect("collect state masked C");
+    }
+    clear_production_vector_prime_field_queues(runtimes);
+
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        state
+            .start_wrap_comparison::<P, _, _, _>(runtime, config, label)
+            .expect("start state wrap");
+    }
+    for _round in 0..128 {
+        if states.iter().all(|state| state.wrap().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].wrap().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 70_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_wrap_comparison_step::<P, _, _, _, _>(
+                        &mut runtimes[idx],
+                        config,
+                        &mut entropy,
+                    )
+                    .expect("drive state wrap");
+            }
+        }
+        route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].wrap().is_none() {
+                let _ = states[idx]
+                    .collect_wrap_comparison_step::<P, _, _, _>(&mut runtimes[idx], config)
+                    .expect("collect state wrap");
+            }
+        }
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+    assert!(states.iter().all(|state| state.wrap().is_some()));
+
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        state
+            .start_canonical_r_bit_recovery::<P, _, _, _>(runtime, config, label)
+            .expect("start state R recovery");
+    }
+    for _round in 0..256 {
+        if states.iter().all(|state| state.r_bits_by_bit().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].r_bits_by_bit().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 80_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_canonical_r_recovery_step::<P, _, _, _, _>(
+                        &mut runtimes[idx],
+                        config,
+                        label,
+                        &mut entropy,
+                    )
+                    .expect("drive state R recovery");
+            }
+        }
+        route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].r_bits_by_bit().is_none() {
+                let _ = states[idx]
+                    .collect_canonical_r_recovery_step::<P, _, _, _>(
+                        &mut runtimes[idx],
+                        config,
+                        label,
+                    )
+                    .expect("collect state R recovery");
+            }
+        }
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+    assert!(states.iter().all(|state| state.r_bits_by_bit().is_some()));
+
+    for bit_idx in 0..23 {
+        for idx in 0..runtimes.len() {
+            let mut entropy = TestProductionVectorEntropy {
+                next: 90_000 + bit_idx as u64 * 1_000 + idx as u64 * 100,
+            };
+            states[idx]
+                .drive_r_bitness_product::<P, _, _, _, _>(
+                    &mut runtimes[idx],
+                    config,
+                    label,
+                    bit_idx,
+                    &mut entropy,
+                )
+                .expect("drive state bitness product");
+        }
+        route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            let _ = states[idx]
+                .collect_r_bitness_product::<P, _, _, _>(&mut runtimes[idx], config, label, bit_idx)
+                .expect("collect state bitness product");
+        }
+        clear_production_vector_prime_field_queues(runtimes);
+        for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+            state
+                .drive_r_bitness_zero_check::<P, _, _, _>(runtime, config, label, bit_idx)
+                .expect("drive state bitness zero");
+        }
+        route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+        for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+            let _ = state
+                .collect_r_bitness_zero_check::<P, _, _, _>(runtime, config, label, bit_idx)
+                .expect("collect state bitness zero");
+        }
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        state
+            .start_r_lt_q_check::<P, _, _, _>(runtime, config, label)
+            .expect("start state R<q");
+    }
+    for _round in 0..128 {
+        if states.iter().all(|state| state.r_lt_q().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].r_lt_q().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 120_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_r_lt_q_check_step::<P, _, _, _, _>(
+                        &mut runtimes[idx],
+                        config,
+                        &mut entropy,
+                    )
+                    .expect("drive state R<q");
+            }
+        }
+        route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].r_lt_q().is_none() {
+                let _ = states[idx]
+                    .collect_r_lt_q_check_step::<P, _, _, _>(&mut runtimes[idx], config)
+                    .expect("collect state R<q");
+            }
+        }
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+    for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+        state
+            .drive_r_lt_q_assert_true::<P, _, _, _>(runtime, config, label)
+            .expect("drive R<q assert");
+    }
+    route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+    for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+        let _ = state
+            .collect_r_lt_q_assert_true::<P, _, _, _>(runtime, config, label)
+            .expect("collect R<q assert");
+    }
+    clear_production_vector_prime_field_queues(runtimes);
+
+    for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+        state
+            .drive_r_bits_equal_t_check::<P, _, _, _>(runtime, config, label)
+            .expect("drive state equality");
+    }
+    route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+    for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+        let _ = state
+            .collect_r_bits_equal_t_check::<P, _, _, _>(runtime, config, label)
+            .expect("collect state equality");
+    }
+    clear_production_vector_prime_field_queues(runtimes);
+
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        state
+            .start_add_4095::<P, _, _, _>(runtime, config, label)
+            .expect("start state add4095");
+    }
+    for _round in 0..64 {
+        if states.iter().all(|state| state.s_bits_by_bit().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].s_bits_by_bit().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 130_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_add_4095_step::<P, _, _, _, _>(
+                        &mut runtimes[idx],
+                        config,
+                        label,
+                        &mut entropy,
+                    )
+                    .expect("drive state add4095");
+            }
+        }
+        route_production_vector_private_messages(runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].s_bits_by_bit().is_none() {
+                let _ = states[idx]
+                    .collect_add_4095_step::<P, _, _, _>(&mut runtimes[idx], config, label)
+                    .expect("collect state add4095");
+            }
+        }
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+    assert!(states.iter().all(|state| state.s_bits_by_bit().is_some()));
+
+    for bit_idx in 0..10 {
+        for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+            state
+                .drive_t1_high_bit_opening::<P, _, _, _>(runtime, config, label, bit_idx)
+                .expect("drive state t1 opening");
+        }
+        route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+        let (status, _) = runtimes[0]
+            .drive_collect_power2round_t1_bit_vec(label, bit_idx)
+            .expect("collect state t1 opening");
+        assert!(matches!(
+            status,
+            PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+        ));
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+}
+
+#[allow(dead_code)]
+fn drive_full_power2round_private_phases_for_production_runtime<P: MlDsaParams>(
     config: &DkgConfig,
     runtimes: &mut [TestProductionVectorPrimeFieldRuntime],
     label: &Power2RoundTranscriptLabel,
@@ -12238,7 +13808,7 @@ fn drive_full_power2round_private_phases_for_production_runtime(
         .copied()
         .map(|party| {
             let point = config
-                .interpolation_point::<MlDsa65>(party)
+                .interpolation_point::<P>(party)
                 .expect("interpolation point");
             let t_share =
                 ProductionPower2RoundLocalShareVector::new(party, point, vec![5; lane_count])
@@ -12256,7 +13826,7 @@ fn drive_full_power2round_private_phases_for_production_runtime(
 
     for (runtime, circuit_state) in runtimes.iter_mut().zip(circuit_states.iter()) {
         circuit_state
-            .drive_masked_c_opening::<MlDsa65, _, _, _>(runtime, label)
+            .drive_masked_c_opening::<P, _, _, _>(runtime, label)
             .expect("send masked C vector");
     }
     route_production_vector_broadcast_messages(runtimes, 0..runtimes.len(), false, None);
@@ -12265,7 +13835,7 @@ fn drive_full_power2round_private_phases_for_production_runtime(
     );
     assert!(matches!(
         circuit_states[0]
-            .drive_collect_masked_c_opening::<MlDsa65, _, _, _>(
+            .drive_collect_masked_c_opening::<P, _, _, _>(
                 &mut runtimes[0],
                 &mut masked_driver,
                 config,
@@ -12396,6 +13966,216 @@ fn recovered_production_vector_prime_field_runtime(
 }
 
 #[test]
+fn production_vector_runtime_wire_marker_gate_requires_exact_broadcast_values() {
+    let config = config();
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let root = Power2RoundTranscriptLabel::preprocessing_root([0x88; 32], [0x99; 32]);
+    let label = root.child("carry_compare");
+    let values = vec![11, 22, 33, 44];
+
+    for runtime in runtimes.iter_mut() {
+        runtime
+            .drive_preprocessing_carry_compare_vec(&label, &values)
+            .expect("send preprocessing marker vector");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    assert!(matches!(
+        runtimes[0]
+            .drive_collect_preprocessing_carry_compare_vec(&label)
+            .expect("collect preprocessing marker vector")
+            .0,
+        PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+    ));
+
+    let exact_label = label.child("preprocessing_carry_compare");
+    assert_eq!(
+        ensure_prime_field_mpc_wire_log_contains_broadcast_vec(
+            runtimes[0].inner().runtime().wire_log(),
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCarryCompare,
+            &exact_label,
+            &config.parties,
+            &values,
+        ),
+        Ok(())
+    );
+
+    let mut wrong_values = values.clone();
+    wrong_values[0] ^= 1;
+    assert_eq!(
+        ensure_prime_field_mpc_wire_log_contains_broadcast_vec(
+            runtimes[0].inner().runtime().wire_log(),
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCarryCompare,
+            &exact_label,
+            &config.parties,
+            &wrong_values,
+        ),
+        Err(DkgError::PrimeFieldMpcTransport)
+    );
+    assert_eq!(
+        ensure_prime_field_mpc_wire_log_contains_broadcast_vec(
+            runtimes[0].inner().runtime().wire_log(),
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCarryCompare,
+            &root.child("wrong_label"),
+            &config.parties,
+            &values,
+        ),
+        Err(DkgError::PrimeFieldMpcTransport)
+    );
+    assert_eq!(
+        ensure_preprocessing_wire_log_private_circuits_for_release(
+            runtimes[0].inner().runtime().wire_log(),
+            &[root
+                .child("rho_gt_t")
+                .child("bit_0/candidate")
+                .child("bit_and")
+                .child("mul_layer")],
+            &[root
+                .child("bcc_sum_leq")
+                .child("add_input_0/bit_0/carry")
+                .child("bit_and")
+                .child("mul_layer")],
+        ),
+        Err(DkgError::BlockedPendingReview),
+        "statement marker phases alone are not private preprocessing circuits"
+    );
+}
+
+#[test]
+fn production_vector_runtime_preprocessing_release_gate_requires_private_circuit_layers() {
+    let config = config_for::<MlDsa65>();
+    let root = Power2RoundTranscriptLabel::preprocessing_root([0x8a; 32], [0x9b; 32])
+        .child("private_preprocessing_gate");
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let values = [0u32, 2, 1, 3];
+    let thresholds = vec![1, 1, 1, 1];
+    let bit_slopes = [[3, 5, 7, 11], [13, 17, 19, 23]];
+
+    let mut carry_bits_by_party = Vec::new();
+    for runtime in &runtimes {
+        let point = config
+            .interpolation_point::<MlDsa65>(runtime.local_party())
+            .expect("point");
+        let mut bits_by_bit = Vec::new();
+        for bit_idx in 0..2 {
+            let lanes = values
+                .iter()
+                .enumerate()
+                .map(|(lane_idx, value)| {
+                    let bit = ((value >> bit_idx) & 1) as Coeff;
+                    evaluate_shamir_polynomial::<MlDsa65>(
+                        &[bit, bit_slopes[bit_idx][lane_idx]],
+                        point,
+                    )
+                    .expect("carry bit lane")
+                })
+                .collect::<Vec<_>>();
+            bits_by_bit.push(
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &root.child(format!("carry_bit_{bit_idx}")),
+                        lanes,
+                    )
+                    .expect("carry bit handle"),
+            );
+        }
+        carry_bits_by_party.push(bits_by_bit);
+    }
+
+    let mut carry_states = runtimes
+        .iter()
+        .zip(&carry_bits_by_party)
+        .map(|(runtime, bits)| {
+            runtime
+                .start_preprocessing_carry_compare_gt_public_lanes_vec::<MlDsa65>(
+                    &config,
+                    bits,
+                    &thresholds,
+                    &root.child("carry_compare_private").child("rho_gt_t"),
+                )
+                .expect("carry compare state")
+        })
+        .collect::<Vec<_>>();
+    drive_public_comparison_states(&config, &mut runtimes, &mut carry_states);
+
+    let bcc_bit_values = [[0u32, 1, 1, 0], [0u32, 0, 1, 1]];
+    let bcc_bit_slopes = [[29, 31, 37, 41], [43, 47, 53, 59]];
+    let mut bcc_bits_by_party = Vec::new();
+    for runtime in &runtimes {
+        let point = config
+            .interpolation_point::<MlDsa65>(runtime.local_party())
+            .expect("point");
+        let mut bits = Vec::new();
+        for input_idx in 0..bcc_bit_values.len() {
+            let lanes = bcc_bit_values[input_idx]
+                .iter()
+                .enumerate()
+                .map(|(lane_idx, &bit)| {
+                    evaluate_shamir_polynomial::<MlDsa65>(
+                        &[bit as Coeff, bcc_bit_slopes[input_idx][lane_idx]],
+                        point,
+                    )
+                    .expect("bcc bit lane")
+                })
+                .collect::<Vec<_>>();
+            bits.push(
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &root.child(format!("bcc_bit_input_{input_idx}")),
+                        lanes,
+                    )
+                    .expect("bcc bit handle"),
+            );
+        }
+        bcc_bits_by_party.push(bits);
+    }
+
+    let mut bcc_states = runtimes
+        .iter()
+        .zip(&bcc_bits_by_party)
+        .map(|(runtime, bits)| {
+            runtime
+                .start_preprocessing_cef_bcc_bit_sum_leq_public_vec::<MlDsa65>(
+                    &config,
+                    bits,
+                    1,
+                    &root.child("cef_bcc_private").child("bcc_sum_leq"),
+                )
+                .expect("bcc threshold state")
+        })
+        .collect::<Vec<_>>();
+    drive_bit_sum_leq_states(&config, &mut runtimes, &mut bcc_states);
+
+    assert_eq!(
+        ensure_preprocessing_wire_log_private_circuits_for_release(
+            runtimes[0].inner().runtime().wire_log(),
+            &[root
+                .child("carry_compare_private")
+                .child("rho_gt_t")
+                .child("bit_1/candidate")
+                .child("bit_and")
+                .child("mul_layer")],
+            &[root
+                .child("cef_bcc_private")
+                .child("bcc_sum_leq")
+                .child("add_input_0/bit_0/carry")
+                .child("bit_and")
+                .child("mul_layer")],
+        ),
+        Ok(())
+    );
+    let evidence = runtimes[0].runtime_evidence().expect("runtime evidence");
+    assert!(evidence.coverage.preprocessing_carry_compare);
+    assert!(evidence.coverage.preprocessing_cef_bcc);
+    assert!(evidence.coverage.mul_vec);
+    assert_eq!(evidence.counters.scalar_mul_gates, 0);
+}
+
+#[test]
 fn production_vector_runtime_certifies_power2round_only_with_runtime_evidence() {
     let config = config();
     let lane_count = MlDsa65::K * MlDsa65::N;
@@ -12440,13 +14220,17 @@ fn production_vector_runtime_certifies_power2round_only_with_runtime_evidence() 
 
     let mut runtimes = test_production_vector_prime_field_runtimes(&config);
     drive_production_power2round_runtime_coverage(&mut runtimes, &label, &[0, 1, 1, 0]);
-    drive_full_power2round_private_phases_for_production_runtime(
+    drive_state_owned_power2round_release_marker_phases::<MlDsa65>(
+        &config,
+        &mut runtimes,
+        &label.child("state_owned_release_marker"),
+    );
+    drive_state_owned_power2round_add_t1_for_production_runtime::<MlDsa65>(
         &config,
         &mut runtimes,
         &label,
-        lane_count,
+        &expected_coeffs,
     );
-    drive_power2round_t1_bits_for_production_runtime(&mut runtimes, &label, &expected_coeffs);
     let wire_log = runtimes[0].inner().runtime().wire_log().clone();
     let mut runtime = recovered_production_vector_prime_field_runtime(&config, wire_log);
     let mut driver = ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
@@ -12479,9 +14263,1001 @@ fn production_vector_runtime_certifies_power2round_only_with_runtime_evidence() 
     let runtime_evidence = runtime_evidence.expect("runtime evidence attached");
     ensure_production_power2round_runtime_evidence_for_release(&runtime_evidence)
         .expect("release-capable runtime evidence");
+    ensure_power2round_wire_log_openings_allowed_for_release(runtime.inner().runtime().wire_log())
+        .expect("only masked C and t1 high-bit openings are present");
     assert!(runtime_evidence.coverage.covers_power2round());
     assert!(!runtime_evidence.counters.used_scalar_execution());
     assert!(driver.is_complete());
+}
+
+#[test]
+fn power2round_release_log_rejects_forbidden_open_phases() {
+    let config = config_for::<MlDsa65>();
+    let root = Power2RoundTranscriptLabel::root(&config, [0x6d; 32])
+        .child("release_power2round_opening_scan");
+    let mut allowed = test_production_vector_prime_field_runtimes(&config);
+    for runtime in &mut allowed {
+        runtime
+            .drive_power2round_masked_c_vec(&root, &[1, 2, 3])
+            .expect("masked C opening");
+        runtime
+            .drive_power2round_t1_bit_vec(&root, 0, &[0, 1, 0])
+            .expect("t1 high-bit opening");
+    }
+    ensure_power2round_wire_log_openings_allowed_for_release(
+        allowed[0].inner().runtime().wire_log(),
+    )
+    .expect("allowed Power2Round openings pass release scan");
+
+    let mut forbidden = test_production_vector_prime_field_runtimes(&config);
+    let share = forbidden[0]
+        .share_vec_from_local_lanes::<MlDsa65>(&config, &root.child("forbidden_t"), vec![7, 8, 9])
+        .expect("local share");
+    forbidden[0]
+        .drive_open_share_vec::<MlDsa65>(&config, &share, &root.child("forbidden_t"))
+        .expect("generic opening");
+    assert_eq!(
+        ensure_power2round_wire_log_openings_allowed_for_release(
+            forbidden[0].inner().runtime().wire_log()
+        ),
+        Err(DkgError::Power2RoundForbiddenOpeningInRelease)
+    );
+}
+
+#[test]
+fn power2round_rejects_forged_canonical_recovery_residual() {
+    let config = config_for::<MlDsa65>();
+    let lane_count = 4;
+    let label =
+        Power2RoundTranscriptLabel::root(&config, [0x6e; 32]).child("forged_canonical_recovery");
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let zeroes = vec![0; lane_count];
+    let forged = vec![1, 0, 0, 0];
+
+    for runtime in &mut runtimes {
+        runtime
+            .drive_power2round_wrap_compare_vec(&label, &zeroes)
+            .expect("send wrap compare residual");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    assert!(matches!(
+        runtimes[0]
+            .drive_collect_power2round_wrap_compare_vec(&label)
+            .expect("collect wrap compare residual")
+            .0,
+        PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+    ));
+    clear_production_vector_prime_field_queues(&mut runtimes);
+
+    for runtime in &mut runtimes {
+        runtime
+            .drive_power2round_subtractor_share_vec(&label, 0, &forged)
+            .expect("send forged subtractor residual");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    assert!(matches!(
+        runtimes[0]
+            .drive_collect_power2round_subtractor_share_vec(&label, 0)
+            .expect("collect forged subtractor residual")
+            .0,
+        PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+    ));
+
+    let wire_log = runtimes[0].inner().runtime().wire_log().clone();
+    let mut recovered = recovered_production_vector_prime_field_runtime(&config, wire_log);
+    let mut driver = ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+    driver
+        .accept_masked_openings(lane_count)
+        .expect("accept masked opening phase");
+
+    assert_eq!(
+        recovered.drive_collect_power2round_canonical_recovery_all_vec_and_advance::<MlDsa65>(
+            &mut driver,
+            &config,
+            &label,
+        ),
+        Err(DkgError::Power2RoundCanonicalityFailure)
+    );
+}
+
+#[test]
+fn power2round_rejects_forged_wrap_comparison_residual() {
+    let config = config_for::<MlDsa65>();
+    let lane_count = 4;
+    let label = Power2RoundTranscriptLabel::root(&config, [0x7b; 32]).child("forged_wrap_residual");
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let forged = vec![0, 1, 0, 0];
+
+    for runtime in &mut runtimes {
+        runtime
+            .drive_power2round_wrap_compare_vec(&label, &forged)
+            .expect("send forged wrap residual");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    assert!(matches!(
+        runtimes[0]
+            .drive_collect_power2round_wrap_compare_vec(&label)
+            .expect("collect forged wrap residual")
+            .0,
+        PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+    ));
+
+    let wire_log = runtimes[0].inner().runtime().wire_log().clone();
+    let mut recovered = recovered_production_vector_prime_field_runtime(&config, wire_log);
+    let mut driver = ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+    driver
+        .accept_masked_openings(lane_count)
+        .expect("accept masked opening phase");
+    assert_eq!(
+        recovered.drive_collect_power2round_canonical_recovery_all_vec_and_advance::<MlDsa65>(
+            &mut driver,
+            &config,
+            &label,
+        ),
+        Err(DkgError::Power2RoundCanonicalityFailure)
+    );
+}
+
+#[test]
+fn power2round_rejects_wrong_masked_opening_share() {
+    let config = config_for::<MlDsa65>();
+    let lane_count = 4;
+    let label = Power2RoundTranscriptLabel::root(&config, [0x7a; 32]).child("wrong_masked_opening");
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let mut local_state = {
+        let party = PartyId(1);
+        let point = config
+            .interpolation_point::<MlDsa65>(party)
+            .expect("interpolation point");
+        let t_share = ProductionPower2RoundLocalShareVector::new(party, point, vec![5; lane_count])
+            .expect("local t share");
+        let mask_share = ProductionPower2RoundLocalMaskShare::new(
+            mask_id,
+            ProductionPower2RoundLocalShareVector::new(party, point, vec![12; lane_count])
+                .expect("local mask share"),
+        )
+        .expect("mask share");
+        ProductionPower2RoundCircuitState::new(&label, t_share, mask_share).expect("circuit state")
+    };
+
+    for (party_idx, runtime) in runtimes.iter_mut().enumerate() {
+        let values = if party_idx == 2 {
+            vec![99; lane_count]
+        } else {
+            vec![17; lane_count]
+        };
+        runtime
+            .drive_power2round_masked_c_vec(&label, &values)
+            .expect("send masked C vector");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    let mut driver = ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+    assert_eq!(
+        local_state.drive_collect_masked_c_opening::<MlDsa65, _, _, _>(
+            &mut runtimes[0],
+            &mut driver,
+            &config,
+            &label,
+        ),
+        Err(DkgError::Power2RoundCanonicalityFailure)
+    );
+}
+
+#[test]
+fn power2round_circuit_state_rejects_malformed_mask_binding() {
+    let config = config_for::<MlDsa65>();
+    let lane_count = 4;
+    let label = Power2RoundTranscriptLabel::root(&config, [0x7f; 32]).child("mask_binding");
+    let wrong_label = label.child("wrong");
+    let party = PartyId(1);
+    let point = config
+        .interpolation_point::<MlDsa65>(party)
+        .expect("interpolation point");
+    let t_share = ProductionPower2RoundLocalShareVector::new(party, point, vec![5; lane_count])
+        .expect("local t share");
+    let wrong_label_mask = ProductionPower2RoundLocalMaskShare::new(
+        Power2RoundMaskBatchId::new(&wrong_label.child("mask"), lane_count),
+        ProductionPower2RoundLocalShareVector::new(party, point, vec![12; lane_count])
+            .expect("mask share"),
+    )
+    .expect("wrong-label mask shape");
+    assert_eq!(
+        ProductionPower2RoundCircuitState::new(&label, t_share.clone(), wrong_label_mask)
+            .map(|_| ()),
+        Err(DkgError::Power2RoundMaskTranscriptMismatch)
+    );
+
+    let wrong_shape_mask = ProductionPower2RoundLocalMaskShare::new(
+        Power2RoundMaskBatchId::new(&label.child("mask"), lane_count),
+        ProductionPower2RoundLocalShareVector::new(party, point, vec![12; lane_count - 1])
+            .expect("short mask share"),
+    );
+    assert_eq!(
+        wrong_shape_mask.map(|_| ()),
+        Err(DkgError::Power2RoundMaskShapeMismatch)
+    );
+}
+
+#[test]
+fn power2round_runtime_state_derives_wrap_comparison_from_mask_bits_and_opened_c() {
+    let config = config_for::<MlDsa65>();
+    let lane_count = 4;
+    let label =
+        Power2RoundTranscriptLabel::root(&config, [0x85; 32]).child("state_owned_wrap_compare");
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let t_values = [1, 2, 3, 4];
+    let mask_values = [0, 6, MlDsa65::Q - 1, 8];
+    let expected_c = t_values
+        .iter()
+        .copied()
+        .zip(mask_values.iter().copied())
+        .map(|(t, mask)| reduce_mod_q::<MlDsa65>(t + mask))
+        .collect::<Vec<_>>();
+    let expected_wrap = mask_values
+        .iter()
+        .copied()
+        .zip(expected_c.iter().copied())
+        .map(|(mask, c)| if mask > c { 1 } else { 0 })
+        .collect::<Vec<_>>();
+
+    let mut states = Vec::new();
+    for runtime in &runtimes {
+        let t = runtime
+            .public_lanes_share_vec::<MlDsa65>(&config, &label.child("t"), &t_values)
+            .expect("t handle");
+        let mask_value = runtime
+            .public_lanes_share_vec::<MlDsa65>(&config, &label.child("mask_value"), &mask_values)
+            .expect("mask value handle");
+        let mask_bits_by_bit = (0..23)
+            .map(|bit_idx| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &label.child(format!("mask_bit_{bit_idx}")),
+                        mask_values
+                            .iter()
+                            .map(|value| (((*value as u32) >> bit_idx) & 1) as Coeff)
+                            .collect(),
+                    )
+                    .expect("mask bit handle")
+            })
+            .collect::<Vec<_>>();
+        states.push(
+            ProductionPower2RoundRuntimeCircuitState::new::<MlDsa65, _, _, _>(
+                runtime,
+                &config,
+                t,
+                mask_value,
+                mask_bits_by_bit,
+            )
+            .expect("runtime-owned state"),
+        );
+    }
+
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let mut drivers =
+        vec![
+            ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+            runtimes.len()
+        ];
+    for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+        state
+            .drive_masked_c_opening::<MlDsa65, _, _, _>(runtime, &config, &label)
+            .expect("drive masked C");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    for idx in 0..runtimes.len() {
+        assert_eq!(
+            states[idx]
+                .collect_masked_c_opening::<MlDsa65, _, _, _>(
+                    &mut runtimes[idx],
+                    &mut drivers[idx],
+                    &config,
+                    &label,
+                )
+                .expect("collect masked C"),
+            ProductionPower2RoundVectorCollectResult::Collected(expected_c.clone())
+        );
+    }
+    clear_production_vector_prime_field_queues(&mut runtimes);
+
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        state
+            .start_wrap_comparison::<MlDsa65, _, _, _>(runtime, &config, &label)
+            .expect("start wrap comparison");
+    }
+    for _round in 0..128 {
+        if states.iter().all(|state| state.wrap().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].wrap().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 9_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_wrap_comparison_step::<MlDsa65, _, _, _, _>(
+                        &mut runtimes[idx],
+                        &config,
+                        &mut entropy,
+                    )
+                    .expect("drive wrap comparison step");
+            }
+        }
+        route_production_vector_private_messages(&mut runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].wrap().is_none() {
+                match states[idx]
+                    .collect_wrap_comparison_step::<MlDsa65, _, _, _>(&mut runtimes[idx], &config)
+                    .expect("collect wrap comparison step")
+                {
+                    ProductionVectorItMpcCollectResult::Collected { .. } => {}
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        panic!("wrap comparison did not collect: {status:?}")
+                    }
+                }
+            }
+        }
+        clear_production_vector_prime_field_queues(&mut runtimes);
+    }
+    assert!(states.iter().all(|state| state.wrap().is_some()));
+    let wrap_shares = states
+        .iter()
+        .map(|state| state.wrap().expect("wrap").share().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reconstruct_production_share_vec::<MlDsa65>(&config, &wrap_shares),
+        expected_wrap
+    );
+
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        state
+            .start_canonical_r_bit_recovery::<MlDsa65, _, _, _>(runtime, &config, &label)
+            .expect("start canonical R recovery");
+    }
+    for _round in 0..256 {
+        if states.iter().all(|state| state.r_bits_by_bit().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].r_bits_by_bit().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 15_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_canonical_r_recovery_step::<MlDsa65, _, _, _, _>(
+                        &mut runtimes[idx],
+                        &config,
+                        &label,
+                        &mut entropy,
+                    )
+                    .expect("drive canonical R recovery");
+            }
+        }
+        route_production_vector_private_messages(&mut runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].r_bits_by_bit().is_none() {
+                match states[idx]
+                    .collect_canonical_r_recovery_step::<MlDsa65, _, _, _>(
+                        &mut runtimes[idx],
+                        &config,
+                        &label,
+                    )
+                    .expect("collect canonical R recovery")
+                {
+                    ProductionVectorItMpcCollectResult::Collected { .. } => {}
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        panic!("canonical R recovery did not collect: {status:?}")
+                    }
+                }
+            }
+        }
+        clear_production_vector_prime_field_queues(&mut runtimes);
+    }
+    assert!(states.iter().all(|state| state.r_bits_by_bit().is_some()));
+    let recovered_values = (0..lane_count)
+        .map(|lane_idx| {
+            let mut value = 0;
+            for bit_idx in 0..23 {
+                let bit_shares = states
+                    .iter()
+                    .map(|state| {
+                        state.r_bits_by_bit().expect("r bits")[bit_idx]
+                            .share()
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                let bits = reconstruct_production_share_vec::<MlDsa65>(&config, &bit_shares);
+                value += bits[lane_idx] << bit_idx;
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovered_values, t_values);
+
+    for bit_idx in [0usize, 12, 22] {
+        for idx in 0..runtimes.len() {
+            let mut entropy = TestProductionVectorEntropy {
+                next: 20_000 + bit_idx as u64 * 1_000 + idx as u64 * 100,
+            };
+            states[idx]
+                .drive_r_bitness_product::<MlDsa65, _, _, _, _>(
+                    &mut runtimes[idx],
+                    &config,
+                    &label,
+                    bit_idx,
+                    &mut entropy,
+                )
+                .expect("drive R bitness product");
+        }
+        route_production_vector_private_messages(&mut runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            assert!(matches!(
+                states[idx]
+                    .collect_r_bitness_product::<MlDsa65, _, _, _>(
+                        &mut runtimes[idx],
+                        &config,
+                        &label,
+                        bit_idx
+                    )
+                    .expect("collect R bitness product"),
+                ProductionVectorItMpcCollectResult::Collected { .. }
+            ));
+        }
+        clear_production_vector_prime_field_queues(&mut runtimes);
+
+        for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+            state
+                .drive_r_bitness_zero_check::<MlDsa65, _, _, _>(runtime, &config, &label, bit_idx)
+                .expect("drive R bitness zero");
+        }
+        route_production_vector_broadcast_messages(
+            &mut runtimes,
+            0..config.parties.len(),
+            false,
+            None,
+        );
+        for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+            assert!(matches!(
+                state
+                    .collect_r_bitness_zero_check::<MlDsa65, _, _, _>(
+                        runtime, &config, &label, bit_idx
+                    )
+                    .expect("collect R bitness zero"),
+                ProductionVectorItMpcCollectResult::Collected { .. }
+            ));
+        }
+        clear_production_vector_prime_field_queues(&mut runtimes);
+    }
+
+    for (state, runtime) in states.iter_mut().zip(runtimes.iter()) {
+        state
+            .start_r_lt_q_check::<MlDsa65, _, _, _>(runtime, &config, &label)
+            .expect("start R < q check");
+    }
+    for _round in 0..128 {
+        if states.iter().all(|state| state.r_lt_q().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].r_lt_q().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 18_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_r_lt_q_check_step::<MlDsa65, _, _, _, _>(
+                        &mut runtimes[idx],
+                        &config,
+                        &mut entropy,
+                    )
+                    .expect("drive R < q check");
+            }
+        }
+        route_production_vector_private_messages(&mut runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].r_lt_q().is_none() {
+                match states[idx]
+                    .collect_r_lt_q_check_step::<MlDsa65, _, _, _>(&mut runtimes[idx], &config)
+                    .expect("collect R < q check")
+                {
+                    ProductionVectorItMpcCollectResult::Collected { .. } => {}
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        panic!("R < q check did not collect: {status:?}")
+                    }
+                }
+            }
+        }
+        clear_production_vector_prime_field_queues(&mut runtimes);
+    }
+    let lt_q_shares = states
+        .iter()
+        .map(|state| state.r_lt_q().expect("lt q").share().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reconstruct_production_share_vec::<MlDsa65>(&config, &lt_q_shares),
+        vec![1; lane_count]
+    );
+
+    for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+        state
+            .drive_r_bits_equal_t_check::<MlDsa65, _, _, _>(runtime, &config, &label)
+            .expect("drive R bits equality check");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+        assert!(matches!(
+            state
+                .collect_r_bits_equal_t_check::<MlDsa65, _, _, _>(runtime, &config, &label)
+                .expect("collect R bits equality check"),
+            ProductionVectorItMpcCollectResult::Collected { .. }
+        ));
+    }
+    clear_production_vector_prime_field_queues(&mut runtimes);
+}
+
+#[test]
+fn power2round_runtime_state_adds_4095_and_opens_only_t1_high_bits() {
+    let config = config_for::<MlDsa65>();
+    let lane_count = 4;
+    let label =
+        Power2RoundTranscriptLabel::root(&config, [0x86; 32]).child("state_owned_add4095_t1");
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let r_values = [0, 4095, 4096, 4097];
+    let expected_t1 = r_values
+        .iter()
+        .map(|&value| talus_core::power2round::<MlDsa65>(value).0)
+        .collect::<Vec<_>>();
+
+    let mut states = Vec::new();
+    for runtime in &runtimes {
+        let zero = vec![0; lane_count];
+        let t = runtime
+            .public_lanes_share_vec::<MlDsa65>(&config, &label.child("t"), &zero)
+            .expect("t handle");
+        let mask_value = runtime
+            .public_lanes_share_vec::<MlDsa65>(&config, &label.child("mask_value"), &zero)
+            .expect("mask value handle");
+        let mask_bits_by_bit = (0..23)
+            .map(|bit_idx| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &label.child(format!("mask_bit_{bit_idx}")),
+                        zero.clone(),
+                    )
+                    .expect("mask bit handle")
+            })
+            .collect::<Vec<_>>();
+        let mut state = ProductionPower2RoundRuntimeCircuitState::new::<MlDsa65, _, _, _>(
+            runtime,
+            &config,
+            t,
+            mask_value,
+            mask_bits_by_bit,
+        )
+        .expect("runtime-owned state");
+        let r_bits_by_bit = (0..23)
+            .map(|bit_idx| {
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &label.child(format!("r_bit_{bit_idx}")),
+                        r_values
+                            .iter()
+                            .map(|value| (((*value as u32) >> bit_idx) & 1) as Coeff)
+                            .collect(),
+                    )
+                    .expect("r bit handle")
+            })
+            .collect::<Vec<_>>();
+        state
+            .accept_recovered_r_bits::<MlDsa65, _, _, _>(runtime, &config, r_bits_by_bit)
+            .expect("install recovered r bits");
+        state
+            .start_add_4095::<MlDsa65, _, _, _>(runtime, &config, &label)
+            .expect("start add 4095");
+        states.push(state);
+    }
+
+    for _round in 0..64 {
+        if states.iter().all(|state| state.s_bits_by_bit().is_some()) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if states[idx].s_bits_by_bit().is_none() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 12_000 + idx as u64 * 1_000,
+                };
+                states[idx]
+                    .drive_add_4095_step::<MlDsa65, _, _, _, _>(
+                        &mut runtimes[idx],
+                        &config,
+                        &label,
+                        &mut entropy,
+                    )
+                    .expect("drive add 4095 step");
+            }
+        }
+        route_production_vector_private_messages(&mut runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if states[idx].s_bits_by_bit().is_none() {
+                match states[idx]
+                    .collect_add_4095_step::<MlDsa65, _, _, _>(&mut runtimes[idx], &config, &label)
+                    .expect("collect add 4095 step")
+                {
+                    ProductionVectorItMpcCollectResult::Collected { .. } => {}
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        panic!("add 4095 did not collect: {status:?}")
+                    }
+                }
+            }
+        }
+        clear_production_vector_prime_field_queues(&mut runtimes);
+    }
+    assert!(states.iter().all(|state| state.s_bits_by_bit().is_some()));
+
+    for bit_idx in 0..10 {
+        let expected_bits = expected_t1
+            .iter()
+            .map(|coefficient| ((coefficient >> bit_idx) & 1) as Coeff)
+            .collect::<Vec<_>>();
+        for (state, runtime) in states.iter().zip(runtimes.iter_mut()) {
+            state
+                .drive_t1_high_bit_opening::<MlDsa65, _, _, _>(runtime, &config, &label, bit_idx)
+                .expect("drive state-owned t1 opening");
+        }
+        route_production_vector_broadcast_messages(
+            &mut runtimes,
+            0..config.parties.len(),
+            false,
+            None,
+        );
+        let (status, opened) = runtimes[0]
+            .drive_collect_power2round_t1_bit_vec(&label, bit_idx)
+            .expect("collect state-owned t1 bit");
+        assert!(matches!(
+            status,
+            PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+        ));
+        let opened_shares = opened
+            .iter()
+            .map(|(party, lanes)| {
+                ProductionShareVec::new(
+                    *party,
+                    config
+                        .interpolation_point::<MlDsa65>(*party)
+                        .expect("point"),
+                    &label.child(format!("opened_t1_bit_{bit_idx}/party_{}", party.0)),
+                    lanes.clone(),
+                )
+                .expect("opened t1 share")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reconstruct_production_share_vec::<MlDsa65>(&config, &opened_shares),
+            expected_bits
+        );
+        clear_production_vector_prime_field_queues(&mut runtimes);
+    }
+}
+
+fn drive_power2round_canonical_zero_residuals_until_range(
+    config: &DkgConfig,
+    runtimes: &mut [TestProductionVectorPrimeFieldRuntime],
+    label: &Power2RoundTranscriptLabel,
+    lane_count: usize,
+) {
+    let zeroes = vec![0; lane_count];
+    for runtime in runtimes.iter_mut() {
+        runtime
+            .drive_power2round_wrap_compare_vec(label, &zeroes)
+            .expect("send wrap compare vector");
+    }
+    route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+    assert!(matches!(
+        runtimes[0]
+            .drive_collect_power2round_wrap_compare_vec(label)
+            .expect("collect wrap compare vector")
+            .0,
+        PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+    ));
+    clear_production_vector_prime_field_queues(runtimes);
+    for bit_idx in 0..24 {
+        for runtime in runtimes.iter_mut() {
+            runtime
+                .drive_power2round_subtractor_share_vec(label, bit_idx, &zeroes)
+                .expect("send subtractor vector");
+        }
+        route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+        assert!(matches!(
+            runtimes[0]
+                .drive_collect_power2round_subtractor_share_vec(label, bit_idx)
+                .expect("collect subtractor vector")
+                .0,
+            PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+        ));
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+    for bit_idx in 0..23 {
+        for runtime in runtimes.iter_mut() {
+            runtime
+                .drive_power2round_canonical_bitness_check_vec(label, bit_idx, &zeroes)
+                .expect("send canonical bitness vector");
+        }
+        route_production_vector_broadcast_messages(runtimes, 0..config.parties.len(), false, None);
+        assert!(matches!(
+            runtimes[0]
+                .drive_collect_power2round_canonical_bitness_check_vec(label, bit_idx)
+                .expect("collect canonical bitness vector")
+                .0,
+            PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+        ));
+        clear_production_vector_prime_field_queues(runtimes);
+    }
+}
+
+#[test]
+fn power2round_rejects_noncanonical_r_range_residual() {
+    let config = config_for::<MlDsa65>();
+    let lane_count = 4;
+    let label = Power2RoundTranscriptLabel::root(&config, [0x7c; 32]).child("noncanonical_r_range");
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    drive_power2round_canonical_zero_residuals_until_range(
+        &config,
+        &mut runtimes,
+        &label,
+        lane_count,
+    );
+    let forged = vec![0, 0, 1, 0];
+    for runtime in &mut runtimes {
+        runtime
+            .drive_power2round_canonical_range_check_vec(&label, &forged)
+            .expect("send forged range residual");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    assert!(matches!(
+        runtimes[0]
+            .drive_collect_power2round_canonical_range_check_vec(&label)
+            .expect("collect forged range residual")
+            .0,
+        PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+    ));
+
+    let wire_log = runtimes[0].inner().runtime().wire_log().clone();
+    let mut recovered = recovered_production_vector_prime_field_runtime(&config, wire_log);
+    let mut driver = ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+    driver
+        .accept_masked_openings(lane_count)
+        .expect("accept masked opening phase");
+    assert_eq!(
+        recovered.drive_collect_power2round_canonical_recovery_all_vec_and_advance::<MlDsa65>(
+            &mut driver,
+            &config,
+            &label,
+        ),
+        Err(DkgError::Power2RoundCanonicalityFailure)
+    );
+}
+
+#[test]
+fn power2round_rejects_forged_add4095_carry_residual() {
+    let config = config_for::<MlDsa65>();
+    let lane_count = 4;
+    let label = Power2RoundTranscriptLabel::root(&config, [0x7d; 32]).child("forged_add4095_carry");
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let zeroes = vec![0; lane_count];
+    let forged = vec![0, 0, 0, 1];
+
+    for runtime in &mut runtimes {
+        runtime
+            .drive_power2round_add4095_share_vec(&label, 0, &forged)
+            .expect("send forged add4095 residual");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    assert!(matches!(
+        runtimes[0]
+            .drive_collect_power2round_add4095_share_vec(&label, 0)
+            .expect("collect forged add4095 residual")
+            .0,
+        PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+    ));
+    clear_production_vector_prime_field_queues(&mut runtimes);
+    for bit_idx in 1..23 {
+        for runtime in &mut runtimes {
+            runtime
+                .drive_power2round_add4095_share_vec(&label, bit_idx, &zeroes)
+                .expect("send add4095 residual");
+        }
+        route_production_vector_broadcast_messages(
+            &mut runtimes,
+            0..config.parties.len(),
+            false,
+            None,
+        );
+        assert!(matches!(
+            runtimes[0]
+                .drive_collect_power2round_add4095_share_vec(&label, bit_idx)
+                .expect("collect add4095 residual")
+                .0,
+            PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+        ));
+        clear_production_vector_prime_field_queues(&mut runtimes);
+    }
+
+    let wire_log = runtimes[0].inner().runtime().wire_log().clone();
+    let mut recovered = recovered_production_vector_prime_field_runtime(&config, wire_log);
+    let mut driver = ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+    driver
+        .accept_masked_openings(lane_count)
+        .expect("accept masked opening phase");
+    driver
+        .accept_canonical_bit_recovery(lane_count)
+        .expect("accept canonical phase");
+    assert_eq!(
+        recovered.drive_collect_power2round_add4095_all_vec_and_advance::<MlDsa65>(
+            &mut driver,
+            &config,
+            &label,
+        ),
+        Err(DkgError::Power2RoundCanonicalityFailure)
+    );
+}
+
+#[test]
+fn power2round_rejects_duplicate_phase_label_collection() {
+    let config = config_for::<MlDsa65>();
+    let label =
+        Power2RoundTranscriptLabel::root(&config, [0x7e; 32]).child("duplicate_phase_label");
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let zeroes = vec![0; 4];
+    for runtime in &mut runtimes {
+        runtime
+            .drive_power2round_wrap_compare_vec(&label, &zeroes)
+            .expect("send wrap residual");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    assert!(matches!(
+        runtimes[0]
+            .drive_collect_power2round_wrap_compare_vec(&label)
+            .expect("first collect")
+            .0,
+        PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+    ));
+    assert_eq!(
+        runtimes[0].drive_collect_power2round_wrap_compare_vec(&label),
+        Err(DkgError::PrimeFieldMpcReplayDetected)
+    );
+}
+
+#[test]
+fn power2round_rejects_non_bit_t1_opening() {
+    let config = config_for::<MlDsa65>();
+    let lane_count = 4;
+    let label = Power2RoundTranscriptLabel::root(&config, [0x6f; 32]).child("bad_t1_opening");
+    let assembly_label = PublicKeyAssemblyLabel::new(&config, [0x6f; 32]);
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let invalid_bits = vec![2; lane_count];
+
+    for runtime in &mut runtimes {
+        runtime
+            .drive_power2round_t1_bit_vec(&label, 0, &invalid_bits)
+            .expect("send invalid t1 bit vector");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..config.parties.len(), false, None);
+    assert!(matches!(
+        runtimes[0]
+            .drive_collect_power2round_t1_bit_vec(&label, 0)
+            .expect("collect invalid t1 bit vector")
+            .0,
+        PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+    ));
+
+    let wire_log = runtimes[0].inner().runtime().wire_log().clone();
+    let mut recovered = recovered_production_vector_prime_field_runtime(&config, wire_log);
+    let mut driver = ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+    driver
+        .accept_masked_openings(lane_count)
+        .expect("accept masked opening phase");
+    driver
+        .accept_canonical_bit_recovery(lane_count)
+        .expect("accept canonical phase");
+    driver
+        .accept_add_round_constant(lane_count)
+        .expect("accept add4095 phase");
+
+    assert_eq!(
+        recovered.drive_collect_power2round_t1_bits_and_certify::<MlDsa65>(
+            &mut driver,
+            &config,
+            assembly_label,
+            &label,
+        ),
+        Err(DkgError::Power2RoundInvalidOpenedBit)
+    );
+}
+
+fn assert_power2round_performance_gate_for_suite<P: MlDsaParams>(seed: u8) {
+    let config = config_for::<P>();
+    let lane_count = P::K * P::N;
+    let label = Power2RoundTranscriptLabel::root(&config, [seed; 32])
+        .child("all_suite_vector_performance_gate");
+    let assembly_label = PublicKeyAssemblyLabel::new(&config, [seed; 32]);
+    let mask_id = Power2RoundMaskBatchId::new(&label.child("mask"), lane_count);
+    let expected_coeffs = (0..lane_count)
+        .map(|index| ((index * 11 + usize::from(seed)) as u16) & 1023)
+        .collect::<Vec<_>>();
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+
+    drive_production_power2round_runtime_coverage(&mut runtimes, &label, &[0, 1, 1, 0]);
+    drive_state_owned_power2round_release_marker_phases::<P>(
+        &config,
+        &mut runtimes,
+        &label.child("all_suite_state_owned_marker"),
+    );
+    drive_state_owned_power2round_add_t1_for_production_runtime::<P>(
+        &config,
+        &mut runtimes,
+        &label,
+        &expected_coeffs,
+    );
+
+    let wire_log = runtimes[0].inner().runtime().wire_log().clone();
+    let mut recovered = recovered_production_vector_prime_field_runtime(&config, wire_log);
+    let mut driver = ProductionPower2RoundPerPartyDriver::resume_after_precomputed_masks(mask_id);
+    driver
+        .accept_masked_openings(lane_count)
+        .expect("accept masked opening phase");
+    driver
+        .accept_canonical_bit_recovery(lane_count)
+        .expect("accept canonical phase");
+    driver
+        .accept_add_round_constant(lane_count)
+        .expect("accept add4095 phase");
+    let output = match recovered
+        .drive_collect_power2round_t1_bits_and_certify::<P>(
+            &mut driver,
+            &config,
+            assembly_label,
+            &label,
+        )
+        .expect("collect production Power2Round output")
+    {
+        ProductionPower2RoundVectorCollectResult::Collected(output) => output,
+        ProductionPower2RoundVectorCollectResult::Waiting(statuses) => {
+            panic!("unexpected wait: {statuses:?}")
+        }
+    };
+    let (t1, _, runtime_evidence) = output.into_parts();
+    assert_eq!(t1.coeffs, expected_coeffs);
+    let runtime_evidence = runtime_evidence.expect("runtime evidence");
+    ensure_production_power2round_runtime_evidence_for_release(&runtime_evidence)
+        .expect("release-capable runtime evidence");
+    let counters = runtime_evidence.counters;
+    assert!(
+        counters.rounds <= 192,
+        "Power2Round must follow vector circuit depth, not coefficient count; got {} rounds for {} lanes",
+        counters.rounds,
+        lane_count
+    );
+    assert!(
+        counters.rounds < lane_count as u64,
+        "scalar-per-coefficient execution would scale rounds with lanes"
+    );
+    assert!(counters.vector_lanes >= lane_count as u64);
+    assert!(!counters.used_scalar_execution());
+}
+
+#[test]
+fn power2round_performance_gates_all_suites_are_vectorized() {
+    assert_power2round_performance_gate_for_suite::<MlDsa44>(0x70);
+    assert_power2round_performance_gate_for_suite::<MlDsa65>(0x71);
+    assert_power2round_performance_gate_for_suite::<MlDsa87>(0x72);
 }
 
 #[test]
@@ -14176,25 +16952,23 @@ fn production_native_dkg_assembly_all_suites_release_valid() {
         let assembly_label = shared_t.assembly_label;
         let t_share = local_share_vec_from_shared_t::<P>(&config, &shared_t).expect("t share vec");
         let local_backend = LocalPrimeFieldMpcBackend::new([0xa5; 32]);
-        let mut power2round = ProductionItMpcPower2RoundBackend::new(
+        let mut reference_power2round = ProductionItMpcPower2RoundBackend::new(
             local_backend,
             InMemoryPower2RoundMaskUseLog::default(),
         );
-        let mut power2round_output = power2round
+        let reference_power2round_output = reference_power2round
             .power2round_t1_from_share_vec::<P>(&config, assembly_label, t_share)
-            .expect("production power2round output");
-        power2round_output.runtime_evidence =
-            Some(complete_phase3_runtime_evidence_for_release_test());
+            .expect("reference power2round output");
+        let mut power2round_output =
+            production_power2round_output_with_runtime_evidence_for_test::<P>(
+                &config,
+                rho,
+                "all_suite_native_dkg_assembly_power2round",
+                &reference_power2round_output.t1.coeffs,
+            );
         let expected_t1 = power2round_output.t1.bytes.clone();
 
-        let (public, mut certificate) = assemble_public_output_from_production_power2round(
-            &config,
-            rho,
-            &config.parties,
-            power2round_output,
-        )
-        .expect("production public output");
-        certificate.setup = Some(DkgSetupTranscriptCertificate {
+        let setup = DkgSetupTranscriptCertificate {
             setup_backend_id: DkgSetupBackendId::ProductionInformationTheoretic,
             sampler_s1_hash: [0xa1; 32],
             sampler_s2_hash: [0xa2; 32],
@@ -14208,10 +16982,44 @@ fn production_native_dkg_assembly_all_suites_release_valid() {
             accepted_dealers: config.parties.clone(),
             rejected_dealers: Vec::new(),
             release_blockers: Vec::new(),
-        });
+        };
+        power2round_output = power2round_output.with_setup_input_hash(
+            production_power2round_setup_input_hash(&config, rho, &setup),
+        );
+
+        let (public, mut certificate) = assemble_public_output_from_production_power2round(
+            &config,
+            rho,
+            &config.parties,
+            power2round_output,
+        )
+        .expect("production public output");
+        certificate.power2round_setup_input_hash = Some(production_power2round_setup_input_hash(
+            &config, rho, &setup,
+        ));
+        certificate.setup = Some(setup);
         let key_packages =
-            dkg_key_packages_from_public_output(&public, s1_packages, certificate.clone())
+            dkg_key_packages_from_public_output(&public, s1_packages.clone(), certificate.clone())
                 .expect("release-valid key packages");
+        let mut mismatched_certificate = certificate.clone();
+        mismatched_certificate.power2round_setup_input_hash = Some([0xee; 32]);
+        let mismatched_packages = dkg_key_packages_from_public_output(
+            &public,
+            s1_packages,
+            mismatched_certificate.clone(),
+        )
+        .expect("mismatched key packages");
+        assert_eq!(
+            ProductionNativeDkgAssemblyOutput::new(
+                public.clone(),
+                mismatched_packages,
+                mismatched_certificate,
+                config.parties.clone(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(DkgError::Power2RoundEvidenceRequired)
+        );
         let output = ProductionNativeDkgAssemblyOutput::new(
             public,
             key_packages,
@@ -14858,12 +17666,99 @@ fn production_it_vss_artifacts_for_release_test(
     )
 }
 
+fn finalize_production_it_vss_artifacts_for_release_test(
+    config: &DkgConfig,
+    public_commitments: &[ItVssPublicCommitment],
+    coin_shares: &[ProductionItVssPublicCoinShare],
+    audit_records: &[ProductionItVssAuditRecord],
+    consistency_records: &[ProductionItVssConsistencyRecord],
+) -> (Vec<ItVssPublicCommitment>, ItVssComplaintResolution) {
+    let params = ProductionItVssSecurityParams {
+        audit_tags: 1,
+        retained_tags: 1,
+        consistency_rounds: 1,
+        ..ProductionItVssSecurityParams::default()
+    };
+    let public_commitments = public_commitments
+        .iter()
+        .map(|commitment| {
+            let shares = coin_shares
+                .iter()
+                .filter(|share| share.label_hash == commitment.label_hash)
+                .copied()
+                .collect::<Vec<_>>();
+            let coin_hash =
+                production_it_vss_public_coin_transcript(config, commitment.label_hash, &shares)
+                    .expect("public coin transcript")
+                    .coin_hash;
+            let audit_for_key = audit_records
+                .iter()
+                .filter(|record| {
+                    record.dealer == commitment.dealer && record.label_hash == commitment.label_hash
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let consistency_for_key = consistency_records
+                .iter()
+                .filter(|record| {
+                    record.dealer == commitment.dealer && record.label_hash == commitment.label_hash
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let vector_len = consistency_for_key
+                .first()
+                .map(|record| {
+                    opened_vector_consistency_masked_eval_len(&record.masked_eval)
+                        .expect("masked eval len")
+                })
+                .expect("consistency record");
+            ItVssPublicCommitment {
+                backend_id: commitment.backend_id,
+                dealer: commitment.dealer,
+                label_hash: commitment.label_hash,
+                public_metadata_hash: production_it_vss_metadata_hash(
+                    commitment.label_hash,
+                    commitment.dealer,
+                    vector_len,
+                    params,
+                    Some(coin_hash),
+                    hash_production_it_vss_audit_records(&audit_for_key),
+                    hash_production_it_vss_consistency_records(&consistency_for_key),
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let complaint_hash = hash_dkg_complaint_payloads(&[]);
+    let certificates = public_commitments
+        .iter()
+        .map(|commitment| VerifiedItVssSharingCertificate {
+            backend_id: ItVssBackendId::ProductionInformationChecking,
+            dealer: commitment.dealer,
+            label_hash: commitment.label_hash,
+            accepted_receivers: config.parties.clone(),
+            complaint_hash,
+            transcript_hash: hash_it_vss_public_commitment(commitment),
+        })
+        .collect::<Vec<_>>();
+    (
+        public_commitments,
+        ItVssComplaintResolution {
+            accepted_dealers: config.parties.clone(),
+            rejected_dealers: Vec::new(),
+            complaints: Vec::new(),
+            certificates,
+        },
+    )
+}
+
 fn production_it_vss_public_flow_for_release_test(
     config: &DkgConfig,
     public_commitments: &[ItVssPublicCommitment],
 ) -> (
     Vec<ItVssPublicPrecommitment>,
     Vec<ProductionItVssPublicCoinShare>,
+    Vec<ProductionItVssAuditRecord>,
+    Vec<ProductionItVssConsistencyRecord>,
 ) {
     let precommitments = public_commitments
         .iter()
@@ -14887,7 +17782,95 @@ fn production_it_vss_public_flow_for_release_test(
             })
         })
         .collect::<Vec<_>>();
-    (precommitments, coin_shares)
+    let audit_records = public_commitments
+        .iter()
+        .flat_map(|commitment| {
+            config.parties.iter().copied().flat_map(move |holder| {
+                config.parties.iter().copied().map(move |receiver| {
+                    let audited = AuditedVectorReceiverTag::new(
+                        holder,
+                        receiver,
+                        0,
+                        ItVssFq::nonzero(1 + commitment.dealer.0 as u32)
+                            .expect("nonzero audit tag multiplier"),
+                        vec![ItVssFq::new(
+                            1000 + commitment.dealer.0 as u32 + holder.0 as u32 + receiver.0 as u32,
+                        )
+                        .expect("audit tag value")],
+                    )
+                    .expect("audited vector receiver tag");
+                    let audited_receiver_tag = encode_it_vss_audited_vector_receiver_tag(&audited);
+                    ProductionItVssAuditRecord {
+                        dealer: commitment.dealer,
+                        holder,
+                        receiver,
+                        label_hash: commitment.label_hash,
+                        tag_index: 0,
+                        audited_receiver_tag_hash: hash_opened_audited_vector_receiver_tag_payload(
+                            &audited_receiver_tag,
+                        ),
+                        audited_receiver_tag,
+                        discard_after_audit: DiscardAfterAudit,
+                    }
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let consistency_records = public_commitments
+        .iter()
+        .flat_map(|commitment| {
+            let coin_shares_for_commitment = coin_shares.clone();
+            config.parties.iter().copied().map(move |holder| {
+                let shares = coin_shares_for_commitment
+                    .iter()
+                    .filter(|share| share.label_hash == commitment.label_hash)
+                    .copied()
+                    .collect::<Vec<_>>();
+                let coin_hash = production_it_vss_public_coin_transcript(
+                    config,
+                    commitment.label_hash,
+                    &shares,
+                )
+                .expect("public coin transcript")
+                .coin_hash;
+                let challenge_bit = production_it_vss_consistency_challenge_bit_with_coin(
+                    commitment.label_hash,
+                    Some(coin_hash),
+                    0,
+                );
+                let masked_values =
+                    vec![
+                        ItVssFq::new(2000 + commitment.dealer.0 as u32 + holder.0 as u32)
+                            .expect("masked eval value"),
+                    ];
+                let masked_eval = encode_opened_vector_consistency_masked_eval_payload(
+                    commitment.dealer,
+                    holder,
+                    commitment.label_hash,
+                    0,
+                    challenge_bit,
+                    &masked_values,
+                );
+                ProductionItVssConsistencyRecord {
+                    dealer: commitment.dealer,
+                    holder,
+                    label_hash: commitment.label_hash,
+                    round: 0,
+                    challenge_bit,
+                    masked_eval_hash: hash_opened_vector_consistency_masked_eval_payload(
+                        &masked_eval,
+                    ),
+                    masked_eval,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        precommitments,
+        coin_shares,
+        audit_records,
+        consistency_records,
+    )
 }
 
 fn persist_complete_it_vss_phase_cursors_for_release(
@@ -14909,6 +17892,18 @@ fn persist_complete_it_vss_phase_cursors_for_release(
         ),
         (
             ProductionItVssComplaintPhase::BroadcastPublicCommitments,
+            DkgTransportPhase::ItVssArtifact,
+            DkgSetupPhaseCursorState::Collected,
+            config.parties.len() * 2,
+        ),
+        (
+            ProductionItVssComplaintPhase::BroadcastPublicAudits,
+            DkgTransportPhase::ItVssArtifact,
+            DkgSetupPhaseCursorState::Collected,
+            config.parties.len() * 2,
+        ),
+        (
+            ProductionItVssComplaintPhase::BroadcastConsistencyRecords,
             DkgTransportPhase::ItVssArtifact,
             DkgSetupPhaseCursorState::Collected,
             config.parties.len() * 2,
@@ -14985,10 +17980,14 @@ fn release_test_key_packages() -> Vec<DkgKeyPackage> {
         &public_t1,
     );
     certificate.power2round_runtime = Some(complete_phase3_runtime_evidence_for_release_test());
-    certificate.setup = Some(test_setup_certificate(
+    let setup = test_setup_certificate(
         DkgSetupBackendId::ProductionInformationTheoretic,
         Vec::new(),
+    );
+    certificate.power2round_setup_input_hash = Some(production_power2round_setup_input_hash(
+        &config, output.rho, &setup,
     ));
+    certificate.setup = Some(setup);
     dkg_key_packages_from_public_output(&output, s1_packages, certificate).expect("key packages")
 }
 
@@ -15051,6 +18050,7 @@ fn release_guard_rejects_incomplete_dkg_certificates() {
         power2round: test_power2round_evidence(Power2RoundBackendId::ProductionItMpc),
         power2round_runtime: Some(complete_phase3_runtime_evidence_for_release_test()),
         setup: None,
+        power2round_setup_input_hash: None,
     };
     assert_eq!(
         ensure_dkg_certificate_allowed_for_release(&missing_setup),
@@ -15064,6 +18064,7 @@ fn release_guard_rejects_incomplete_dkg_certificates() {
             DkgSetupBackendId::ProductionInformationTheoretic,
             Vec::new(),
         )),
+        power2round_setup_input_hash: None,
     };
     assert_eq!(
         ensure_dkg_certificate_allowed_for_release(&missing_runtime),
@@ -15077,6 +18078,7 @@ fn release_guard_rejects_incomplete_dkg_certificates() {
             DkgSetupBackendId::InProcessScaffold,
             Vec::new(),
         )),
+        power2round_setup_input_hash: None,
     };
     assert_eq!(
         ensure_dkg_certificate_allowed_for_release(&scaffold_setup),
@@ -15092,6 +18094,7 @@ fn release_guard_rejects_incomplete_dkg_certificates() {
         power2round: test_power2round_evidence(Power2RoundBackendId::ProductionItMpc),
         power2round_runtime: Some(complete_phase3_runtime_evidence_for_release_test()),
         setup: Some(scaffold_it_vss_setup),
+        power2round_setup_input_hash: None,
     };
     assert_eq!(
         ensure_dkg_certificate_allowed_for_release(&scaffold_it_vss),
@@ -15105,6 +18108,7 @@ fn release_guard_rejects_incomplete_dkg_certificates() {
             DkgSetupBackendId::ProductionInformationTheoretic,
             vec![DkgReleaseBlocker::ExternalReview],
         )),
+        power2round_setup_input_hash: None,
     };
     assert_eq!(
         ensure_dkg_certificate_allowed_for_release(&blocked_setup),
@@ -15118,6 +18122,7 @@ fn release_guard_rejects_incomplete_dkg_certificates() {
             DkgSetupBackendId::ProductionInformationTheoretic,
             Vec::new(),
         )),
+        power2round_setup_input_hash: None,
     };
     assert_eq!(
         ensure_dkg_certificate_allowed_for_release(&simulator_power2round),
@@ -15131,6 +18136,7 @@ fn release_guard_rejects_incomplete_dkg_certificates() {
             DkgSetupBackendId::ProductionInformationTheoretic,
             Vec::new(),
         )),
+        power2round_setup_input_hash: None,
     };
     assert_eq!(
         ensure_dkg_certificate_allowed_for_release(&production),
@@ -15350,9 +18356,16 @@ fn release_guard_checks_dkg_key_package_sets() {
 #[test]
 fn native_dkg_release_context_gate_composes_packages_logs_cursors_and_transport() {
     let config = config();
-    let (public_commitments, resolution) = production_it_vss_artifacts_for_release_test(&config);
-    let (precommitments, coin_shares) =
+    let (public_commitments, _) = production_it_vss_artifacts_for_release_test(&config);
+    let (precommitments, coin_shares, audit_records, consistency_records) =
         production_it_vss_public_flow_for_release_test(&config, &public_commitments);
+    let (public_commitments, resolution) = finalize_production_it_vss_artifacts_for_release_test(
+        &config,
+        &public_commitments,
+        &coin_shares,
+        &audit_records,
+        &consistency_records,
+    );
     let public_hash = hash_it_vss_public_artifacts(&public_commitments);
     let resolution_hash = hash_it_vss_complaint_resolution(&resolution);
 
@@ -15361,6 +18374,9 @@ fn native_dkg_release_context_gate_composes_packages_logs_cursors_and_transport(
         let setup = package.certificate.setup.as_mut().expect("setup");
         setup.it_vss_public_artifact_hash = public_hash;
         setup.it_vss_resolution_hash = resolution_hash;
+        package.certificate.power2round_setup_input_hash = Some(
+            production_power2round_setup_input_hash(&config, package.rho, setup),
+        );
     }
 
     let mut runtime = test_logged_dkg_transport_runtimes(&config)
@@ -15376,6 +18392,12 @@ fn native_dkg_release_context_gate_composes_packages_logs_cursors_and_transport(
     runtime
         .persist_it_vss_artifacts_logged(&public_commitments, &resolution)
         .expect("persist release artifacts");
+    runtime
+        .persist_it_vss_public_audit_records_logged(&audit_records)
+        .expect("persist public audit records");
+    runtime
+        .persist_it_vss_public_consistency_records_logged(&consistency_records)
+        .expect("persist public consistency records");
 
     let mut cursors = InMemoryDkgSetupPhaseCursorLog::default();
     persist_complete_it_vss_phase_cursors_for_release(&mut cursors, &config);
@@ -16406,6 +19428,14 @@ fn production_information_checking_vss_backend_shares_vectors_and_rejects_tamper
     assert_eq!(complaint.dealer, dealer);
     assert_eq!(complaint.receiver, tampered.receiver);
     assert!(!format!("{complaint:?}").contains("1, 2, 3, 4"));
+    assert_eq!(
+        backend.resolve_complaints::<MlDsa44>(
+            &config,
+            &public_commitments,
+            core::slice::from_ref(&complaint),
+        ),
+        Err(DkgError::ItVssAbortNoBlame)
+    );
 
     let mut tampered_gamma = output.deliveries[0].clone();
     let tampered_gamma_receiver = tampered_gamma.receiver;
@@ -17752,6 +20782,8 @@ fn production_it_vss_complaint_phase_skeleton_is_ordered() {
             ProductionItVssComplaintPhase::BroadcastPublicPrecommitments,
             ProductionItVssComplaintPhase::BroadcastPublicCoins,
             ProductionItVssComplaintPhase::BroadcastPublicCommitments,
+            ProductionItVssComplaintPhase::BroadcastPublicAudits,
+            ProductionItVssComplaintPhase::BroadcastConsistencyRecords,
             ProductionItVssComplaintPhase::DeliverPrivateShares,
             ProductionItVssComplaintPhase::VerifyPrivateDeliveries,
             ProductionItVssComplaintPhase::BroadcastComplaints,
@@ -18751,4 +21783,40 @@ fn production_dkg_source_gates_public_a_s1_artifacts() {
         !error.contains("As1"),
         "DKG error/transcript code must not model public A*s1 commitments"
     );
+}
+
+#[test]
+fn production_vector_runtime_records_preprocessing_phase_coverage() {
+    let config = config();
+    let root = Power2RoundTranscriptLabel::root(&config, [0x91; 32]);
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let values = vec![1, 2, 3, 4];
+
+    for runtime in runtimes.iter_mut() {
+        runtime
+            .drive_preprocessing_masked_broadcast_vec(
+                &root.child("preprocessing/masked_broadcast"),
+                &values,
+            )
+            .expect("drive preprocessing masked broadcast");
+        runtime
+            .drive_preprocessing_carry_compare_vec(
+                &root.child("preprocessing/carry_compare"),
+                &[0, 0, 0, 0],
+            )
+            .expect("drive preprocessing carry compare");
+        runtime
+            .drive_preprocessing_cef_bcc_vec(&root.child("preprocessing/cef_bcc"), &[0, 0, 0, 0])
+            .expect("drive preprocessing cef bcc");
+    }
+    route_production_vector_broadcast_messages(&mut runtimes, 0..3, false, None);
+
+    let evidence = runtimes[0].runtime_evidence().expect("runtime evidence");
+    assert!(evidence.coverage.preprocessing_masked_broadcast);
+    assert!(evidence.coverage.preprocessing_carry_compare);
+    assert!(evidence.coverage.preprocessing_cef_bcc);
+    assert!(evidence.coverage.open_many_checked);
+    assert!(evidence.coverage.assert_zero_vec);
+    assert_eq!(evidence.counters.scalar_openings, 0);
+    assert_eq!(evidence.counters.scalar_assert_zero, 0);
 }

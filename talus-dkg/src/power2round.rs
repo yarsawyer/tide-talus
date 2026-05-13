@@ -157,6 +157,14 @@ pub struct ProductionPower2RoundOutput {
     /// assembly requires this field to be present in the final public
     /// certificate.
     pub runtime_evidence: Option<ProductionVectorItMpcRuntimeEvidence>,
+    /// Optional hash binding this Power2Round output to the setup transcript
+    /// that produced `[t] = A[s1] + [s2]`.
+    ///
+    /// Generic correctness tests may omit this. Release-valid native DKG
+    /// assembly requires it to match the recovered production setup
+    /// certificate, preventing a valid `t1` output for the same config/rho from
+    /// being attached to unrelated sampler/IT-VSS setup logs.
+    pub setup_input_hash: Option<[u8; 32]>,
 }
 
 impl ProductionPower2RoundOutput {
@@ -204,7 +212,20 @@ impl ProductionPower2RoundOutput {
             t1,
             evidence,
             runtime_evidence,
+            setup_input_hash: None,
         })
+    }
+
+    /// Attaches the setup-input binding hash expected by release-valid native
+    /// DKG assembly.
+    pub fn with_setup_input_hash(mut self, setup_input_hash: [u8; 32]) -> Self {
+        self.setup_input_hash = Some(setup_input_hash);
+        self
+    }
+
+    /// Returns the setup-input binding hash, when present.
+    pub const fn setup_input_hash(&self) -> Option<[u8; 32]> {
+        self.setup_input_hash
     }
 
     /// Splits the validated public output into its parts.
@@ -299,6 +320,15 @@ impl Power2RoundTranscriptLabel {
         }
     }
 
+    /// Creates a root label for preprocessing vector IT-MPC phases.
+    pub fn preprocessing_root(session_id: [u8; 32], transcript_hash: [u8; 32]) -> Self {
+        Self {
+            path: format!(
+                "TALUS-Preprocessing-Vector-IT-MPC-v1/session_{session_id:02x?}/transcript_{transcript_hash:02x?}"
+            ),
+        }
+    }
+
     /// Derives a child label.
     pub fn child(&self, name: impl AsRef<str>) -> Self {
         Self {
@@ -333,6 +363,55 @@ pub struct PublicKeyAssemblyCertificate {
     pub power2round_runtime: Option<ProductionVectorItMpcRuntimeEvidence>,
     /// Optional native DKG setup transcript certificate.
     pub setup: Option<DkgSetupTranscriptCertificate>,
+    /// Hash binding the Power2Round output to the native DKG setup transcript
+    /// that produced the shared `t` input.
+    ///
+    /// Release-valid native DKG certificates must include this when `setup` is
+    /// present, and it must match the setup certificate.
+    pub power2round_setup_input_hash: Option<[u8; 32]>,
+}
+
+/// Hashes the setup transcript material that determines the secret-shared
+/// Power2Round input `[t] = A[s1] + [s2]`.
+pub fn production_power2round_setup_input_hash(
+    config: &DkgConfig,
+    rho: [u8; 32],
+    setup: &DkgSetupTranscriptCertificate,
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS-DKG-v1/production-power2round-setup-input");
+    hasher.update(config.transcript_hash().0);
+    hasher.update(rho);
+    hasher.update([match setup.setup_backend_id {
+        DkgSetupBackendId::InProcessScaffold => 1,
+        DkgSetupBackendId::ProductionInformationTheoretic => 2,
+    }]);
+    hasher.update(setup.sampler_s1_hash);
+    hasher.update(setup.sampler_s2_hash);
+    hasher.update(setup.vss_commit_hash);
+    hasher.update(setup.vss_share_hash);
+    hasher.update(setup.complaint_hash);
+    hasher.update(setup.it_vss_public_artifact_hash);
+    hasher.update(setup.it_vss_resolution_hash);
+    hasher.update([setup.it_vss_backend_id.as_u8()]);
+    hasher.update((setup.complaints.len() as u32).to_le_bytes());
+    for complaint in &setup.complaints {
+        hasher.update(complaint.complainant.0.to_le_bytes());
+        hasher.update(complaint.dealer.0.to_le_bytes());
+        hasher.update(complaint.receiver.0.to_le_bytes());
+        hasher.update([complaint.reason.as_u8()]);
+        hasher.update((complaint.evidence.len() as u32).to_le_bytes());
+        hasher.update(&complaint.evidence);
+    }
+    hasher.update((setup.accepted_dealers.len() as u32).to_le_bytes());
+    for dealer in &setup.accepted_dealers {
+        hasher.update(dealer.0.to_le_bytes());
+    }
+    hasher.update((setup.rejected_dealers.len() as u32).to_le_bytes());
+    for dealer in &setup.rejected_dealers {
+        hasher.update(dealer.0.to_le_bytes());
+    }
+    hasher.finalize().into()
 }
 
 /// DKG key package shape. This intentionally contains no `s2`, `t`, `t0`, low
@@ -578,6 +657,12 @@ pub struct ProductionVectorItMpcRuntimeCoverage {
     pub bit_sum_or_threshold_check: bool,
     /// A vector private one-hot selection phase was recorded.
     pub private_one_hot_selection: bool,
+    /// Preprocessing masked-broadcast consistency openings were recorded.
+    pub preprocessing_masked_broadcast: bool,
+    /// Preprocessing CarryCompare certification phases were recorded.
+    pub preprocessing_carry_compare: bool,
+    /// Preprocessing CEF/BCC certification phases were recorded.
+    pub preprocessing_cef_bcc: bool,
 }
 
 impl ProductionVectorItMpcRuntimeCoverage {
@@ -593,6 +678,9 @@ impl ProductionVectorItMpcRuntimeCoverage {
             && self.equality_to_public
             && self.bit_sum_or_threshold_check
             && self.private_one_hot_selection
+            && self.preprocessing_masked_broadcast
+            && self.preprocessing_carry_compare
+            && self.preprocessing_cef_bcc
     }
 
     /// Returns true when the evidence covers the Power2Round vector circuit.
@@ -604,6 +692,23 @@ impl ProductionVectorItMpcRuntimeCoverage {
             && self.comparison_to_public
             && self.equality_to_public
             && self.bit_sum_or_threshold_check
+    }
+
+    /// Returns true when the evidence covers the vector operations needed by
+    /// strict no-rejected-z signing.
+    ///
+    /// Strict signing consumes already-certified preprocessing tokens, so this
+    /// gate is intentionally scoped to response preparation/check/selection and
+    /// selected opening. Preprocessing-specific proof phases are checked by the
+    /// token certification path, not by the online signing handoff.
+    pub fn covers_strict_signing(self) -> bool {
+        self.open_many_checked
+            && self.assert_zero_vec
+            && self.assert_bit_vec
+            && self.mul_vec
+            && self.comparison_to_public
+            && self.bit_sum_or_threshold_check
+            && self.private_one_hot_selection
     }
 }
 
@@ -776,10 +881,26 @@ fn update_runtime_coverage_from_phase(
         | PrimeFieldMpcPhase::EqualityToPublicCheck => {
             coverage.equality_to_public = true;
         }
-        PrimeFieldMpcPhase::Power2RoundAdd4095 | PrimeFieldMpcPhase::BitSumThresholdCheck => {
+        PrimeFieldMpcPhase::Power2RoundAdd4095 => {
+            coverage.bit_sum_or_threshold_check = true;
+        }
+        PrimeFieldMpcPhase::BitSumThresholdCheck => {
+            coverage.comparison_to_public = true;
             coverage.bit_sum_or_threshold_check = true;
         }
         PrimeFieldMpcPhase::PrivateSelectionCheck => coverage.private_one_hot_selection = true,
+        PrimeFieldMpcPhase::PreprocessingMaskedBroadcast => {
+            coverage.preprocessing_masked_broadcast = true;
+        }
+        PrimeFieldMpcPhase::PreprocessingCarryCompare => {
+            coverage.comparison_to_public = true;
+            coverage.preprocessing_carry_compare = true;
+        }
+        PrimeFieldMpcPhase::PreprocessingCefBcc => {
+            coverage.comparison_to_public = true;
+            coverage.bit_sum_or_threshold_check = true;
+            coverage.preprocessing_cef_bcc = true;
+        }
         _ => {}
     }
 }
@@ -831,6 +952,203 @@ where
     })
 }
 
+/// Release gate for public openings in a Power2Round runtime log.
+///
+/// A production Power2Round transcript may publicly open only:
+///
+/// - masked values `C = t + A_mask`, protected by the certified one-time mask;
+/// - public `t1` high bits after canonicality/range/equality checks complete.
+///
+/// Generic openings, low-bit openings, masks, witnesses, `t`, `t0`, or failed
+/// diffs must not appear as `Open` rounds in a release-capable Power2Round log.
+pub fn ensure_power2round_wire_log_openings_allowed_for_release<L>(log: &L) -> Result<(), DkgError>
+where
+    L: PrimeFieldMpcWireMessageLog,
+{
+    for record in log.wire_records() {
+        if record.message.header.payload_kind != PayloadKind::DkgPrimeFieldMpc {
+            continue;
+        }
+        let payload = decode_dkg_prime_field_mpc_payload(&record.message.payload)
+            .map_err(|_| DkgError::PrimeFieldMpcTransport)?;
+        let kind = prime_field_round_kind_from_u8(payload.round_kind)
+            .ok_or(DkgError::PrimeFieldMpcTransport)?;
+        if kind != PrimeFieldMpcRoundKind::Open {
+            continue;
+        }
+        let phase =
+            prime_field_phase_from_u8(payload.phase).ok_or(DkgError::PrimeFieldMpcTransport)?;
+        match phase {
+            PrimeFieldMpcPhase::Power2RoundMaskedOpenC | PrimeFieldMpcPhase::T1BitOpening => {}
+            _ => return Err(DkgError::Power2RoundForbiddenOpeningInRelease),
+        }
+    }
+    Ok(())
+}
+
+/// Ensures a durable prime-field MPC wire log contains one collected
+/// broadcast vector phase with the exact expected public marker values from
+/// every expected sender.
+///
+/// This is used by production adapters that first bind a public statement into
+/// a vector runtime marker phase before producing release evidence. A phase
+/// cursor alone only proves a round reached the collected state; this check
+/// also proves the durable wire transcript carried the expected statement
+/// marker lanes.
+pub fn ensure_prime_field_mpc_wire_log_contains_broadcast_vec<L>(
+    log: &L,
+    kind: PrimeFieldMpcRoundKind,
+    phase: PrimeFieldMpcPhase,
+    label: &Power2RoundTranscriptLabel,
+    expected_senders: &[PartyId],
+    expected_values: &[Coeff],
+) -> Result<(), DkgError>
+where
+    L: PrimeFieldMpcWireMessageLog,
+{
+    if expected_senders.is_empty() || expected_values.is_empty() {
+        return Err(DkgError::PrimeFieldMpcTransport);
+    }
+    let label_hash = power2round_label_hash(label);
+    let mut seen = Vec::with_capacity(expected_senders.len());
+    for record in log.wire_records() {
+        if !matches!(
+            record.direction,
+            PrimeFieldMpcWireDirection::SentBroadcast
+                | PrimeFieldMpcWireDirection::AcceptedBroadcast
+        ) || record.message.header.payload_kind != PayloadKind::DkgPrimeFieldMpc
+        {
+            continue;
+        }
+        let payload = decode_dkg_prime_field_mpc_payload(&record.message.payload)
+            .map_err(|_| DkgError::PrimeFieldMpcTransport)?;
+        if prime_field_round_kind_from_u8(payload.round_kind) != Some(kind)
+            || prime_field_phase_from_u8(payload.phase) != Some(phase)
+            || payload.receiver_party_id != 0
+            || payload.label_hash != label_hash
+            || payload.values != expected_values
+        {
+            continue;
+        }
+        let sender = PartyId(record.message.header.sender_party_id);
+        if expected_senders.contains(&sender) && !seen.contains(&sender) {
+            seen.push(sender);
+        }
+    }
+    if expected_senders.iter().all(|sender| seen.contains(sender)) {
+        Ok(())
+    } else {
+        Err(DkgError::PrimeFieldMpcTransport)
+    }
+}
+
+/// Ensures a preprocessing release transcript contains private vector circuit
+/// layers for CarryCompare and CEF/BCC, not only public marker broadcasts.
+///
+/// Marker phases bind a statement into the durable runtime log. This gate
+/// additionally requires vector multiplication/degree-reduction layers in the
+/// preprocessing CarryCompare and CEF/BCC phases, which are the phases used by
+/// the private comparison and threshold circuits.
+pub fn ensure_preprocessing_wire_log_private_circuits_for_release<L>(
+    log: &L,
+    expected_carry_compare_mul_labels: &[Power2RoundTranscriptLabel],
+    expected_cef_bcc_mul_labels: &[Power2RoundTranscriptLabel],
+) -> Result<(), DkgError>
+where
+    L: PrimeFieldMpcWireMessageLog,
+{
+    if expected_carry_compare_mul_labels.is_empty() || expected_cef_bcc_mul_labels.is_empty() {
+        return Err(DkgError::BlockedPendingReview);
+    }
+    let carry_label_hashes = expected_carry_compare_mul_labels
+        .iter()
+        .map(power2round_label_hash)
+        .collect::<Vec<_>>();
+    let cef_bcc_label_hashes = expected_cef_bcc_mul_labels
+        .iter()
+        .map(power2round_label_hash)
+        .collect::<Vec<_>>();
+    let mut carry_compare = false;
+    let mut cef_bcc = false;
+    for record in log.wire_records() {
+        if record.message.header.payload_kind != PayloadKind::DkgPrimeFieldMpc {
+            continue;
+        }
+        let payload = decode_dkg_prime_field_mpc_payload(&record.message.payload)
+            .map_err(|_| DkgError::PrimeFieldMpcTransport)?;
+        let kind = prime_field_round_kind_from_u8(payload.round_kind)
+            .ok_or(DkgError::PrimeFieldMpcTransport)?;
+        let phase =
+            prime_field_phase_from_u8(payload.phase).ok_or(DkgError::PrimeFieldMpcTransport)?;
+        if kind != PrimeFieldMpcRoundKind::MulDegreeReduce || payload.values.is_empty() {
+            continue;
+        }
+        match phase {
+            PrimeFieldMpcPhase::PreprocessingCarryCompare
+                if carry_label_hashes.contains(&payload.label_hash) =>
+            {
+                carry_compare = true;
+            }
+            PrimeFieldMpcPhase::PreprocessingCefBcc
+                if cef_bcc_label_hashes.contains(&payload.label_hash) =>
+            {
+                cef_bcc = true;
+            }
+            _ => {}
+        }
+    }
+    if carry_compare && cef_bcc {
+        Ok(())
+    } else {
+        Err(DkgError::BlockedPendingReview)
+    }
+}
+
+/// Release gate proving that nonlinear Power2Round values were generated by
+/// the vector runtime, not supplied as already-computed phase vectors.
+///
+/// This intentionally looks for private vector multiplication layers in the
+/// nonlinear phases. Caller-supplied wrap/subtractor/add vectors can produce
+/// phase-ordering broadcasts, but they do not produce these runtime-owned
+/// private circuit layers.
+pub fn ensure_power2round_state_owned_nonlinear_wire_log_for_release<L>(
+    log: &L,
+) -> Result<(), DkgError>
+where
+    L: PrimeFieldMpcWireMessageLog,
+{
+    let mut comparison = false;
+    let mut subtractor = false;
+    let mut bitness = false;
+    let mut add_4095 = false;
+    for record in log.wire_records() {
+        if record.message.header.payload_kind != PayloadKind::DkgPrimeFieldMpc {
+            continue;
+        }
+        let payload = decode_dkg_prime_field_mpc_payload(&record.message.payload)
+            .map_err(|_| DkgError::PrimeFieldMpcTransport)?;
+        let kind = prime_field_round_kind_from_u8(payload.round_kind)
+            .ok_or(DkgError::PrimeFieldMpcTransport)?;
+        let phase =
+            prime_field_phase_from_u8(payload.phase).ok_or(DkgError::PrimeFieldMpcTransport)?;
+        if kind != PrimeFieldMpcRoundKind::MulDegreeReduce || payload.values.is_empty() {
+            continue;
+        }
+        match phase {
+            PrimeFieldMpcPhase::ComparisonToPublicCheck => comparison = true,
+            PrimeFieldMpcPhase::SubtractorShare => subtractor = true,
+            PrimeFieldMpcPhase::Power2RoundCanonicalBitnessCheck => bitness = true,
+            PrimeFieldMpcPhase::Power2RoundAdd4095 => add_4095 = true,
+            _ => {}
+        }
+    }
+    if comparison && subtractor && bitness && add_4095 {
+        Ok(())
+    } else {
+        Err(DkgError::BlockedPendingReview)
+    }
+}
+
 /// Release gate for durable prime-field MPC wire logs.
 pub fn ensure_prime_field_mpc_wire_log_vectorized_for_release<L>(log: &L) -> Result<(), DkgError>
 where
@@ -872,6 +1190,19 @@ pub fn ensure_production_power2round_runtime_evidence_for_release(
 ) -> Result<(), DkgError> {
     ensure_prime_field_mpc_counters_vectorized_for_release(evidence.counters)?;
     if !evidence.counters.has_durable_runtime_evidence() || !evidence.coverage.covers_power2round()
+    {
+        return Err(DkgError::BlockedPendingReview);
+    }
+    Ok(())
+}
+
+/// Release gate for strict-signing-specific durable vector IT-MPC evidence.
+pub fn ensure_production_strict_signing_runtime_evidence_for_release(
+    evidence: &ProductionVectorItMpcRuntimeEvidence,
+) -> Result<(), DkgError> {
+    ensure_prime_field_mpc_counters_vectorized_for_release(evidence.counters)?;
+    if !evidence.counters.has_durable_runtime_evidence()
+        || !evidence.coverage.covers_strict_signing()
     {
         return Err(DkgError::BlockedPendingReview);
     }
@@ -1307,6 +1638,12 @@ pub enum PrimeFieldMpcPhase {
     ComparisonToPublicCheck,
     /// Generic vector equality-to-public check phase.
     EqualityToPublicCheck,
+    /// Preprocessing masked-broadcast consistency opening/check phase.
+    PreprocessingMaskedBroadcast,
+    /// Preprocessing CarryCompare certification phase.
+    PreprocessingCarryCompare,
+    /// Preprocessing CEF/BCC certification phase.
+    PreprocessingCefBcc,
 }
 
 /// Accepted transport-backed prime-field MPC round metadata.
@@ -3959,6 +4296,1779 @@ impl Drop for ProductionPower2RoundCircuitState {
     }
 }
 
+/// Runtime-owned handle state for the nonlinear vector Power2Round circuit.
+///
+/// Unlike the lower-level phase helpers, this state owns the secret handles
+/// needed to derive nonlinear Power2Round material from prior private state.
+/// It is the production-facing path for closing the gap between "the runtime
+/// can verify phase outputs" and "the runtime derives those outputs".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionPower2RoundRuntimeCircuitState {
+    t: ProductionShareVec,
+    mask_value: ProductionShareVec,
+    mask_bits_by_bit: Vec<ProductionBitShareVec>,
+    opened_masked_c: Option<Vec<Coeff>>,
+    wrap_comparison: Option<ProductionPublicComparisonVecState>,
+    wrap: Option<ProductionBitShareVec>,
+    canonical_recovery: Option<ProductionPower2RoundCanonicalRecoveryState>,
+    r_bits_by_bit: Option<Vec<ProductionBitShareVec>>,
+    r_bitness_products: Vec<Option<ProductionShareVec>>,
+    r_lt_q_comparison: Option<ProductionPublicComparisonVecState>,
+    r_lt_q: Option<ProductionBitShareVec>,
+    add_4095: Option<ProductionPower2RoundAdd4095State>,
+    s_bits_by_bit: Option<Vec<ProductionBitShareVec>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProductionPower2RoundCanonicalRecoveryPendingKind {
+    BaseAndMask,
+    DiffAndBorrow,
+    NotBaseAndMask,
+    NotDiffAndBorrow,
+    BorrowOr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProductionPower2RoundCanonicalRecoveryState {
+    c_values: Vec<Coeff>,
+    wrap: ProductionBitShareVec,
+    borrow: ProductionBitShareVec,
+    bit_idx: usize,
+    selected_base: Option<ProductionBitShareVec>,
+    b_xor_a: Option<ProductionBitShareVec>,
+    diff_done: bool,
+    not_b_and_a: Option<ProductionBitShareVec>,
+    not_diff_and_borrow: Option<ProductionBitShareVec>,
+    out_bits_by_bit: Vec<Option<ProductionBitShareVec>>,
+    overflow_bit: Option<ProductionBitShareVec>,
+    final_borrow: Option<ProductionBitShareVec>,
+    pending: Option<ProductionPower2RoundCanonicalRecoveryPendingKind>,
+    done: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProductionPower2RoundAdd4095State {
+    r_bits_by_bit: Vec<ProductionBitShareVec>,
+    out_bits_by_bit: Vec<Option<ProductionBitShareVec>>,
+    carry: ProductionBitShareVec,
+    bit_idx: usize,
+    pending: bool,
+    done: bool,
+}
+
+impl ProductionPower2RoundRuntimeCircuitState {
+    /// Builds runtime-owned Power2Round state from this party's `[t]` share,
+    /// canonical mask value share, and canonical mask bit shares.
+    pub fn new<P, T, L, C>(
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        t: ProductionShareVec,
+        mask_value: ProductionShareVec,
+        mask_bits_by_bit: Vec<ProductionBitShareVec>,
+    ) -> Result<Self, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime.validate_share_vec_context::<P>(config, &t)?;
+        runtime.validate_share_vec_context::<P>(config, &mask_value)?;
+        runtime.ensure_same_share_shape(&t, &mask_value)?;
+        if mask_bits_by_bit.len() != 23 {
+            return Err(DkgError::Power2RoundMaskShapeMismatch);
+        }
+        for bits in &mask_bits_by_bit {
+            runtime.validate_share_vec_context::<P>(config, bits.share())?;
+            runtime.ensure_same_share_shape(&t, bits.share())?;
+        }
+        Ok(Self {
+            t,
+            mask_value,
+            mask_bits_by_bit,
+            opened_masked_c: None,
+            wrap_comparison: None,
+            wrap: None,
+            canonical_recovery: None,
+            r_bits_by_bit: None,
+            r_bitness_products: vec![None; 23],
+            r_lt_q_comparison: None,
+            r_lt_q: None,
+            add_4095: None,
+            s_bits_by_bit: None,
+        })
+    }
+
+    /// Returns the vector lane count.
+    pub fn lane_count(&self) -> usize {
+        self.t.len()
+    }
+
+    /// Returns opened masked `C` values after collection.
+    pub fn opened_masked_c(&self) -> Option<&[Coeff]> {
+        self.opened_masked_c.as_deref()
+    }
+
+    /// Returns the private wrap bits after the state-owned comparison
+    /// completes.
+    pub fn wrap(&self) -> Option<&ProductionBitShareVec> {
+        self.wrap.as_ref()
+    }
+
+    /// Returns recovered canonical `R` bits after the runtime-owned recovery
+    /// and certification phases complete.
+    pub fn r_bits_by_bit(&self) -> Option<&[ProductionBitShareVec]> {
+        self.r_bits_by_bit.as_deref()
+    }
+
+    /// Returns secret bits of `S = R + 4095` after the runtime-owned adder
+    /// completes.
+    pub fn s_bits_by_bit(&self) -> Option<&[ProductionBitShareVec]> {
+        self.s_bits_by_bit.as_deref()
+    }
+
+    /// Returns the private `R < q` result after the range circuit completes.
+    pub fn r_lt_q(&self) -> Option<&ProductionBitShareVec> {
+        self.r_lt_q.as_ref()
+    }
+
+    fn selected_base_bit_for_recovery<P, T, L, C>(
+        &self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        c_values: &[Coeff],
+        bit_idx: usize,
+        wrap: &ProductionBitShareVec,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionBitShareVec, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let c_plus_q = c_values
+            .iter()
+            .map(|&value| {
+                if value < 0 || value >= P::Q {
+                    Err(DkgError::Power2RoundCanonicalityFailure)
+                } else {
+                    Ok(value as u32 + P::Q as u32)
+                }
+            })
+            .collect::<Result<Vec<_>, DkgError>>()?;
+        let base_bits = c_values
+            .iter()
+            .map(|&value| (((value as u32) >> bit_idx) & 1) as Coeff)
+            .collect::<Vec<_>>();
+        let diff = c_values
+            .iter()
+            .zip(c_plus_q.iter())
+            .map(|(&c, &c_q)| {
+                let b0 = ((c as u32 >> bit_idx) & 1) as Coeff;
+                let b1 = ((c_q >> bit_idx) & 1) as Coeff;
+                reduce_mod_q::<P>(b1 - b0)
+            })
+            .collect::<Vec<_>>();
+        let base = runtime.public_lanes_share_vec::<P>(
+            config,
+            &label.child(format!("recover_r_bits/bit_{bit_idx}/base")),
+            &base_bits,
+        )?;
+        let selected_delta = runtime.mul_public_lanes_share_vec::<P>(
+            config,
+            wrap.share(),
+            &diff,
+            &label.child(format!("recover_r_bits/bit_{bit_idx}/wrap_delta")),
+        )?;
+        Ok(ProductionBitShareVec::new(runtime.add_share_vec::<P>(
+            config,
+            &base,
+            &selected_delta,
+            &label.child(format!("recover_r_bits/bit_{bit_idx}/selected_base")),
+        )?))
+    }
+
+    fn recovery_a_bit<P, T, L, C>(
+        &self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        bit_idx: usize,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionBitShareVec, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if bit_idx < 23 {
+            Ok(self.mask_bits_by_bit[bit_idx].clone())
+        } else {
+            runtime.public_bit_share_vec::<P>(
+                config,
+                &label.child("recover_r_bits/a_bit_23_zero"),
+                false,
+                self.lane_count(),
+            )
+        }
+    }
+
+    /// Computes and broadcasts this party's share of `C = t + A_mask`.
+    pub fn drive_masked_c_opening<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let masked = runtime.add_share_vec::<P>(
+            config,
+            &self.t,
+            &self.mask_value,
+            &label.child("masked_c"),
+        )?;
+        runtime.drive_power2round_masked_c_vec(label, masked.lanes())
+    }
+
+    /// Collects opened `C`, advances the Power2Round driver, and stores the
+    /// public masked values for subsequent state-owned nonlinear phases.
+    pub fn collect_masked_c_opening<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        driver: &mut ProductionPower2RoundPerPartyDriver,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionPower2RoundVectorCollectResult<Vec<Coeff>>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        match runtime.drive_collect_power2round_masked_c_vec_and_advance(driver, label)? {
+            ProductionPower2RoundVectorCollectResult::Waiting(statuses) => {
+                Ok(ProductionPower2RoundVectorCollectResult::Waiting(statuses))
+            }
+            ProductionPower2RoundVectorCollectResult::Collected(values) => {
+                let opened = reconstruct_collected_prime_field_vector::<P>(config, &values)?;
+                if opened.len() != self.lane_count()
+                    || opened.iter().any(|&value| value < 0 || value >= P::Q)
+                {
+                    return Err(DkgError::Power2RoundCanonicalityFailure);
+                }
+                self.opened_masked_c = Some(opened.clone());
+                Ok(ProductionPower2RoundVectorCollectResult::Collected(opened))
+            }
+        }
+    }
+
+    /// Opens masked `C = x + A (mod q)` through the generic checked vector
+    /// opening path.
+    ///
+    /// This is used by consumers such as strict signing that reuse the
+    /// canonical decomposition circuit but are not executing the Power2Round
+    /// public-key-assembly cursor.
+    pub fn drive_masked_c_opening_checked<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let masked = runtime.add_share_vec::<P>(
+            config,
+            &self.t,
+            &self.mask_value,
+            &label.child("masked_c"),
+        )?;
+        runtime.drive_open_share_vec::<P>(config, &masked, &label.child("open_masked_c"))
+    }
+
+    /// Collects generic checked masked `C` openings and stores canonical public
+    /// `C` values for later private bit recovery.
+    pub fn collect_masked_c_opening_checked<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<Vec<Coeff>>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        match runtime.collect_open_share_vec::<P>(config, &label.child("open_masked_c"))? {
+            ProductionVectorItMpcCollectResult::Waiting(status) => {
+                Ok(ProductionVectorItMpcCollectResult::Waiting(status))
+            }
+            ProductionVectorItMpcCollectResult::Collected { status, value } => {
+                if value.len() != self.lane_count()
+                    || value.iter().any(|&lane| lane < 0 || lane >= P::Q)
+                {
+                    return Err(DkgError::Power2RoundCanonicalityFailure);
+                }
+                self.opened_masked_c = Some(value.clone());
+                Ok(ProductionVectorItMpcCollectResult::Collected { status, value })
+            }
+        }
+    }
+
+    /// Starts the private lane-wise wrap comparison `[A_mask > C]` from
+    /// runtime-owned mask bit shares and the previously opened masked values.
+    pub fn start_wrap_comparison<P, T, L, C>(
+        &mut self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(), DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let c = self
+            .opened_masked_c
+            .as_ref()
+            .ok_or(DkgError::Power2RoundMaskedOpeningsRequired)?;
+        self.wrap_comparison = Some(runtime.start_gt_public_lanes_vec::<P>(
+            config,
+            &self.mask_bits_by_bit,
+            c,
+            &label.child("a_gt_c"),
+        )?);
+        Ok(())
+    }
+
+    /// Drives one multiplication layer of the state-owned wrap comparison.
+    pub fn drive_wrap_comparison_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        let state = self
+            .wrap_comparison
+            .as_mut()
+            .ok_or(DkgError::Power2RoundMaskedOpeningsRequired)?;
+        runtime.drive_public_comparison_vec_step::<P, E>(config, state, entropy)
+    }
+
+    /// Collects one multiplication layer of the state-owned wrap comparison.
+    pub fn collect_wrap_comparison_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let state = self
+            .wrap_comparison
+            .as_mut()
+            .ok_or(DkgError::Power2RoundMaskedOpeningsRequired)?;
+        let result = runtime.collect_public_comparison_vec_step::<P>(config, state)?;
+        if state.is_done() {
+            self.wrap = Some(
+                state
+                    .result()
+                    .ok_or(DkgError::Power2RoundCanonicalityFailure)?
+                    .clone(),
+            );
+        }
+        Ok(result)
+    }
+
+    /// Starts runtime-owned canonical recovery of secret bits of
+    /// `R = C + q*[A>C] - A`.
+    pub fn start_canonical_r_bit_recovery<P, T, L, C>(
+        &mut self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(), DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let c_values = self
+            .opened_masked_c
+            .as_ref()
+            .ok_or(DkgError::Power2RoundMaskedOpeningsRequired)?
+            .clone();
+        let wrap = self
+            .wrap
+            .as_ref()
+            .ok_or(DkgError::Power2RoundMaskedOpeningsRequired)?
+            .clone();
+        if c_values.len() != self.lane_count() {
+            return Err(DkgError::Power2RoundMaskShapeMismatch);
+        }
+        let borrow = runtime.public_bit_share_vec::<P>(
+            config,
+            &label.child("recover_r_bits/borrow_init"),
+            false,
+            self.lane_count(),
+        )?;
+        self.canonical_recovery = Some(ProductionPower2RoundCanonicalRecoveryState {
+            c_values,
+            wrap,
+            borrow,
+            bit_idx: 0,
+            selected_base: None,
+            b_xor_a: None,
+            diff_done: false,
+            not_b_and_a: None,
+            not_diff_and_borrow: None,
+            out_bits_by_bit: vec![None; 23],
+            overflow_bit: None,
+            final_borrow: None,
+            pending: None,
+            done: false,
+        });
+        self.r_bits_by_bit = None;
+        Ok(())
+    }
+
+    /// Drives one multiplication layer of runtime-owned canonical `R` bit
+    /// recovery.
+    pub fn drive_canonical_r_recovery_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        let Some(state_snapshot) = self.canonical_recovery.as_ref() else {
+            return Err(DkgError::Power2RoundCanonicalBitsRequired);
+        };
+        if state_snapshot.done {
+            return Ok(PrimeFieldMpcPhaseDriverStatus::Collected {
+                receiver: None,
+                kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+                phase: PrimeFieldMpcPhase::SubtractorShare,
+                label_hash: power2round_label_hash(label),
+                senders: Vec::new(),
+            });
+        }
+        if state_snapshot.pending.is_some() {
+            return Err(DkgError::Backend(
+                "Power2Round canonical recovery step already pending",
+            ));
+        }
+        if state_snapshot.bit_idx >= 24 {
+            return Err(DkgError::Power2RoundCanonicalBitsRequired);
+        }
+        let bit_idx = state_snapshot.bit_idx;
+        let step_label = label.child(format!("recover_r_bits/bit_{bit_idx}"));
+        let pending = if state_snapshot.selected_base.is_none() {
+            let selected_base = self.selected_base_bit_for_recovery::<P, _, _, _>(
+                runtime,
+                config,
+                &state_snapshot.c_values,
+                bit_idx,
+                &state_snapshot.wrap,
+                label,
+            )?;
+            let a_bit = self.recovery_a_bit::<P, _, _, _>(runtime, config, bit_idx, label)?;
+            runtime.drive_bit_and_vec_with_phase::<P, E>(
+                config,
+                &selected_base,
+                &a_bit,
+                &step_label.child("base_and_a"),
+                PrimeFieldMpcPhase::SubtractorShare,
+                entropy,
+            )?;
+            let state = self
+                .canonical_recovery
+                .as_mut()
+                .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+            state.selected_base = Some(selected_base);
+            ProductionPower2RoundCanonicalRecoveryPendingKind::BaseAndMask
+        } else if state_snapshot.b_xor_a.is_some() && !state_snapshot.diff_done {
+            let b_xor_a = state_snapshot
+                .b_xor_a
+                .as_ref()
+                .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+            runtime.drive_bit_and_vec_with_phase::<P, E>(
+                config,
+                b_xor_a,
+                &state_snapshot.borrow,
+                &step_label.child("diff_and_borrow"),
+                PrimeFieldMpcPhase::SubtractorShare,
+                entropy,
+            )?;
+            ProductionPower2RoundCanonicalRecoveryPendingKind::DiffAndBorrow
+        } else if state_snapshot.not_b_and_a.is_none() {
+            let selected_base = state_snapshot
+                .selected_base
+                .as_ref()
+                .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+            let not_b =
+                runtime.bit_not_vec::<P>(config, selected_base, &step_label.child("not_b"))?;
+            let a_bit = self.recovery_a_bit::<P, _, _, _>(runtime, config, bit_idx, label)?;
+            runtime.drive_bit_and_vec_with_phase::<P, E>(
+                config,
+                &not_b,
+                &a_bit,
+                &step_label.child("not_b_and_a"),
+                PrimeFieldMpcPhase::SubtractorShare,
+                entropy,
+            )?;
+            ProductionPower2RoundCanonicalRecoveryPendingKind::NotBaseAndMask
+        } else if state_snapshot.not_diff_and_borrow.is_none() {
+            let b_xor_a = state_snapshot
+                .b_xor_a
+                .as_ref()
+                .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+            let not_diff =
+                runtime.bit_not_vec::<P>(config, b_xor_a, &step_label.child("not_diff"))?;
+            runtime.drive_bit_and_vec_with_phase::<P, E>(
+                config,
+                &not_diff,
+                &state_snapshot.borrow,
+                &step_label.child("not_diff_and_borrow"),
+                PrimeFieldMpcPhase::SubtractorShare,
+                entropy,
+            )?;
+            ProductionPower2RoundCanonicalRecoveryPendingKind::NotDiffAndBorrow
+        } else {
+            let left = state_snapshot
+                .not_b_and_a
+                .as_ref()
+                .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+            let right = state_snapshot
+                .not_diff_and_borrow
+                .as_ref()
+                .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+            runtime.drive_bit_and_vec_with_phase::<P, E>(
+                config,
+                left,
+                right,
+                &step_label.child("borrow_or"),
+                PrimeFieldMpcPhase::SubtractorShare,
+                entropy,
+            )?;
+            ProductionPower2RoundCanonicalRecoveryPendingKind::BorrowOr
+        };
+        let state = self
+            .canonical_recovery
+            .as_mut()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        state.pending = Some(pending);
+        Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+            receiver: runtime.local_party(),
+            kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+            phase: PrimeFieldMpcPhase::MulDegreeReductionShare,
+            label_hash: power2round_label_hash(&step_label.child("bit_and").child("mul_layer")),
+        })
+    }
+
+    /// Collects one multiplication layer of runtime-owned canonical `R` bit
+    /// recovery.
+    pub fn collect_canonical_r_recovery_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let pending = self
+            .canonical_recovery
+            .as_ref()
+            .and_then(|state| state.pending)
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        let bit_idx = self
+            .canonical_recovery
+            .as_ref()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?
+            .bit_idx;
+        let step_label = label.child(format!("recover_r_bits/bit_{bit_idx}"));
+        let op_label = match pending {
+            ProductionPower2RoundCanonicalRecoveryPendingKind::BaseAndMask => {
+                step_label.child("base_and_a")
+            }
+            ProductionPower2RoundCanonicalRecoveryPendingKind::DiffAndBorrow => {
+                step_label.child("diff_and_borrow")
+            }
+            ProductionPower2RoundCanonicalRecoveryPendingKind::NotBaseAndMask => {
+                step_label.child("not_b_and_a")
+            }
+            ProductionPower2RoundCanonicalRecoveryPendingKind::NotDiffAndBorrow => {
+                step_label.child("not_diff_and_borrow")
+            }
+            ProductionPower2RoundCanonicalRecoveryPendingKind::BorrowOr => {
+                step_label.child("borrow_or")
+            }
+        };
+        let (status, and_result) = match runtime.collect_bit_and_vec_with_phase::<P>(
+            config,
+            &op_label,
+            PrimeFieldMpcPhase::SubtractorShare,
+        )? {
+            ProductionVectorItMpcCollectResult::Waiting(status) => {
+                return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+            }
+            ProductionVectorItMpcCollectResult::Collected { status, value } => (status, value),
+        };
+        match pending {
+            ProductionPower2RoundCanonicalRecoveryPendingKind::BaseAndMask => {
+                let selected_base = self
+                    .canonical_recovery
+                    .as_ref()
+                    .and_then(|state| state.selected_base.clone())
+                    .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                let a_bit = self.recovery_a_bit::<P, _, _, _>(runtime, config, bit_idx, label)?;
+                let b_xor_a = runtime.bit_xor_from_and_vec::<P>(
+                    config,
+                    &selected_base,
+                    &a_bit,
+                    &and_result,
+                    &step_label.child("b_xor_a"),
+                )?;
+                let state = self
+                    .canonical_recovery
+                    .as_mut()
+                    .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                state.b_xor_a = Some(b_xor_a);
+            }
+            ProductionPower2RoundCanonicalRecoveryPendingKind::DiffAndBorrow => {
+                let b_xor_a = self
+                    .canonical_recovery
+                    .as_ref()
+                    .and_then(|state| state.b_xor_a.clone())
+                    .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                let borrow = self
+                    .canonical_recovery
+                    .as_ref()
+                    .map(|state| state.borrow.clone())
+                    .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                let diff_bit = runtime.bit_xor_from_and_vec::<P>(
+                    config,
+                    &b_xor_a,
+                    &borrow,
+                    &and_result,
+                    &step_label.child("diff_bit"),
+                )?;
+                let state = self
+                    .canonical_recovery
+                    .as_mut()
+                    .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                if bit_idx < 23 {
+                    state.out_bits_by_bit[bit_idx] = Some(diff_bit);
+                } else {
+                    state.overflow_bit = Some(diff_bit);
+                }
+                state.diff_done = true;
+            }
+            ProductionPower2RoundCanonicalRecoveryPendingKind::NotBaseAndMask => {
+                let state = self
+                    .canonical_recovery
+                    .as_mut()
+                    .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                state.not_b_and_a = Some(and_result);
+            }
+            ProductionPower2RoundCanonicalRecoveryPendingKind::NotDiffAndBorrow => {
+                let state = self
+                    .canonical_recovery
+                    .as_mut()
+                    .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                state.not_diff_and_borrow = Some(and_result);
+            }
+            ProductionPower2RoundCanonicalRecoveryPendingKind::BorrowOr => {
+                let (left, right) = self
+                    .canonical_recovery
+                    .as_ref()
+                    .and_then(|state| {
+                        Some((
+                            state.not_b_and_a.clone()?,
+                            state.not_diff_and_borrow.clone()?,
+                        ))
+                    })
+                    .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                let next_borrow = runtime.bit_or_from_and_vec::<P>(
+                    config,
+                    &left,
+                    &right,
+                    &and_result,
+                    &step_label.child("next_borrow"),
+                )?;
+                let state = self
+                    .canonical_recovery
+                    .as_mut()
+                    .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                state.borrow = next_borrow;
+                state.bit_idx += 1;
+                state.selected_base = None;
+                state.b_xor_a = None;
+                state.diff_done = false;
+                state.not_b_and_a = None;
+                state.not_diff_and_borrow = None;
+                if state.bit_idx == 24 {
+                    state.done = true;
+                    state.final_borrow = Some(state.borrow.clone());
+                    let out = state
+                        .out_bits_by_bit
+                        .iter()
+                        .cloned()
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+                    self.r_bits_by_bit = Some(out);
+                    self.r_bitness_products = vec![None; 23];
+                }
+            }
+        }
+        let state = self
+            .canonical_recovery
+            .as_mut()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        state.pending = None;
+        Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+    }
+
+    fn canonical_r_value_share<P, T, L, C>(
+        &self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionShareVec, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let r_bits = self
+            .r_bits_by_bit
+            .as_ref()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        let mut weighted_bits = Vec::with_capacity(r_bits.len());
+        for (bit_idx, bit) in r_bits.iter().enumerate() {
+            weighted_bits.push(
+                runtime.mul_public_const_share_vec::<P>(
+                    config,
+                    bit.share(),
+                    1_i32
+                        .checked_shl(bit_idx as u32)
+                        .ok_or(DkgError::Power2RoundCanonicalityFailure)?,
+                    &label.child(format!("r_from_bits/bit_{bit_idx}")),
+                )?,
+            );
+        }
+        runtime.sum_share_vecs::<P>(config, &weighted_bits, &label.child("r_from_bits/sum"))
+    }
+
+    /// Drives the multiplication product for the state-owned bitness check
+    /// `R_bit * (R_bit - 1)`.
+    pub fn drive_r_bitness_product<P, T, L, C, E>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        bit_idx: usize,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        let r_bits = self
+            .r_bits_by_bit
+            .as_ref()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        let bit = r_bits
+            .get(bit_idx)
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        let one = runtime.public_const_share_vec::<P>(
+            config,
+            &label.child(format!("r_bits_boolean/bit_{bit_idx}/one")),
+            1,
+            self.lane_count(),
+        )?;
+        let bit_minus_one = runtime.sub_share_vec::<P>(
+            config,
+            bit.share(),
+            &one,
+            &label.child(format!("r_bits_boolean/bit_{bit_idx}/bit_minus_one")),
+        )?;
+        runtime.drive_mul_vec_degree_reduction_with_phase::<P, E>(
+            config,
+            bit.share(),
+            &bit_minus_one,
+            &label.child(format!("r_bits_boolean/bit_{bit_idx}")),
+            PrimeFieldMpcPhase::Power2RoundCanonicalBitnessCheck,
+            entropy,
+        )?;
+        Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+            receiver: runtime.local_party(),
+            kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+            phase: PrimeFieldMpcPhase::MulDegreeReductionShare,
+            label_hash: power2round_label_hash(
+                &label
+                    .child(format!("r_bits_boolean/bit_{bit_idx}"))
+                    .child("mul_layer"),
+            ),
+        })
+    }
+
+    /// Collects the state-owned bitness product for `R_bit`.
+    pub fn collect_r_bitness_product<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        bit_idx: usize,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let (status, product) = match runtime.collect_mul_vec_degree_reduction_with_phase::<P>(
+            config,
+            &label.child(format!("r_bits_boolean/bit_{bit_idx}")),
+            PrimeFieldMpcPhase::Power2RoundCanonicalBitnessCheck,
+        )? {
+            ProductionVectorItMpcCollectResult::Waiting(status) => {
+                return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+            }
+            ProductionVectorItMpcCollectResult::Collected { status, value } => (status, value),
+        };
+        let slot = self
+            .r_bitness_products
+            .get_mut(bit_idx)
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        *slot = Some(product);
+        Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+    }
+
+    /// Opens only the zero residual for the state-owned `R_bit` bitness
+    /// product. Failed raw values are checked and discarded by the runtime.
+    pub fn drive_r_bitness_zero_check<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        bit_idx: usize,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let product = self
+            .r_bitness_products
+            .get(bit_idx)
+            .and_then(|product| product.as_ref())
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        runtime.drive_assert_zero_share_vec::<P>(
+            config,
+            product,
+            &label.child(format!("r_bits_boolean/bit_{bit_idx}/assert_zero")),
+        )
+    }
+
+    /// Collects the zero residual for the state-owned `R_bit` bitness product.
+    pub fn collect_r_bitness_zero_check<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        bit_idx: usize,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime.collect_assert_zero_share_vec::<P>(
+            config,
+            &label.child(format!("r_bits_boolean/bit_{bit_idx}/assert_zero")),
+        )
+    }
+
+    /// Starts runtime-owned private range certification for recovered
+    /// canonical `R` bits.
+    pub fn start_r_lt_q_check<P, T, L, C>(
+        &mut self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(), DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let r_bits = self
+            .r_bits_by_bit
+            .as_ref()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        self.r_lt_q_comparison = Some(runtime.start_lt_public_vec::<P>(
+            config,
+            r_bits,
+            P::Q as u32,
+            &label.child("r_lt_q"),
+        )?);
+        self.r_lt_q = None;
+        Ok(())
+    }
+
+    /// Drives one multiplication layer of state-owned `R < q`.
+    pub fn drive_r_lt_q_check_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        let state = self
+            .r_lt_q_comparison
+            .as_mut()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        runtime.drive_public_comparison_vec_step::<P, E>(config, state, entropy)
+    }
+
+    /// Collects one multiplication layer of state-owned `R < q`.
+    pub fn collect_r_lt_q_check_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let state = self
+            .r_lt_q_comparison
+            .as_mut()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        let result = runtime.collect_public_comparison_vec_step::<P>(config, state)?;
+        if state.is_done() {
+            self.r_lt_q = Some(
+                state
+                    .result()
+                    .ok_or(DkgError::Power2RoundCanonicalityFailure)?
+                    .clone(),
+            );
+        }
+        Ok(result)
+    }
+
+    /// Drives the final checked assertion that recovered `R` bits satisfy
+    /// `sum 2^j R_j == t (mod q)`.
+    pub fn drive_r_bits_equal_t_check<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let r_from_bits = self.canonical_r_value_share::<P, _, _, _>(runtime, config, label)?;
+        let residual = runtime.sub_share_vec::<P>(
+            config,
+            &r_from_bits,
+            &self.t,
+            &label.child("assert_bits_equal_r_mod_q/residual"),
+        )?;
+        runtime.drive_assert_zero_share_vec::<P>(
+            config,
+            &residual,
+            &label.child("assert_bits_equal_r_mod_q"),
+        )
+    }
+
+    /// Collects the final checked assertion that recovered `R` bits equal
+    /// `[t] mod q`.
+    pub fn collect_r_bits_equal_t_check<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime
+            .collect_assert_zero_share_vec::<P>(config, &label.child("assert_bits_equal_r_mod_q"))
+    }
+
+    /// Drives a zero assertion for `1 - [R < q]`.
+    pub fn drive_r_lt_q_assert_true<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let r_lt_q = self
+            .r_lt_q
+            .as_ref()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
+        let not_lt =
+            runtime.bit_not_vec::<P>(config, r_lt_q, &label.child("assert_r_lt_q/not_lt"))?;
+        runtime.drive_assert_zero_share_vec::<P>(
+            config,
+            not_lt.share(),
+            &label.child("assert_r_lt_q"),
+        )
+    }
+
+    /// Collects the zero assertion for `1 - [R < q]`.
+    pub fn collect_r_lt_q_assert_true<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        runtime.collect_assert_zero_share_vec::<P>(config, &label.child("assert_r_lt_q"))
+    }
+
+    /// Installs canonical `R` bits as the source for subsequent runtime-owned
+    /// checks/addition.
+    ///
+    /// This is intentionally narrow: it exists to connect the already
+    /// recovered bit handles to the state-owned check/add/open phases. The
+    /// release path is expected to call this only from the runtime-owned
+    /// canonical recovery phase, not from caller-supplied nonlinear artifacts.
+    pub fn accept_recovered_r_bits<P, T, L, C>(
+        &mut self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        r_bits_by_bit: Vec<ProductionBitShareVec>,
+    ) -> Result<(), DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if r_bits_by_bit.len() != 23 {
+            return Err(DkgError::Power2RoundCanonicalBitsRequired);
+        }
+        for bits in &r_bits_by_bit {
+            runtime.validate_share_vec_context::<P>(config, bits.share())?;
+            runtime.ensure_same_share_shape(&self.t, bits.share())?;
+        }
+        self.r_bits_by_bit = Some(r_bits_by_bit);
+        self.r_bitness_products = vec![None; 23];
+        Ok(())
+    }
+
+    /// Starts the runtime-owned ripple adder for `S = R + 4095`.
+    pub fn start_add_4095<P, T, L, C>(
+        &mut self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(), DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let r_bits = self
+            .r_bits_by_bit
+            .as_ref()
+            .ok_or(DkgError::Power2RoundCanonicalBitsRequired)?
+            .clone();
+        let carry = runtime.public_bit_share_vec::<P>(
+            config,
+            &label.child("add_4095/carry_init"),
+            false,
+            self.lane_count(),
+        )?;
+        self.add_4095 = Some(ProductionPower2RoundAdd4095State {
+            r_bits_by_bit: r_bits,
+            out_bits_by_bit: vec![None; 23],
+            carry,
+            bit_idx: 0,
+            pending: false,
+            done: false,
+        });
+        self.s_bits_by_bit = None;
+        Ok(())
+    }
+
+    /// Drives one multiplication layer of the runtime-owned `R + 4095`
+    /// ripple adder.
+    pub fn drive_add_4095_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        let state = self
+            .add_4095
+            .as_mut()
+            .ok_or(DkgError::Power2RoundAddRoundConstantRequired)?;
+        if state.done {
+            return Ok(PrimeFieldMpcPhaseDriverStatus::Collected {
+                receiver: None,
+                kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+                phase: PrimeFieldMpcPhase::Power2RoundAdd4095,
+                label_hash: power2round_label_hash(label),
+                senders: Vec::new(),
+            });
+        }
+        if state.pending {
+            return Err(DkgError::Backend(
+                "Power2Round add-4095 step already pending",
+            ));
+        }
+        if state.bit_idx >= 23 {
+            return Err(DkgError::Power2RoundAddRoundConstantRequired);
+        }
+        let step_label = label.child(format!("add_4095/bit_{}/carry", state.bit_idx));
+        runtime.drive_bit_and_vec_with_phase::<P, E>(
+            config,
+            &state.r_bits_by_bit[state.bit_idx],
+            &state.carry,
+            &step_label,
+            PrimeFieldMpcPhase::Power2RoundAdd4095,
+            entropy,
+        )?;
+        state.pending = true;
+        Ok(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+            receiver: runtime.local_party(),
+            kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+            phase: PrimeFieldMpcPhase::MulDegreeReductionShare,
+            label_hash: power2round_label_hash(&step_label.child("bit_and").child("mul_layer")),
+        })
+    }
+
+    /// Collects one multiplication layer of the runtime-owned `R + 4095`
+    /// ripple adder.
+    pub fn collect_add_4095_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        let state = self
+            .add_4095
+            .as_mut()
+            .ok_or(DkgError::Power2RoundAddRoundConstantRequired)?;
+        if state.done {
+            return Ok(ProductionVectorItMpcCollectResult::Collected {
+                status: PrimeFieldMpcPhaseDriverStatus::Collected {
+                    receiver: None,
+                    kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+                    phase: PrimeFieldMpcPhase::Power2RoundAdd4095,
+                    label_hash: power2round_label_hash(label),
+                    senders: Vec::new(),
+                },
+                value: (),
+            });
+        }
+        if !state.pending || state.bit_idx >= 23 {
+            return Err(DkgError::Backend(
+                "Power2Round add-4095 step has no pending layer",
+            ));
+        }
+        let bit_idx = state.bit_idx;
+        let step_label = label.child(format!("add_4095/bit_{bit_idx}/carry"));
+        let (status, x_and_carry) = match runtime.collect_bit_and_vec_with_phase::<P>(
+            config,
+            &step_label,
+            PrimeFieldMpcPhase::Power2RoundAdd4095,
+        )? {
+            ProductionVectorItMpcCollectResult::Waiting(status) => {
+                return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+            }
+            ProductionVectorItMpcCollectResult::Collected { status, value } => (status, value),
+        };
+        let x = &state.r_bits_by_bit[bit_idx];
+        let x_xor_carry = runtime.bit_xor_from_and_vec::<P>(
+            config,
+            x,
+            &state.carry,
+            &x_and_carry,
+            &label.child(format!("add_4095/bit_{bit_idx}/sum_xor")),
+        )?;
+        let constant_bit = bit_idx < 12;
+        let sum_bit = if constant_bit {
+            runtime.bit_not_vec::<P>(
+                config,
+                &x_xor_carry,
+                &label.child(format!("add_4095/bit_{bit_idx}/sum")),
+            )?
+        } else {
+            x_xor_carry
+        };
+        let next_carry = if constant_bit {
+            runtime.bit_or_from_and_vec::<P>(
+                config,
+                x,
+                &state.carry,
+                &x_and_carry,
+                &label.child(format!("add_4095/bit_{bit_idx}/carry_or")),
+            )?
+        } else {
+            x_and_carry
+        };
+        state.out_bits_by_bit[bit_idx] = Some(sum_bit);
+        state.carry = next_carry;
+        state.bit_idx += 1;
+        state.pending = false;
+        if state.bit_idx == 23 {
+            state.done = true;
+            let out = state
+                .out_bits_by_bit
+                .iter()
+                .cloned()
+                .collect::<Option<Vec<_>>>()
+                .ok_or(DkgError::Power2RoundAddRoundConstantRequired)?;
+            self.s_bits_by_bit = Some(out);
+        }
+        Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+    }
+
+    /// Drives the selected public opening of one `t1` high bit from
+    /// state-owned `S = R + 4095` bits.
+    pub fn drive_t1_high_bit_opening<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        t1_bit_idx: usize,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        if t1_bit_idx >= 10 {
+            return Err(DkgError::Power2RoundT1BitsRequired);
+        }
+        let s_bits = self
+            .s_bits_by_bit
+            .as_ref()
+            .ok_or(DkgError::Power2RoundAddRoundConstantRequired)?;
+        let bit = &s_bits[13 + t1_bit_idx];
+        runtime.validate_share_vec_context::<P>(config, bit.share())?;
+        runtime.drive_power2round_t1_bit_vec(label, t1_bit_idx, bit.share().lanes())
+    }
+}
+
+/// Generic runtime-owned canonical bit-decomposition state for a secret
+/// `ProductionShareVec`.
+///
+/// This reuses the reviewed Power2Round canonical-mask/open/subtract/check
+/// machinery without tying callers to a `t1` public-key assembly. Callers
+/// provide a canonical random mask value and mask bits, open only
+/// `C = x + A (mod q)`, recover private canonical bits of `x`, and can then
+/// run the same bitness, range, and equality checks used by Power2Round.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionCanonicalBitDecompositionState {
+    inner: ProductionPower2RoundRuntimeCircuitState,
+}
+
+impl ProductionCanonicalBitDecompositionState {
+    /// Builds generic canonical bit-decomposition state from a secret value
+    /// share and certified canonical mask shares.
+    pub fn new<P, T, L, C>(
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        value: ProductionShareVec,
+        mask_value: ProductionShareVec,
+        mask_bits_by_bit: Vec<ProductionBitShareVec>,
+    ) -> Result<Self, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        Ok(Self {
+            inner: ProductionPower2RoundRuntimeCircuitState::new::<P, _, _, _>(
+                runtime,
+                config,
+                value,
+                mask_value,
+                mask_bits_by_bit,
+            )?,
+        })
+    }
+
+    /// Returns the vector lane count.
+    pub fn lane_count(&self) -> usize {
+        self.inner.lane_count()
+    }
+
+    /// Returns opened masked `C` values after collection.
+    pub fn opened_masked_c(&self) -> Option<&[Coeff]> {
+        self.inner.opened_masked_c()
+    }
+
+    /// Returns recovered canonical bits after recovery and checks are ready.
+    pub fn r_bits_by_bit(&self) -> Option<&[ProductionBitShareVec]> {
+        self.inner.r_bits_by_bit()
+    }
+
+    /// Returns the private `R < q` bit after range checking.
+    pub fn r_lt_q(&self) -> Option<&ProductionBitShareVec> {
+        self.inner.r_lt_q()
+    }
+
+    /// Opens only the masked value `C = x + A (mod q)`.
+    pub fn drive_masked_c_opening<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .drive_masked_c_opening::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Collects opened masked values and stores them for later private
+    /// recovery. The supplied Power2Round driver is reused as the durable
+    /// vector opening cursor/evidence source.
+    pub fn collect_masked_c_opening<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        driver: &mut ProductionPower2RoundPerPartyDriver,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionPower2RoundVectorCollectResult<Vec<Coeff>>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .collect_masked_c_opening::<P, _, _, _>(runtime, driver, config, label)
+    }
+
+    /// Opens masked `C = x + A (mod q)` through the generic checked vector
+    /// opening path.
+    pub fn drive_masked_c_opening_checked<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .drive_masked_c_opening_checked::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Collects generic checked masked `C` openings.
+    pub fn collect_masked_c_opening_checked<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<Vec<Coeff>>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .collect_masked_c_opening_checked::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Starts private wrap comparison `[A > C]`.
+    pub fn start_wrap_comparison<P, T, L, C>(
+        &mut self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(), DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .start_wrap_comparison::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Drives one wrap-comparison multiplication layer.
+    pub fn drive_wrap_comparison_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        self.inner
+            .drive_wrap_comparison_step::<P, _, _, _, _>(runtime, config, entropy)
+    }
+
+    /// Collects one wrap-comparison multiplication layer.
+    pub fn collect_wrap_comparison_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .collect_wrap_comparison_step::<P, _, _, _>(runtime, config)
+    }
+
+    /// Starts canonical bit recovery for `R = C + q*[A>C] - A`.
+    pub fn start_canonical_bit_recovery<P, T, L, C>(
+        &mut self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(), DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .start_canonical_r_bit_recovery::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Drives one canonical bit-recovery multiplication layer.
+    pub fn drive_canonical_bit_recovery_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        self.inner
+            .drive_canonical_r_recovery_step::<P, _, _, _, _>(runtime, config, label, entropy)
+    }
+
+    /// Collects one canonical bit-recovery multiplication layer.
+    pub fn collect_canonical_bit_recovery_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .collect_canonical_r_recovery_step::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Starts private `R < q` range certification.
+    pub fn start_r_lt_q_check<P, T, L, C>(
+        &mut self,
+        runtime: &ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(), DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .start_r_lt_q_check::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Drives one `R < q` multiplication layer.
+    pub fn drive_r_lt_q_check_step<P, T, L, C, E>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        self.inner
+            .drive_r_lt_q_check_step::<P, _, _, _, _>(runtime, config, entropy)
+    }
+
+    /// Collects one `R < q` multiplication layer.
+    pub fn collect_r_lt_q_check_step<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .collect_r_lt_q_check_step::<P, _, _, _>(runtime, config)
+    }
+
+    /// Drives one bitness-product layer for recovered canonical bits.
+    pub fn drive_r_bitness_product<P, T, L, C, E>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        bit_idx: usize,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+        E: ProductionVectorItMpcEntropy,
+    {
+        self.inner
+            .drive_r_bitness_product::<P, _, _, _, _>(runtime, config, label, bit_idx, entropy)
+    }
+
+    /// Collects one bitness-product layer for recovered canonical bits.
+    pub fn collect_r_bitness_product<P, T, L, C>(
+        &mut self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        bit_idx: usize,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .collect_r_bitness_product::<P, _, _, _>(runtime, config, label, bit_idx)
+    }
+
+    /// Drives the zero-check for one recovered-bit bitness product.
+    pub fn drive_r_bitness_zero_check<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        bit_idx: usize,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .drive_r_bitness_zero_check::<P, _, _, _>(runtime, config, label, bit_idx)
+    }
+
+    /// Collects the zero-check for one recovered-bit bitness product.
+    pub fn collect_r_bitness_zero_check<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        bit_idx: usize,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .collect_r_bitness_zero_check::<P, _, _, _>(runtime, config, label, bit_idx)
+    }
+
+    /// Drives the checked equality `sum 2^j R_j == x (mod q)`.
+    pub fn drive_r_bits_equal_value_check<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .drive_r_bits_equal_t_check::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Collects the checked equality `sum 2^j R_j == x (mod q)`.
+    pub fn collect_r_bits_equal_value_check<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .collect_r_bits_equal_t_check::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Drives the checked assertion that recovered canonical bits encode
+    /// values below `q`.
+    pub fn drive_r_lt_q_assert_true<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .drive_r_lt_q_assert_true::<P, _, _, _>(runtime, config, label)
+    }
+
+    /// Collects the checked assertion that recovered canonical bits encode
+    /// values below `q`.
+    pub fn collect_r_lt_q_assert_true<P, T, L, C>(
+        &self,
+        runtime: &mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError>
+    where
+        P: MlDsaParams,
+        T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+        L: PrimeFieldMpcWireMessageLog,
+        C: PrimeFieldMpcPhaseCursorLog,
+    {
+        self.inner
+            .collect_r_lt_q_assert_true::<P, _, _, _>(runtime, config, label)
+    }
+}
+
 impl<T, L, C> CursoredTransportPrimeFieldMpcPartyRuntime<T, L, C>
 where
     T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
@@ -4073,6 +6183,47 @@ where
         Ok(status)
     }
 
+    /// Drives and persists a preprocessing masked-broadcast consistency vector
+    /// opening.
+    pub fn drive_preprocessing_masked_broadcast_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+        values: &[Coeff],
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        let status = self
+            .runtime
+            .drive_preprocessing_masked_broadcast_vec(label, values)?;
+        self.persist_status(&status)?;
+        Ok(status)
+    }
+
+    /// Drives and persists a preprocessing CarryCompare certification vector
+    /// check.
+    pub fn drive_preprocessing_carry_compare_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+        values: &[Coeff],
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        let status = self
+            .runtime
+            .drive_preprocessing_carry_compare_vec(label, values)?;
+        self.persist_status(&status)?;
+        Ok(status)
+    }
+
+    /// Drives and persists a preprocessing CEF/BCC certification vector check.
+    pub fn drive_preprocessing_cef_bcc_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+        values: &[Coeff],
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        let status = self
+            .runtime
+            .drive_preprocessing_cef_bcc_vec(label, values)?;
+        self.persist_status(&status)?;
+        Ok(status)
+    }
+
     /// Attempts and persists directed phase collection.
     pub fn drive_collect_directed_phase(
         &mut self,
@@ -4141,6 +6292,45 @@ where
         Ok((status, values))
     }
 
+    /// Attempts and persists preprocessing masked-broadcast consistency vector
+    /// collection.
+    pub fn drive_collect_preprocessing_masked_broadcast_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(PrimeFieldMpcPhaseDriverStatus, Vec<(PartyId, Vec<Coeff>)>), DkgError> {
+        let (status, values) = self
+            .runtime
+            .drive_collect_preprocessing_masked_broadcast_vec(label)?;
+        self.persist_status(&status)?;
+        Ok((status, values))
+    }
+
+    /// Attempts and persists preprocessing CarryCompare certification vector
+    /// collection.
+    pub fn drive_collect_preprocessing_carry_compare_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(PrimeFieldMpcPhaseDriverStatus, Vec<(PartyId, Vec<Coeff>)>), DkgError> {
+        let (status, values) = self
+            .runtime
+            .drive_collect_preprocessing_carry_compare_vec(label)?;
+        self.persist_status(&status)?;
+        Ok((status, values))
+    }
+
+    /// Attempts and persists preprocessing CEF/BCC certification vector
+    /// collection.
+    pub fn drive_collect_preprocessing_cef_bcc_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(PrimeFieldMpcPhaseDriverStatus, Vec<(PartyId, Vec<Coeff>)>), DkgError> {
+        let (status, values) = self
+            .runtime
+            .drive_collect_preprocessing_cef_bcc_vec(label)?;
+        self.persist_status(&status)?;
+        Ok((status, values))
+    }
+
     /// Collects or recovers the Power2Round masked-opening vector and advances
     /// the production driver when the lane shape is complete.
     pub fn drive_collect_power2round_masked_c_vec_and_advance(
@@ -4193,9 +6383,10 @@ where
     /// Collects or recovers all vector phases that certify canonical `R` bit
     /// recovery, then advances the production driver once the complete phase
     /// set has been accepted.
-    pub fn drive_collect_power2round_canonical_recovery_all_vec_and_advance(
+    pub fn drive_collect_power2round_canonical_recovery_all_vec_and_advance<P: MlDsaParams>(
         &mut self,
         driver: &mut ProductionPower2RoundPerPartyDriver,
+        config: &DkgConfig,
         label: &Power2RoundTranscriptLabel,
     ) -> Result<ProductionPower2RoundVectorCollectResult<usize>, DkgError> {
         let mut statuses = Vec::with_capacity(50);
@@ -4212,6 +6403,7 @@ where
             return Ok(ProductionPower2RoundVectorCollectResult::Waiting(statuses));
         }
         lane_count = Some(record_power2round_lane_count(lane_count, &values)?);
+        ensure_collected_vector_reconstructs_zero::<P>(config, &values)?;
         statuses.push(status);
 
         for bit_idx in 0..24 {
@@ -4226,6 +6418,7 @@ where
                 return Ok(ProductionPower2RoundVectorCollectResult::Waiting(statuses));
             }
             lane_count = Some(record_power2round_lane_count(lane_count, &values)?);
+            ensure_collected_vector_reconstructs_zero::<P>(config, &values)?;
             statuses.push(status);
         }
 
@@ -4241,6 +6434,7 @@ where
                 return Ok(ProductionPower2RoundVectorCollectResult::Waiting(statuses));
             }
             lane_count = Some(record_power2round_lane_count(lane_count, &values)?);
+            ensure_collected_vector_reconstructs_zero::<P>(config, &values)?;
             statuses.push(status);
         }
 
@@ -4255,6 +6449,7 @@ where
             return Ok(ProductionPower2RoundVectorCollectResult::Waiting(statuses));
         }
         lane_count = Some(record_power2round_lane_count(lane_count, &values)?);
+        ensure_collected_vector_reconstructs_zero::<P>(config, &values)?;
         statuses.push(status);
 
         let equality_label = label.child("assert_bits_equal_r_mod_q");
@@ -4268,6 +6463,7 @@ where
             return Ok(ProductionPower2RoundVectorCollectResult::Waiting(statuses));
         }
         lane_count = Some(record_power2round_lane_count(lane_count, &values)?);
+        ensure_collected_vector_reconstructs_zero::<P>(config, &values)?;
 
         let lane_count = lane_count.ok_or(DkgError::Power2RoundCanonicalBitsRequired)?;
         driver.accept_canonical_bit_recovery(lane_count)?;
@@ -4492,9 +6688,10 @@ where
 
     /// Collects or recovers all 23 add-4095 vector carry/share phases and
     /// advances the production driver once every bit phase is complete.
-    pub fn drive_collect_power2round_add4095_all_vec_and_advance(
+    pub fn drive_collect_power2round_add4095_all_vec_and_advance<P: MlDsaParams>(
         &mut self,
         driver: &mut ProductionPower2RoundPerPartyDriver,
+        config: &DkgConfig,
         label: &Power2RoundTranscriptLabel,
     ) -> Result<ProductionPower2RoundVectorCollectResult<usize>, DkgError> {
         let mut statuses = Vec::with_capacity(23);
@@ -4510,14 +6707,8 @@ where
                 statuses.push(status);
                 return Ok(ProductionPower2RoundVectorCollectResult::Waiting(statuses));
             }
-            let current_lane_count = uniform_collected_vector_lane_count(&values)?;
-            if let Some(expected) = lane_count {
-                if current_lane_count != expected {
-                    return Err(DkgError::Power2RoundMaskShapeMismatch);
-                }
-            } else {
-                lane_count = Some(current_lane_count);
-            }
+            lane_count = Some(record_power2round_lane_count(lane_count, &values)?);
+            ensure_collected_vector_reconstructs_zero::<P>(config, &values)?;
             statuses.push(status);
         }
         let lane_count = lane_count.ok_or(DkgError::Power2RoundAddRoundConstantRequired)?;
@@ -4585,6 +6776,7 @@ where
             &t1,
         );
         driver.accept_certified_evidence(&evidence)?;
+        ensure_power2round_wire_log_openings_allowed_for_release(self.runtime.wire_log())?;
         let output = ProductionPower2RoundOutput::new(config, assembly_label, t1, evidence)?;
         Ok(ProductionPower2RoundVectorCollectResult::Collected(output))
     }
@@ -4751,7 +6943,7 @@ pub struct ProductionShareVec {
 }
 
 impl ProductionShareVec {
-    fn new(
+    pub(crate) fn new(
         holder: PartyId,
         point: u32,
         label: &Power2RoundTranscriptLabel,
@@ -4838,6 +7030,12 @@ impl ProductionBitShareVec {
         Self { share }
     }
 
+    /// Builds a bit-vector handle from a share handle after a runtime circuit
+    /// has produced a value that is already constrained as bits.
+    pub fn from_certified_share(share: ProductionShareVec) -> Self {
+        Self::new(share)
+    }
+
     /// Returns the transcript-bound identifier.
     pub fn id(&self) -> ProductionShareVectorId {
         self.share.id()
@@ -4864,6 +7062,12 @@ impl ProductionBitShareVec {
     }
 
     pub(crate) fn share(&self) -> &ProductionShareVec {
+        &self.share
+    }
+
+    /// Returns the underlying share handle for callers that need to feed
+    /// certified bit vectors into generic share-vector operations.
+    pub fn certified_share(&self) -> &ProductionShareVec {
         &self.share
     }
 }
@@ -4952,7 +7156,9 @@ pub struct ProductionPublicComparisonVecState {
     kind: ProductionPublicComparisonKind,
     bits_by_bit_le: Vec<ProductionBitShareVec>,
     constant: u32,
+    public_bits_by_bit_le: Option<Vec<Vec<bool>>>,
     label: Power2RoundTranscriptLabel,
+    phase: PrimeFieldMpcPhase,
     bit_idx: isize,
     eq: ProductionBitShareVec,
     comparison: ProductionBitShareVec,
@@ -4983,11 +7189,13 @@ pub struct ProductionBitSumLeqPublicVecState {
     bits: Vec<ProductionBitShareVec>,
     threshold: u32,
     label: Power2RoundTranscriptLabel,
+    phase: PrimeFieldMpcPhase,
     accumulator_bits_le: Vec<ProductionBitShareVec>,
     input_idx: usize,
     bit_idx: usize,
     carry: Option<ProductionBitShareVec>,
     pending_carry_and: bool,
+    fast: Option<ProductionBitSumFastReducerState>,
     comparison: Option<ProductionPublicComparisonVecState>,
     result: Option<ProductionBitShareVec>,
 }
@@ -5007,6 +7215,55 @@ impl ProductionBitSumLeqPublicVecState {
     pub fn accumulator_bits_le(&self) -> &[ProductionBitShareVec] {
         &self.accumulator_bits_le
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProductionBitSumFastPending {
+    CsaAb {
+        triples: Vec<usize>,
+        next_columns: Vec<Vec<ProductionBitShareVec>>,
+        a: ProductionBitShareVec,
+        b: ProductionBitShareVec,
+        c: ProductionBitShareVec,
+    },
+    CsaAxc {
+        triples: Vec<usize>,
+        next_columns: Vec<Vec<ProductionBitShareVec>>,
+        c: ProductionBitShareVec,
+        ab: ProductionBitShareVec,
+        axorb: ProductionBitShareVec,
+        driven: bool,
+    },
+    RippleHalfAnd {
+        column: usize,
+        left: ProductionBitShareVec,
+        right: ProductionBitShareVec,
+    },
+    RippleFullAb {
+        column: usize,
+        a: ProductionBitShareVec,
+        b: ProductionBitShareVec,
+        c: ProductionBitShareVec,
+    },
+    RippleFullAxc {
+        column: usize,
+        c: ProductionBitShareVec,
+        ab: ProductionBitShareVec,
+        axorb: ProductionBitShareVec,
+        driven: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProductionBitSumFastReducerState {
+    columns: Vec<Vec<ProductionBitShareVec>>,
+    lane_count: usize,
+    layer_idx: usize,
+    pending: Option<ProductionBitSumFastPending>,
+    ripple_column: usize,
+    ripple_carry: Option<ProductionBitShareVec>,
+    normal_bits_le: Vec<ProductionBitShareVec>,
+    normal_width: usize,
 }
 
 fn bit_width_for_public_sum(max_sum: usize) -> usize {
@@ -5222,6 +7479,34 @@ where
         )
     }
 
+    /// Local lane-wise multiplication by public field constants.
+    pub fn mul_public_lanes_share_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        share: &ProductionShareVec,
+        constants: &[Coeff],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionShareVec, DkgError> {
+        self.validate_share_vec_context::<P>(config, share)?;
+        if share.len() != constants.len() {
+            return Err(DkgError::Power2RoundMaskShapeMismatch);
+        }
+        let q = i64::from(P::Q);
+        self.share_vec_from_local_lanes::<P>(
+            config,
+            label,
+            share
+                .lanes
+                .iter()
+                .zip(constants.iter().copied())
+                .map(|(&lane, constant)| {
+                    (i64::from(lane) * i64::from(reduce_mod_q::<P>(constant))).rem_euclid(q)
+                        as Coeff
+                })
+                .collect(),
+        )
+    }
+
     /// Bitwise NOT for field-backed secret bit vectors.
     pub fn bit_not_vec<P: MlDsaParams>(
         &self,
@@ -5239,6 +7524,160 @@ where
                     .iter()
                     .map(|&lane| reduce_mod_q::<P>(1 - lane))
                     .collect(),
+            )?,
+        ))
+    }
+
+    /// Applies the public ML-DSA challenge-polynomial multiplication to a
+    /// flattened `PolyVecL` share.
+    ///
+    /// This is a local linear operation over Shamir shares. It does not open
+    /// the share and does not require an MPC multiplication round because the
+    /// challenge polynomial is public. The input and output lane order is
+    /// polynomial-major: `poly_0[0..256], poly_1[0..256], ...`.
+    pub fn mul_public_challenge_polyvec_share_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        share: &ProductionShareVec,
+        ctilde: &[u8],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionShareVec, DkgError> {
+        self.validate_share_vec_context::<P>(config, share)?;
+        if ctilde.len() != P::CTILDE_LEN || share.len() != P::L * P::N {
+            return Err(DkgError::Power2RoundMaskShapeMismatch);
+        }
+        let challenge = talus_core::sample_in_ball::<P>(ctilde);
+        let mut out = Vec::with_capacity(share.len());
+        for poly_idx in 0..P::L {
+            let input = &share.lanes()[poly_idx * P::N..(poly_idx + 1) * P::N];
+            let mut coeffs = [0; 256];
+            coeffs.copy_from_slice(input);
+            let poly = talus_core::mul_challenge_poly::<P>(&challenge, &Poly::from_coeffs(coeffs));
+            out.extend_from_slice(poly.coeffs());
+        }
+        self.share_vec_from_local_lanes::<P>(config, label, out)
+    }
+
+    /// Applies public matrix expansion `A = ExpandA(rho)` to a flattened
+    /// `PolyVecL` share.
+    ///
+    /// This is a local linear operation over Shamir shares and returns a
+    /// flattened `PolyVecK` share. It does not expose the private lanes.
+    pub fn az_from_rho_share_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        rho: &[u8; 32],
+        share: &ProductionShareVec,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionShareVec, DkgError> {
+        self.validate_share_vec_context::<P>(config, share)?;
+        if share.len() != P::L * P::N {
+            return Err(DkgError::Power2RoundMaskShapeMismatch);
+        }
+        let mut polys = Vec::with_capacity(P::L);
+        for poly_idx in 0..P::L {
+            let input = &share.lanes()[poly_idx * P::N..(poly_idx + 1) * P::N];
+            let mut coeffs = [0; 256];
+            coeffs.copy_from_slice(input);
+            polys.push(Poly::from_coeffs(coeffs));
+        }
+        let az = talus_core::az_from_rho::<P>(rho, &PolyVec::new(polys))
+            .map_err(|_| DkgError::Backend("public A*z transform failed"))?;
+        let mut out = Vec::with_capacity(P::K * P::N);
+        for poly in az.polys() {
+            out.extend_from_slice(poly.coeffs());
+        }
+        self.share_vec_from_local_lanes::<P>(config, label, out)
+    }
+
+    /// Selects lane-wise between two private bit vectors using public selector
+    /// lanes. `selector_lanes[idx] == 1` chooses `when_true[idx]`; zero chooses
+    /// `when_false[idx]`.
+    pub fn public_lane_select_bit_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        when_true: &ProductionBitShareVec,
+        when_false: &ProductionBitShareVec,
+        selector_lanes: &[Coeff],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionBitShareVec, DkgError> {
+        self.validate_share_vec_context::<P>(config, when_true.share())?;
+        self.validate_share_vec_context::<P>(config, when_false.share())?;
+        self.ensure_same_share_shape(when_true.share(), when_false.share())?;
+        if when_true.len() != selector_lanes.len()
+            || selector_lanes.iter().any(|&lane| lane != 0 && lane != 1)
+        {
+            return Err(DkgError::Power2RoundMaskShapeMismatch);
+        }
+        let selected_true = self.mul_public_lanes_share_vec::<P>(
+            config,
+            when_true.share(),
+            selector_lanes,
+            &label.child("selected_true"),
+        )?;
+        let inverse = selector_lanes
+            .iter()
+            .map(|&lane| 1 - lane)
+            .collect::<Vec<_>>();
+        let selected_false = self.mul_public_lanes_share_vec::<P>(
+            config,
+            when_false.share(),
+            &inverse,
+            &label.child("selected_false"),
+        )?;
+        Ok(ProductionBitShareVec::new(self.add_share_vec::<P>(
+            config,
+            &selected_true,
+            &selected_false,
+            &label.child("selected"),
+        )?))
+    }
+
+    /// Splits a private bit vector into one-lane bit vectors without opening.
+    ///
+    /// This is used by threshold circuits that need to sum across all lanes
+    /// rather than lane-wise across a set of same-shaped vectors.
+    pub fn split_bit_share_vec_lanes<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bits: &ProductionBitShareVec,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<Vec<ProductionBitShareVec>, DkgError> {
+        self.validate_share_vec_context::<P>(config, bits.share())?;
+        bits.share()
+            .lanes()
+            .iter()
+            .enumerate()
+            .map(|(idx, &lane)| {
+                self.bit_share_vec_from_local_lanes::<P>(
+                    config,
+                    &label.child(format!("lane_{idx}")),
+                    vec![lane],
+                )
+            })
+            .collect()
+    }
+
+    /// Repeats a one-lane private bit share to a vector of `lane_count` lanes.
+    ///
+    /// This lets selection bits multiply whole private response or hint
+    /// vectors without opening the selected index.
+    pub fn repeat_one_lane_bit_share_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bit: &ProductionBitShareVec,
+        lane_count: usize,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionBitShareVec, DkgError> {
+        self.validate_share_vec_context::<P>(config, bit.share())?;
+        if bit.len() != 1 || lane_count == 0 {
+            return Err(DkgError::Power2RoundMaskShapeMismatch);
+        }
+        Ok(ProductionBitShareVec::new(
+            self.share_vec_from_local_lanes::<P>(
+                config,
+                label,
+                vec![bit.share().lanes()[0]; lane_count],
             )?,
         ))
     }
@@ -5435,6 +7874,7 @@ where
             bits_by_bit_le,
             constant,
             label,
+            PrimeFieldMpcPhase::ComparisonToPublicCheck,
         )
     }
 
@@ -5453,7 +7893,126 @@ where
             bits_by_bit_le,
             constant,
             label,
+            PrimeFieldMpcPhase::ComparisonToPublicCheck,
         )
+    }
+
+    /// Initializes a private lane-wise `[x > C_lane]` comparison over
+    /// little-endian secret bit vectors and public per-lane constants.
+    pub fn start_gt_public_lanes_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bits_by_bit_le: &[ProductionBitShareVec],
+        constants: &[Coeff],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionPublicComparisonVecState, DkgError> {
+        self.start_public_comparison_lanes_vec::<P>(
+            config,
+            ProductionPublicComparisonKind::GreaterThan,
+            bits_by_bit_le,
+            constants,
+            label,
+            PrimeFieldMpcPhase::ComparisonToPublicCheck,
+        )
+    }
+
+    /// Initializes a private lane-wise `[x < C_lane]` comparison over
+    /// little-endian secret bit vectors and public per-lane constants.
+    pub fn start_lt_public_lanes_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bits_by_bit_le: &[ProductionBitShareVec],
+        constants: &[Coeff],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionPublicComparisonVecState, DkgError> {
+        self.start_public_comparison_lanes_vec::<P>(
+            config,
+            ProductionPublicComparisonKind::LessThan,
+            bits_by_bit_le,
+            constants,
+            label,
+            PrimeFieldMpcPhase::ComparisonToPublicCheck,
+        )
+    }
+
+    /// Initializes a preprocessing CarryCompare private lane-wise `[x > C]`
+    /// comparison over little-endian secret bit vectors and public per-lane
+    /// constants.
+    pub fn start_preprocessing_carry_compare_gt_public_lanes_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bits_by_bit_le: &[ProductionBitShareVec],
+        constants: &[Coeff],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionPublicComparisonVecState, DkgError> {
+        self.start_public_comparison_lanes_vec::<P>(
+            config,
+            ProductionPublicComparisonKind::GreaterThan,
+            bits_by_bit_le,
+            constants,
+            label,
+            PrimeFieldMpcPhase::PreprocessingCarryCompare,
+        )
+    }
+
+    fn start_public_comparison_lanes_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        kind: ProductionPublicComparisonKind,
+        bits_by_bit_le: &[ProductionBitShareVec],
+        constants: &[Coeff],
+        label: &Power2RoundTranscriptLabel,
+        phase: PrimeFieldMpcPhase,
+    ) -> Result<ProductionPublicComparisonVecState, DkgError> {
+        let first = bits_by_bit_le
+            .first()
+            .ok_or(DkgError::Backend("empty production comparison input"))?;
+        self.validate_share_vec_context::<P>(config, first.share())?;
+        if constants.len() != first.len()
+            || constants
+                .iter()
+                .any(|&constant| constant < 0 || constant >= P::Q)
+        {
+            return Err(DkgError::Power2RoundCanonicalityFailure);
+        }
+        for bits in bits_by_bit_le {
+            self.validate_share_vec_context::<P>(config, bits.share())?;
+            self.ensure_same_share_shape(first.share(), bits.share())?;
+        }
+        let public_bits_by_bit_le = (0..bits_by_bit_le.len())
+            .map(|bit_idx| {
+                constants
+                    .iter()
+                    .map(|&constant| (((constant as u32) >> bit_idx) & 1) == 1)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let lane_count = first.len();
+        Ok(ProductionPublicComparisonVecState {
+            kind,
+            bits_by_bit_le: bits_by_bit_le.to_vec(),
+            constant: 0,
+            public_bits_by_bit_le: Some(public_bits_by_bit_le),
+            label: label.clone(),
+            phase,
+            bit_idx: bits_by_bit_le.len() as isize - 1,
+            eq: self.public_bit_share_vec::<P>(
+                config,
+                &label.child("eq_init"),
+                true,
+                lane_count,
+            )?,
+            comparison: self.public_bit_share_vec::<P>(
+                config,
+                &label.child("comparison_init"),
+                false,
+                lane_count,
+            )?,
+            candidate: None,
+            needs_eq_update: false,
+            pending: None,
+            done: false,
+        })
     }
 
     fn start_public_comparison_vec<P: MlDsaParams>(
@@ -5463,6 +8022,7 @@ where
         bits_by_bit_le: &[ProductionBitShareVec],
         constant: u32,
         label: &Power2RoundTranscriptLabel,
+        phase: PrimeFieldMpcPhase,
     ) -> Result<ProductionPublicComparisonVecState, DkgError> {
         let first = bits_by_bit_le
             .first()
@@ -5477,7 +8037,9 @@ where
             kind,
             bits_by_bit_le: bits_by_bit_le.to_vec(),
             constant,
+            public_bits_by_bit_le: None,
             label: label.clone(),
+            phase,
             bit_idx: bits_by_bit_le.len() as isize - 1,
             eq: self.public_bit_share_vec::<P>(
                 config,
@@ -5505,6 +8067,45 @@ where
         bit_idx: usize,
     ) -> Result<Option<ProductionBitShareVec>, DkgError> {
         let xj = &state.bits_by_bit_le[bit_idx];
+        if let Some(public_bits_by_bit_le) = &state.public_bits_by_bit_le {
+            let c_bits = &public_bits_by_bit_le[bit_idx];
+            let constants = match state.kind {
+                ProductionPublicComparisonKind::LessThan => {
+                    let not_x = self.bit_not_vec::<P>(
+                        config,
+                        xj,
+                        &state.label.child(format!("not_x_{bit_idx}")),
+                    )?;
+                    return Ok(Some(ProductionBitShareVec::new(
+                        self.mul_public_lanes_share_vec::<P>(
+                            config,
+                            not_x.share(),
+                            &c_bits
+                                .iter()
+                                .map(|&bit| if bit { 1 } else { 0 })
+                                .collect::<Vec<_>>(),
+                            &state
+                                .label
+                                .child(format!("lt_public_lane_select_{bit_idx}")),
+                        )?,
+                    )));
+                }
+                ProductionPublicComparisonKind::GreaterThan => c_bits
+                    .iter()
+                    .map(|&bit| if bit { 0 } else { 1 })
+                    .collect::<Vec<_>>(),
+            };
+            return Ok(Some(ProductionBitShareVec::new(
+                self.mul_public_lanes_share_vec::<P>(
+                    config,
+                    xj.share(),
+                    &constants,
+                    &state
+                        .label
+                        .child(format!("gt_public_lane_select_{bit_idx}")),
+                )?,
+            )));
+        }
         let cj = ((state.constant >> bit_idx) & 1) == 1;
         match (state.kind, cj) {
             (ProductionPublicComparisonKind::LessThan, true) => self
@@ -5523,6 +8124,38 @@ where
         bit_idx: usize,
     ) -> Result<ProductionBitShareVec, DkgError> {
         let xj = &state.bits_by_bit_le[bit_idx];
+        if let Some(public_bits_by_bit_le) = &state.public_bits_by_bit_le {
+            let c_bits = &public_bits_by_bit_le[bit_idx];
+            let not_x = self.bit_not_vec::<P>(
+                config,
+                xj,
+                &state.label.child(format!("eq_not_x_{bit_idx}")),
+            )?;
+            let x_when_one = self.mul_public_lanes_share_vec::<P>(
+                config,
+                xj.share(),
+                &c_bits
+                    .iter()
+                    .map(|&bit| if bit { 1 } else { 0 })
+                    .collect::<Vec<_>>(),
+                &state.label.child(format!("eq_x_when_one_{bit_idx}")),
+            )?;
+            let not_x_when_zero = self.mul_public_lanes_share_vec::<P>(
+                config,
+                not_x.share(),
+                &c_bits
+                    .iter()
+                    .map(|&bit| if bit { 0 } else { 1 })
+                    .collect::<Vec<_>>(),
+                &state.label.child(format!("eq_not_x_when_zero_{bit_idx}")),
+            )?;
+            return Ok(ProductionBitShareVec::new(self.add_share_vec::<P>(
+                config,
+                &x_when_one,
+                &not_x_when_zero,
+                &state.label.child(format!("eq_condition_{bit_idx}")),
+            )?));
+        }
         let cj = ((state.constant >> bit_idx) & 1) == 1;
         if cj {
             Ok(xj.clone())
@@ -5546,7 +8179,7 @@ where
             return Ok(PrimeFieldMpcPhaseDriverStatus::Collected {
                 receiver: None,
                 kind: PrimeFieldMpcRoundKind::AssertZero,
-                phase: PrimeFieldMpcPhase::ComparisonToPublicCheck,
+                phase: state.phase,
                 label_hash: power2round_label_hash(&state.label),
                 senders: Vec::new(),
             });
@@ -5561,7 +8194,7 @@ where
             return Ok(PrimeFieldMpcPhaseDriverStatus::Collected {
                 receiver: None,
                 kind: PrimeFieldMpcRoundKind::AssertZero,
-                phase: PrimeFieldMpcPhase::ComparisonToPublicCheck,
+                phase: state.phase,
                 label_hash: power2round_label_hash(&state.label),
                 senders: Vec::new(),
             });
@@ -5576,7 +8209,7 @@ where
                 &state.comparison,
                 candidate,
                 &label,
-                PrimeFieldMpcPhase::ComparisonToPublicCheck,
+                state.phase,
                 entropy,
             )?;
             state.pending = Some(ProductionPublicComparisonPendingKind::UpdateComparison);
@@ -5594,7 +8227,7 @@ where
                 &state.eq,
                 &eq_condition,
                 &label,
-                PrimeFieldMpcPhase::ComparisonToPublicCheck,
+                state.phase,
                 entropy,
             )?;
             state.pending = Some(ProductionPublicComparisonPendingKind::UpdateEquality);
@@ -5613,7 +8246,7 @@ where
                 &state.eq,
                 &condition,
                 &label,
-                PrimeFieldMpcPhase::ComparisonToPublicCheck,
+                state.phase,
                 entropy,
             )?;
             state.pending = Some(ProductionPublicComparisonPendingKind::Candidate);
@@ -5631,7 +8264,7 @@ where
                 &state.eq,
                 &eq_condition,
                 &label,
-                PrimeFieldMpcPhase::ComparisonToPublicCheck,
+                state.phase,
                 entropy,
             )?;
             state.pending = Some(ProductionPublicComparisonPendingKind::UpdateEquality);
@@ -5657,7 +8290,7 @@ where
                     status: PrimeFieldMpcPhaseDriverStatus::Collected {
                         receiver: None,
                         kind: PrimeFieldMpcRoundKind::AssertZero,
-                        phase: PrimeFieldMpcPhase::ComparisonToPublicCheck,
+                        phase: state.phase,
                         label_hash: power2round_label_hash(&state.label),
                         senders: Vec::new(),
                     },
@@ -5680,16 +8313,13 @@ where
                 state.label.child(format!("bit_{bit_idx}/eq_update"))
             }
         };
-        let collected = match self.collect_bit_and_vec_with_phase::<P>(
-            config,
-            &label,
-            PrimeFieldMpcPhase::ComparisonToPublicCheck,
-        )? {
-            ProductionVectorItMpcCollectResult::Waiting(status) => {
-                return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
-            }
-            ProductionVectorItMpcCollectResult::Collected { status, value } => (status, value),
-        };
+        let collected =
+            match self.collect_bit_and_vec_with_phase::<P>(config, &label, state.phase)? {
+                ProductionVectorItMpcCollectResult::Waiting(status) => {
+                    return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+                }
+                ProductionVectorItMpcCollectResult::Collected { status, value } => (status, value),
+            };
         let (status, and_result) = collected;
         match pending {
             ProductionPublicComparisonPendingKind::Candidate => {
@@ -5733,6 +8363,59 @@ where
         threshold: u32,
         label: &Power2RoundTranscriptLabel,
     ) -> Result<ProductionBitSumLeqPublicVecState, DkgError> {
+        self.start_bit_sum_leq_public_vec_with_phase::<P>(
+            config,
+            bits,
+            threshold,
+            label,
+            PrimeFieldMpcPhase::BitSumThresholdCheck,
+        )
+    }
+
+    /// Initializes a preprocessing CEF/BCC private `[sum(bits) <= threshold]`
+    /// circuit over vector lanes.
+    pub fn start_preprocessing_cef_bcc_bit_sum_leq_public_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bits: &[ProductionBitShareVec],
+        threshold: u32,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionBitSumLeqPublicVecState, DkgError> {
+        self.start_bit_sum_leq_public_vec_with_phase::<P>(
+            config,
+            bits,
+            threshold,
+            label,
+            PrimeFieldMpcPhase::PreprocessingCefBcc,
+        )
+    }
+
+    /// Initializes a preprocessing masked-broadcast private
+    /// `[sum(bits) <= threshold]` circuit over vector lanes.
+    pub fn start_preprocessing_masked_broadcast_bit_sum_leq_public_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bits: &[ProductionBitShareVec],
+        threshold: u32,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionBitSumLeqPublicVecState, DkgError> {
+        self.start_bit_sum_leq_public_vec_with_phase::<P>(
+            config,
+            bits,
+            threshold,
+            label,
+            PrimeFieldMpcPhase::PreprocessingMaskedBroadcast,
+        )
+    }
+
+    fn start_bit_sum_leq_public_vec_with_phase<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bits: &[ProductionBitShareVec],
+        threshold: u32,
+        label: &Power2RoundTranscriptLabel,
+        phase: PrimeFieldMpcPhase,
+    ) -> Result<ProductionBitSumLeqPublicVecState, DkgError> {
         let first = bits
             .first()
             .ok_or(DkgError::Backend("empty production threshold input"))?;
@@ -5760,17 +8443,596 @@ where
             })
             .collect::<Result<Vec<_>, DkgError>>()?;
         Ok(ProductionBitSumLeqPublicVecState {
-            bits: bits.to_vec(),
+            bits: Vec::new(),
             threshold,
             label: label.clone(),
+            phase,
             accumulator_bits_le,
             input_idx: 0,
             bit_idx: 0,
             carry: bits.first().cloned(),
             pending_carry_and: false,
+            fast: Some(ProductionBitSumFastReducerState {
+                columns: {
+                    let mut columns = vec![Vec::new(); width];
+                    columns[0] = bits.to_vec();
+                    columns
+                },
+                lane_count,
+                layer_idx: 0,
+                pending: None,
+                ripple_column: 0,
+                ripple_carry: None,
+                normal_bits_le: Vec::with_capacity(width + 1),
+                normal_width: width + 1,
+            }),
             comparison: None,
             result: None,
         })
+    }
+
+    fn pack_bit_share_vecs<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bits: &[ProductionBitShareVec],
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionBitShareVec, DkgError> {
+        let first = bits.first().ok_or(DkgError::Power2RoundMaskShapeMismatch)?;
+        self.validate_share_vec_context::<P>(config, first.share())?;
+        let lane_count = first.len();
+        let mut lanes = Vec::with_capacity(bits.len() * lane_count);
+        for bit in bits {
+            self.validate_share_vec_context::<P>(config, bit.share())?;
+            self.ensure_same_share_shape(first.share(), bit.share())?;
+            lanes.extend_from_slice(bit.share().lanes());
+        }
+        Ok(ProductionBitShareVec::new(
+            self.share_vec_from_local_lanes::<P>(config, label, lanes)?,
+        ))
+    }
+
+    fn unpack_bit_share_vec_chunks<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        bits: &ProductionBitShareVec,
+        chunk_len: usize,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<Vec<ProductionBitShareVec>, DkgError> {
+        self.validate_share_vec_context::<P>(config, bits.share())?;
+        if chunk_len == 0 || bits.len() % chunk_len != 0 {
+            return Err(DkgError::Power2RoundMaskShapeMismatch);
+        }
+        bits.share()
+            .lanes()
+            .chunks(chunk_len)
+            .enumerate()
+            .map(|(idx, lanes)| {
+                Ok(ProductionBitShareVec::new(
+                    self.share_vec_from_local_lanes::<P>(
+                        config,
+                        &label.child(format!("chunk_{idx}")),
+                        lanes.to_vec(),
+                    )?,
+                ))
+            })
+            .collect()
+    }
+
+    fn constant_bit_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+        value: bool,
+        lane_count: usize,
+    ) -> Result<ProductionBitShareVec, DkgError> {
+        self.public_bit_share_vec::<P>(config, label, value, lane_count)
+    }
+
+    fn drive_fast_bit_sum_step<P: MlDsaParams, E: ProductionVectorItMpcEntropy>(
+        &mut self,
+        config: &DkgConfig,
+        state: &mut ProductionBitSumLeqPublicVecState,
+        entropy: &mut E,
+    ) -> Result<Option<PrimeFieldMpcPhaseDriverStatus>, DkgError> {
+        let Some(fast) = state.fast.as_mut() else {
+            return Ok(None);
+        };
+        if let Some(pending) = fast.pending.take() {
+            match pending {
+                ProductionBitSumFastPending::CsaAxc {
+                    triples,
+                    next_columns,
+                    c,
+                    ab,
+                    axorb,
+                    driven: false,
+                } => {
+                    let layer = state
+                        .label
+                        .child(format!("fast_csa_layer_{}", fast.layer_idx));
+                    self.drive_bit_and_vec_with_phase::<P, E>(
+                        config,
+                        &axorb,
+                        &c,
+                        &layer.child("axorb_c"),
+                        state.phase,
+                        entropy,
+                    )?;
+                    fast.pending = Some(ProductionBitSumFastPending::CsaAxc {
+                        triples,
+                        next_columns,
+                        c,
+                        ab,
+                        axorb,
+                        driven: true,
+                    });
+                    return Ok(Some(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+                        receiver: self.local_party(),
+                        kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+                        phase: PrimeFieldMpcPhase::MulDegreeReductionShare,
+                        label_hash: power2round_label_hash(
+                            &layer.child("axorb_c").child("bit_and").child("mul_layer"),
+                        ),
+                    }));
+                }
+                ProductionBitSumFastPending::RippleFullAxc {
+                    column,
+                    c,
+                    ab,
+                    axorb,
+                    driven: false,
+                } => {
+                    let label = state
+                        .label
+                        .child(format!("fast_ripple_{column}/full_axorb_c"));
+                    self.drive_bit_and_vec_with_phase::<P, E>(
+                        config,
+                        &axorb,
+                        &c,
+                        &label,
+                        state.phase,
+                        entropy,
+                    )?;
+                    fast.pending = Some(ProductionBitSumFastPending::RippleFullAxc {
+                        column,
+                        c,
+                        ab,
+                        axorb,
+                        driven: true,
+                    });
+                    return Ok(Some(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+                        receiver: self.local_party(),
+                        kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+                        phase: PrimeFieldMpcPhase::MulDegreeReductionShare,
+                        label_hash: power2round_label_hash(
+                            &label.child("bit_and").child("mul_layer"),
+                        ),
+                    }));
+                }
+                other => {
+                    fast.pending = Some(other);
+                    return Err(DkgError::Backend(
+                        "production fast threshold step already pending",
+                    ));
+                }
+            }
+        }
+        if state.result.is_some() || state.comparison.is_some() {
+            return Ok(None);
+        }
+
+        let mut triples = Vec::new();
+        let mut next_columns = fast
+            .columns
+            .iter()
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<ProductionBitShareVec>>>();
+        let mut a_bits = Vec::new();
+        let mut b_bits = Vec::new();
+        let mut c_bits = Vec::new();
+        for (column, bits) in fast.columns.iter().enumerate() {
+            let mut chunks = bits.chunks_exact(3);
+            for triple in &mut chunks {
+                triples.push(column);
+                a_bits.push(triple[0].clone());
+                b_bits.push(triple[1].clone());
+                c_bits.push(triple[2].clone());
+            }
+            next_columns[column].extend(chunks.remainder().iter().cloned());
+        }
+        if !triples.is_empty() {
+            if fast.columns.len() == next_columns.len() {
+                next_columns.push(Vec::new());
+            }
+            let layer = state
+                .label
+                .child(format!("fast_csa_layer_{}", fast.layer_idx));
+            let a = self.pack_bit_share_vecs::<P>(config, &a_bits, &layer.child("a"))?;
+            let b = self.pack_bit_share_vecs::<P>(config, &b_bits, &layer.child("b"))?;
+            let c = self.pack_bit_share_vecs::<P>(config, &c_bits, &layer.child("c"))?;
+            self.drive_bit_and_vec_with_phase::<P, E>(
+                config,
+                &a,
+                &b,
+                &layer.child("ab"),
+                state.phase,
+                entropy,
+            )?;
+            fast.pending = Some(ProductionBitSumFastPending::CsaAb {
+                triples,
+                next_columns,
+                a,
+                b,
+                c,
+            });
+            return Ok(Some(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+                receiver: self.local_party(),
+                kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+                phase: PrimeFieldMpcPhase::MulDegreeReductionShare,
+                label_hash: power2round_label_hash(
+                    &layer.child("ab").child("bit_and").child("mul_layer"),
+                ),
+            }));
+        }
+
+        if fast.ripple_column >= fast.normal_width {
+            state.accumulator_bits_le = fast.normal_bits_le.clone();
+            state.comparison = Some(self.start_public_comparison_vec::<P>(
+                config,
+                ProductionPublicComparisonKind::GreaterThan,
+                &state.accumulator_bits_le,
+                state.threshold,
+                &state.label.child("sum_gt_threshold"),
+                state.phase,
+            )?);
+            return self
+                .drive_public_comparison_vec_step::<P, E>(
+                    config,
+                    state
+                        .comparison
+                        .as_mut()
+                        .ok_or(DkgError::Power2RoundMaskShapeMismatch)?,
+                    entropy,
+                )
+                .map(Some);
+        }
+
+        let mut operands = fast
+            .columns
+            .get(fast.ripple_column)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(carry) = fast.ripple_carry.take() {
+            operands.push(carry);
+        }
+        match operands.len() {
+            0 => {
+                fast.normal_bits_le.push(
+                    self.constant_bit_vec::<P>(
+                        config,
+                        &state
+                            .label
+                            .child(format!("fast_ripple_{}/zero", fast.ripple_column)),
+                        false,
+                        fast.lane_count,
+                    )?,
+                );
+                fast.ripple_column += 1;
+                self.drive_fast_bit_sum_step::<P, E>(config, state, entropy)
+            }
+            1 => {
+                fast.normal_bits_le.push(operands.remove(0));
+                fast.ripple_column += 1;
+                self.drive_fast_bit_sum_step::<P, E>(config, state, entropy)
+            }
+            2 => {
+                let label = state
+                    .label
+                    .child(format!("fast_ripple_{}/half", fast.ripple_column));
+                self.drive_bit_and_vec_with_phase::<P, E>(
+                    config,
+                    &operands[0],
+                    &operands[1],
+                    &label,
+                    state.phase,
+                    entropy,
+                )?;
+                fast.pending = Some(ProductionBitSumFastPending::RippleHalfAnd {
+                    column: fast.ripple_column,
+                    left: operands[0].clone(),
+                    right: operands[1].clone(),
+                });
+                Ok(Some(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+                    receiver: self.local_party(),
+                    kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+                    phase: PrimeFieldMpcPhase::MulDegreeReductionShare,
+                    label_hash: power2round_label_hash(&label.child("bit_and").child("mul_layer")),
+                }))
+            }
+            3 => {
+                let label = state
+                    .label
+                    .child(format!("fast_ripple_{}/full_ab", fast.ripple_column));
+                self.drive_bit_and_vec_with_phase::<P, E>(
+                    config,
+                    &operands[0],
+                    &operands[1],
+                    &label,
+                    state.phase,
+                    entropy,
+                )?;
+                fast.pending = Some(ProductionBitSumFastPending::RippleFullAb {
+                    column: fast.ripple_column,
+                    a: operands[0].clone(),
+                    b: operands[1].clone(),
+                    c: operands[2].clone(),
+                });
+                Ok(Some(PrimeFieldMpcPhaseDriverStatus::SentPrivate {
+                    receiver: self.local_party(),
+                    kind: PrimeFieldMpcRoundKind::MulDegreeReduce,
+                    phase: PrimeFieldMpcPhase::MulDegreeReductionShare,
+                    label_hash: power2round_label_hash(&label.child("bit_and").child("mul_layer")),
+                }))
+            }
+            _ => Err(DkgError::Power2RoundMaskShapeMismatch),
+        }
+    }
+
+    fn collect_fast_bit_sum_step<P: MlDsaParams>(
+        &mut self,
+        config: &DkgConfig,
+        state: &mut ProductionBitSumLeqPublicVecState,
+    ) -> Result<Option<ProductionVectorItMpcCollectResult<()>>, DkgError> {
+        let Some(fast) = state.fast.as_mut() else {
+            return Ok(None);
+        };
+        let Some(pending) = fast.pending.take() else {
+            return Ok(None);
+        };
+        match pending {
+            ProductionBitSumFastPending::CsaAb {
+                triples,
+                next_columns,
+                a,
+                b,
+                c,
+            } => {
+                let layer = state
+                    .label
+                    .child(format!("fast_csa_layer_{}", fast.layer_idx));
+                let (status, ab) = match self.collect_bit_and_vec_with_phase::<P>(
+                    config,
+                    &layer.child("ab"),
+                    state.phase,
+                )? {
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        fast.pending = Some(ProductionBitSumFastPending::CsaAb {
+                            triples,
+                            next_columns,
+                            a,
+                            b,
+                            c,
+                        });
+                        return Ok(Some(ProductionVectorItMpcCollectResult::Waiting(status)));
+                    }
+                    ProductionVectorItMpcCollectResult::Collected { status, value } => {
+                        (status, value)
+                    }
+                };
+                let axorb =
+                    self.bit_xor_from_and_vec::<P>(config, &a, &b, &ab, &layer.child("a_xor_b"))?;
+                fast.pending = Some(ProductionBitSumFastPending::CsaAxc {
+                    triples,
+                    next_columns,
+                    c,
+                    ab,
+                    axorb,
+                    driven: false,
+                });
+                Ok(Some(ProductionVectorItMpcCollectResult::Collected {
+                    status,
+                    value: (),
+                }))
+            }
+            ProductionBitSumFastPending::CsaAxc {
+                triples,
+                mut next_columns,
+                c,
+                ab,
+                axorb,
+                driven,
+            } => {
+                if !driven {
+                    fast.pending = Some(ProductionBitSumFastPending::CsaAxc {
+                        triples,
+                        next_columns,
+                        c,
+                        ab,
+                        axorb,
+                        driven,
+                    });
+                    return Err(DkgError::Backend(
+                        "production fast threshold axc step not driven",
+                    ));
+                }
+                let layer = state
+                    .label
+                    .child(format!("fast_csa_layer_{}", fast.layer_idx));
+                let (status, axc) = match self.collect_bit_and_vec_with_phase::<P>(
+                    config,
+                    &layer.child("axorb_c"),
+                    state.phase,
+                )? {
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        fast.pending = Some(ProductionBitSumFastPending::CsaAxc {
+                            triples,
+                            next_columns,
+                            c,
+                            ab,
+                            axorb,
+                            driven,
+                        });
+                        return Ok(Some(ProductionVectorItMpcCollectResult::Waiting(status)));
+                    }
+                    ProductionVectorItMpcCollectResult::Collected { status, value } => {
+                        (status, value)
+                    }
+                };
+                let sum =
+                    self.bit_xor_from_and_vec::<P>(config, &axorb, &c, &axc, &layer.child("sum"))?;
+                let carry = ProductionBitShareVec::new(self.add_share_vec::<P>(
+                    config,
+                    ab.share(),
+                    axc.share(),
+                    &layer.child("carry"),
+                )?);
+                let sum_chunks = self.unpack_bit_share_vec_chunks::<P>(
+                    config,
+                    &sum,
+                    fast.lane_count,
+                    &layer.child("sum_chunks"),
+                )?;
+                let carry_chunks = self.unpack_bit_share_vec_chunks::<P>(
+                    config,
+                    &carry,
+                    fast.lane_count,
+                    &layer.child("carry_chunks"),
+                )?;
+                for ((column, sum_bit), carry_bit) in triples
+                    .into_iter()
+                    .zip(sum_chunks.into_iter())
+                    .zip(carry_chunks.into_iter())
+                {
+                    if column + 1 >= next_columns.len() {
+                        next_columns.resize_with(column + 2, Vec::new);
+                    }
+                    next_columns[column].push(sum_bit);
+                    next_columns[column + 1].push(carry_bit);
+                }
+                fast.columns = next_columns;
+                fast.layer_idx += 1;
+                Ok(Some(ProductionVectorItMpcCollectResult::Collected {
+                    status,
+                    value: (),
+                }))
+            }
+            ProductionBitSumFastPending::RippleHalfAnd {
+                column,
+                left,
+                right,
+            } => {
+                let label = state.label.child(format!("fast_ripple_{column}/half"));
+                let (status, and) =
+                    match self.collect_bit_and_vec_with_phase::<P>(config, &label, state.phase)? {
+                        ProductionVectorItMpcCollectResult::Waiting(status) => {
+                            fast.pending = Some(ProductionBitSumFastPending::RippleHalfAnd {
+                                column,
+                                left,
+                                right,
+                            });
+                            return Ok(Some(ProductionVectorItMpcCollectResult::Waiting(status)));
+                        }
+                        ProductionVectorItMpcCollectResult::Collected { status, value } => {
+                            (status, value)
+                        }
+                    };
+                let sum = self.bit_xor_from_and_vec::<P>(
+                    config,
+                    &left,
+                    &right,
+                    &and,
+                    &label.child("sum"),
+                )?;
+                fast.normal_bits_le.push(sum);
+                fast.ripple_carry = Some(and);
+                fast.ripple_column = column + 1;
+                Ok(Some(ProductionVectorItMpcCollectResult::Collected {
+                    status,
+                    value: (),
+                }))
+            }
+            ProductionBitSumFastPending::RippleFullAb { column, a, b, c } => {
+                let label = state.label.child(format!("fast_ripple_{column}/full_ab"));
+                let (status, ab) =
+                    match self.collect_bit_and_vec_with_phase::<P>(config, &label, state.phase)? {
+                        ProductionVectorItMpcCollectResult::Waiting(status) => {
+                            fast.pending =
+                                Some(ProductionBitSumFastPending::RippleFullAb { column, a, b, c });
+                            return Ok(Some(ProductionVectorItMpcCollectResult::Waiting(status)));
+                        }
+                        ProductionVectorItMpcCollectResult::Collected { status, value } => {
+                            (status, value)
+                        }
+                    };
+                let axorb =
+                    self.bit_xor_from_and_vec::<P>(config, &a, &b, &ab, &label.child("a_xor_b"))?;
+                fast.pending = Some(ProductionBitSumFastPending::RippleFullAxc {
+                    column,
+                    c,
+                    ab,
+                    axorb,
+                    driven: false,
+                });
+                Ok(Some(ProductionVectorItMpcCollectResult::Collected {
+                    status,
+                    value: (),
+                }))
+            }
+            ProductionBitSumFastPending::RippleFullAxc {
+                column,
+                c,
+                ab,
+                axorb,
+                driven,
+            } => {
+                if !driven {
+                    fast.pending = Some(ProductionBitSumFastPending::RippleFullAxc {
+                        column,
+                        c,
+                        ab,
+                        axorb,
+                        driven,
+                    });
+                    return Err(DkgError::Backend(
+                        "production fast threshold ripple axc step not driven",
+                    ));
+                }
+                let label = state
+                    .label
+                    .child(format!("fast_ripple_{column}/full_axorb_c"));
+                let (status, axc) =
+                    match self.collect_bit_and_vec_with_phase::<P>(config, &label, state.phase)? {
+                        ProductionVectorItMpcCollectResult::Waiting(status) => {
+                            fast.pending = Some(ProductionBitSumFastPending::RippleFullAxc {
+                                column,
+                                c,
+                                ab,
+                                axorb,
+                                driven,
+                            });
+                            return Ok(Some(ProductionVectorItMpcCollectResult::Waiting(status)));
+                        }
+                        ProductionVectorItMpcCollectResult::Collected { status, value } => {
+                            (status, value)
+                        }
+                    };
+                let sum =
+                    self.bit_xor_from_and_vec::<P>(config, &axorb, &c, &axc, &label.child("sum"))?;
+                let carry = ProductionBitShareVec::new(self.add_share_vec::<P>(
+                    config,
+                    ab.share(),
+                    axc.share(),
+                    &label.child("carry"),
+                )?);
+                fast.normal_bits_le.push(sum);
+                fast.ripple_carry = Some(carry);
+                fast.ripple_column = column + 1;
+                Ok(Some(ProductionVectorItMpcCollectResult::Collected {
+                    status,
+                    value: (),
+                }))
+            }
+        }
     }
 
     /// Drives the next multiplication layer for a private bit-sum threshold
@@ -5785,7 +9047,7 @@ where
             return Ok(PrimeFieldMpcPhaseDriverStatus::Collected {
                 receiver: None,
                 kind: PrimeFieldMpcRoundKind::AssertZero,
-                phase: PrimeFieldMpcPhase::BitSumThresholdCheck,
+                phase: state.phase,
                 label_hash: power2round_label_hash(&state.label),
                 senders: Vec::new(),
             });
@@ -5803,12 +9065,17 @@ where
                 return Ok(PrimeFieldMpcPhaseDriverStatus::Collected {
                     receiver: None,
                     kind: PrimeFieldMpcRoundKind::AssertZero,
-                    phase: PrimeFieldMpcPhase::BitSumThresholdCheck,
+                    phase: state.phase,
                     label_hash: power2round_label_hash(&state.label),
                     senders: Vec::new(),
                 });
             }
             return self.drive_public_comparison_vec_step::<P, E>(config, comparison, entropy);
+        }
+        if state.fast.is_some() {
+            if let Some(status) = self.drive_fast_bit_sum_step::<P, E>(config, state, entropy)? {
+                return Ok(status);
+            }
         }
         if state.pending_carry_and {
             return Err(DkgError::Backend(
@@ -5816,11 +9083,13 @@ where
             ));
         }
         if state.input_idx >= state.bits.len() {
-            state.comparison = Some(self.start_gt_public_vec::<P>(
+            state.comparison = Some(self.start_public_comparison_vec::<P>(
                 config,
+                ProductionPublicComparisonKind::GreaterThan,
                 &state.accumulator_bits_le,
                 state.threshold,
                 &state.label.child("sum_gt_threshold"),
+                state.phase,
             )?);
             return self.drive_bit_sum_leq_public_vec_step::<P, E>(config, state, entropy);
         }
@@ -5843,7 +9112,7 @@ where
             &state.accumulator_bits_le[state.bit_idx],
             carry,
             &label,
-            PrimeFieldMpcPhase::BitSumThresholdCheck,
+            state.phase,
             entropy,
         )?;
         state.pending_carry_and = true;
@@ -5876,7 +9145,7 @@ where
                     status: PrimeFieldMpcPhaseDriverStatus::Collected {
                         receiver: None,
                         kind: PrimeFieldMpcRoundKind::AssertZero,
-                        phase: PrimeFieldMpcPhase::BitSumThresholdCheck,
+                        phase: state.phase,
                         label_hash: power2round_label_hash(&state.label),
                         senders: Vec::new(),
                     },
@@ -5896,6 +9165,11 @@ where
             }
             return Ok(result);
         }
+        if state.fast.is_some() {
+            if let Some(result) = self.collect_fast_bit_sum_step::<P>(config, state)? {
+                return Ok(result);
+            }
+        }
         if !state.pending_carry_and {
             return Err(DkgError::Backend(
                 "production threshold has no pending step",
@@ -5905,16 +9179,13 @@ where
             "add_input_{}/bit_{}/carry",
             state.input_idx, state.bit_idx
         ));
-        let and_result = match self.collect_bit_and_vec_with_phase::<P>(
-            config,
-            &label,
-            PrimeFieldMpcPhase::BitSumThresholdCheck,
-        )? {
-            ProductionVectorItMpcCollectResult::Waiting(status) => {
-                return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
-            }
-            ProductionVectorItMpcCollectResult::Collected { status, value } => (status, value),
-        };
+        let and_result =
+            match self.collect_bit_and_vec_with_phase::<P>(config, &label, state.phase)? {
+                ProductionVectorItMpcCollectResult::Waiting(status) => {
+                    return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+                }
+                ProductionVectorItMpcCollectResult::Collected { status, value } => (status, value),
+            };
         let (status, new_carry) = and_result;
         let carry = state
             .carry
@@ -6392,6 +9663,35 @@ where
         })
     }
 
+    /// Broadcasts this party's local bit lanes for a checked vector opening.
+    pub fn drive_open_bit_share_vec<P: MlDsaParams>(
+        &mut self,
+        config: &DkgConfig,
+        bits: &ProductionBitShareVec,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        self.drive_open_share_vec::<P>(config, bits.share(), label)
+    }
+
+    /// Collects and reconstructs a checked vector bit opening.
+    pub fn collect_open_bit_share_vec<P: MlDsaParams>(
+        &mut self,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<Vec<Coeff>>, DkgError> {
+        match self.collect_open_share_vec::<P>(config, label)? {
+            ProductionVectorItMpcCollectResult::Waiting(status) => {
+                Ok(ProductionVectorItMpcCollectResult::Waiting(status))
+            }
+            ProductionVectorItMpcCollectResult::Collected { status, value } => {
+                if value.iter().any(|&lane| lane != 0 && lane != 1) {
+                    return Err(DkgError::Power2RoundInvalidOpenedBit);
+                }
+                Ok(ProductionVectorItMpcCollectResult::Collected { status, value })
+            }
+        }
+    }
+
     /// Broadcasts this party's local lanes for a checked zero assertion.
     pub fn drive_assert_zero_share_vec<P: MlDsaParams>(
         &mut self,
@@ -6495,6 +9795,43 @@ where
         label: &Power2RoundTranscriptLabel,
     ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError> {
         let (status, values) = self.collect_bit_sum_threshold_check_vec(label)?;
+        if matches!(
+            status,
+            PrimeFieldMpcPhaseDriverStatus::WaitingBroadcast { .. }
+        ) {
+            return Ok(ProductionVectorItMpcCollectResult::Waiting(status));
+        }
+        let opened = reconstruct_collected_prime_field_vector::<P>(config, &values)?;
+        if opened.iter().any(|&value| reduce_mod_q::<P>(value) != 0) {
+            return Err(DkgError::Power2RoundCanonicalityFailure);
+        }
+        Ok(ProductionVectorItMpcCollectResult::Collected { status, value: () })
+    }
+
+    /// Broadcasts a private one-hot selection residual check without opening the
+    /// selected bit pattern.
+    ///
+    /// The residual is typically `sum(selected_bits) - 1`. Collection verifies
+    /// that it reconstructs to zero and records the dedicated private-selection
+    /// phase in the durable runtime log.
+    pub fn drive_private_selection_check_share_vec<P: MlDsaParams>(
+        &mut self,
+        config: &DkgConfig,
+        residual: &ProductionShareVec,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        self.validate_share_vec_context::<P>(config, residual)?;
+        self.private_selection_check_vec(label, residual.lanes())
+    }
+
+    /// Collects a private one-hot selection residual check without returning
+    /// failed raw values.
+    pub fn collect_private_selection_check_share_vec<P: MlDsaParams>(
+        &mut self,
+        config: &DkgConfig,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, DkgError> {
+        let (status, values) = self.collect_private_selection_check_vec(label)?;
         if matches!(
             status,
             PrimeFieldMpcPhaseDriverStatus::WaitingBroadcast { .. }
@@ -6825,6 +10162,61 @@ where
         self.inner.drive_power2round_masked_c_vec(label, values)
     }
 
+    /// Broadcasts preprocessing masked-broadcast consistency vector lanes.
+    pub fn drive_preprocessing_masked_broadcast_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+        values: &[Coeff],
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        self.inner
+            .drive_preprocessing_masked_broadcast_vec(label, values)
+    }
+
+    /// Collects preprocessing masked-broadcast consistency vector lanes.
+    pub fn drive_collect_preprocessing_masked_broadcast_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(PrimeFieldMpcPhaseDriverStatus, Vec<(PartyId, Vec<Coeff>)>), DkgError> {
+        self.inner
+            .drive_collect_preprocessing_masked_broadcast_vec(label)
+    }
+
+    /// Broadcasts preprocessing CarryCompare certification vector lanes.
+    pub fn drive_preprocessing_carry_compare_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+        values: &[Coeff],
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        self.inner
+            .drive_preprocessing_carry_compare_vec(label, values)
+    }
+
+    /// Collects preprocessing CarryCompare certification vector lanes.
+    pub fn drive_collect_preprocessing_carry_compare_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(PrimeFieldMpcPhaseDriverStatus, Vec<(PartyId, Vec<Coeff>)>), DkgError> {
+        self.inner
+            .drive_collect_preprocessing_carry_compare_vec(label)
+    }
+
+    /// Broadcasts preprocessing CEF/BCC certification vector lanes.
+    pub fn drive_preprocessing_cef_bcc_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+        values: &[Coeff],
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        self.inner.drive_preprocessing_cef_bcc_vec(label, values)
+    }
+
+    /// Collects preprocessing CEF/BCC certification vector lanes.
+    pub fn drive_collect_preprocessing_cef_bcc_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(PrimeFieldMpcPhaseDriverStatus, Vec<(PartyId, Vec<Coeff>)>), DkgError> {
+        self.inner.drive_collect_preprocessing_cef_bcc_vec(label)
+    }
+
     /// Collects vector masked openings and advances the Power2Round driver.
     pub fn drive_collect_power2round_masked_c_vec_and_advance(
         &mut self,
@@ -6936,13 +10328,16 @@ where
 
     /// Collects all vector canonical-recovery phases and advances the
     /// Power2Round driver.
-    pub fn drive_collect_power2round_canonical_recovery_all_vec_and_advance(
+    pub fn drive_collect_power2round_canonical_recovery_all_vec_and_advance<P: MlDsaParams>(
         &mut self,
         driver: &mut ProductionPower2RoundPerPartyDriver,
+        config: &DkgConfig,
         label: &Power2RoundTranscriptLabel,
     ) -> Result<ProductionPower2RoundVectorCollectResult<usize>, DkgError> {
         self.inner
-            .drive_collect_power2round_canonical_recovery_all_vec_and_advance(driver, label)
+            .drive_collect_power2round_canonical_recovery_all_vec_and_advance::<P>(
+                driver, config, label,
+            )
     }
 
     /// Broadcasts one vector add-4095 carry/share phase.
@@ -6968,13 +10363,14 @@ where
 
     /// Collects all vector add-4095 phases and advances the Power2Round
     /// driver.
-    pub fn drive_collect_power2round_add4095_all_vec_and_advance(
+    pub fn drive_collect_power2round_add4095_all_vec_and_advance<P: MlDsaParams>(
         &mut self,
         driver: &mut ProductionPower2RoundPerPartyDriver,
+        config: &DkgConfig,
         label: &Power2RoundTranscriptLabel,
     ) -> Result<ProductionPower2RoundVectorCollectResult<usize>, DkgError> {
         self.inner
-            .drive_collect_power2round_add4095_all_vec_and_advance(driver, label)
+            .drive_collect_power2round_add4095_all_vec_and_advance::<P>(driver, config, label)
     }
 
     /// Broadcasts one vector public `t1` bit-opening phase.
@@ -7028,6 +10424,9 @@ where
             ProductionPower2RoundVectorCollectResult::Collected(output) => output,
         };
         let (t1, evidence, _) = output.into_parts();
+        ensure_power2round_state_owned_nonlinear_wire_log_for_release(
+            self.inner.runtime().wire_log(),
+        )?;
         let runtime_evidence = self.runtime_evidence()?;
         let output = ProductionPower2RoundOutput::new_with_runtime_evidence(
             config,
@@ -7071,27 +10470,114 @@ fn record_power2round_lane_count(
     Ok(current)
 }
 
+fn ensure_collected_vector_reconstructs_zero<P: MlDsaParams>(
+    config: &DkgConfig,
+    values: &[(PartyId, Vec<Coeff>)],
+) -> Result<(), DkgError> {
+    let opened = reconstruct_collected_prime_field_vector::<P>(config, values)?;
+    if opened.iter().all(|&value| value == 0) {
+        Ok(())
+    } else {
+        Err(DkgError::Power2RoundCanonicalityFailure)
+    }
+}
+
 fn reconstruct_collected_prime_field_vector<P: MlDsaParams>(
     config: &DkgConfig,
     values: &[(PartyId, Vec<Coeff>)],
 ) -> Result<Vec<Coeff>, DkgError> {
     let lane_count = uniform_collected_vector_lane_count(values)?;
+    let threshold = usize::from(config.threshold);
+    if values.len() < threshold {
+        return Err(DkgError::MissingRoundMessages {
+            round: DkgRound::Finalize,
+            expected: threshold,
+            got: values.len(),
+        });
+    }
     let mut sorted = values.to_vec();
     sorted.sort_by_key(|(party, _)| party.0);
+    let interpolation_points = sorted
+        .iter()
+        .map(|(party, _)| config.interpolation_point::<P>(*party))
+        .collect::<Result<Vec<_>, DkgError>>()?;
+    let base_points = interpolation_points
+        .iter()
+        .copied()
+        .take(threshold)
+        .collect::<Vec<_>>();
     let mut out = Vec::with_capacity(lane_count);
     for lane_idx in 0..lane_count {
-        let shares = sorted
+        let shares = interpolation_points
             .iter()
-            .map(|(party, lanes)| {
-                Ok(ShamirScalarShare {
-                    point: config.interpolation_point::<P>(*party)?,
-                    value: lanes[lane_idx],
-                })
+            .copied()
+            .zip(sorted.iter())
+            .map(|(point, (_, lanes))| ShamirScalarShare {
+                point,
+                value: lanes[lane_idx],
             })
-            .collect::<Result<Vec<_>, DkgError>>()?;
-        out.push(reconstruct_scalar_at_zero::<P>(&shares)?);
+            .collect::<Vec<_>>();
+        let base_shares = shares.iter().copied().take(threshold).collect::<Vec<_>>();
+        for share in &shares {
+            let expected =
+                interpolate_scalar_at_point::<P>(&base_points, &base_shares, share.point)?;
+            if expected != share.value {
+                return Err(DkgError::Power2RoundCanonicalityFailure);
+            }
+        }
+        out.push(reconstruct_scalar_at_zero::<P>(&base_shares)?);
     }
     Ok(out)
+}
+
+fn interpolate_scalar_at_point<P: MlDsaParams>(
+    base_points: &[u32],
+    shares: &[ShamirScalarShare],
+    x: u32,
+) -> Result<Coeff, DkgError> {
+    if base_points.len() != shares.len() || shares.is_empty() {
+        return Err(DkgError::Power2RoundMaskShapeMismatch);
+    }
+    let q = i64::from(P::Q);
+    let x = i64::from(x).rem_euclid(q);
+    let mut value = 0i64;
+    for (i, share) in shares.iter().enumerate() {
+        let xi = i64::from(base_points[i]).rem_euclid(q);
+        let mut numerator = 1i64;
+        let mut denominator = 1i64;
+        for (j, &point_j) in base_points.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let xj = i64::from(point_j).rem_euclid(q);
+            if xi == xj {
+                return Err(DkgError::DuplicateInterpolationPoint);
+            }
+            numerator = (numerator * (x - xj).rem_euclid(q)).rem_euclid(q);
+            denominator = (denominator * (xi - xj).rem_euclid(q)).rem_euclid(q);
+        }
+        let term = (i64::from(share.value) * numerator).rem_euclid(q)
+            * mod_inverse_prime_i64(denominator, q);
+        value = (value + term.rem_euclid(q)).rem_euclid(q);
+    }
+    Ok(value as Coeff)
+}
+
+fn mod_inverse_prime_i64(value: i64, modulus: i64) -> i64 {
+    mod_pow_i64(value, modulus - 2, modulus)
+}
+
+fn mod_pow_i64(mut base: i64, mut exponent: i64, modulus: i64) -> i64 {
+    base = base.rem_euclid(modulus);
+    let mut result = 1i64;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            result = (result * base).rem_euclid(modulus);
+        }
+        base = (base * base).rem_euclid(modulus);
+        exponent >>= 1;
+    }
+    result
 }
 
 impl<T, L> TransportPrimeFieldMpcPartyRuntime<T, L>
@@ -7215,6 +10701,86 @@ where
             PrimeFieldMpcPhase::Power2RoundMaskedOpenC,
             &phase_label,
             values,
+        )
+    }
+
+    /// Drives the preprocessing masked-broadcast consistency vector opening.
+    pub fn drive_preprocessing_masked_broadcast_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+        values: &[Coeff],
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        self.drive_broadcast_phase_vec(
+            PrimeFieldMpcRoundKind::Open,
+            PrimeFieldMpcPhase::PreprocessingMaskedBroadcast,
+            &label.child("preprocessing_masked_broadcast"),
+            values,
+        )
+    }
+
+    /// Attempts to collect the preprocessing masked-broadcast consistency
+    /// vector opening.
+    pub fn drive_collect_preprocessing_masked_broadcast_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(PrimeFieldMpcPhaseDriverStatus, Vec<(PartyId, Vec<Coeff>)>), DkgError> {
+        self.drive_collect_broadcast_phase_vec(
+            PrimeFieldMpcRoundKind::Open,
+            PrimeFieldMpcPhase::PreprocessingMaskedBroadcast,
+            &label.child("preprocessing_masked_broadcast"),
+        )
+    }
+
+    /// Drives a preprocessing CarryCompare certification vector check.
+    pub fn drive_preprocessing_carry_compare_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+        values: &[Coeff],
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        self.drive_broadcast_phase_vec(
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCarryCompare,
+            &label.child("preprocessing_carry_compare"),
+            values,
+        )
+    }
+
+    /// Attempts to collect a preprocessing CarryCompare certification vector
+    /// check.
+    pub fn drive_collect_preprocessing_carry_compare_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(PrimeFieldMpcPhaseDriverStatus, Vec<(PartyId, Vec<Coeff>)>), DkgError> {
+        self.drive_collect_broadcast_phase_vec(
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCarryCompare,
+            &label.child("preprocessing_carry_compare"),
+        )
+    }
+
+    /// Drives a preprocessing CEF/BCC certification vector check.
+    pub fn drive_preprocessing_cef_bcc_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+        values: &[Coeff],
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, DkgError> {
+        self.drive_broadcast_phase_vec(
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCefBcc,
+            &label.child("preprocessing_cef_bcc"),
+            values,
+        )
+    }
+
+    /// Attempts to collect a preprocessing CEF/BCC certification vector check.
+    pub fn drive_collect_preprocessing_cef_bcc_vec(
+        &mut self,
+        label: &Power2RoundTranscriptLabel,
+    ) -> Result<(PrimeFieldMpcPhaseDriverStatus, Vec<(PartyId, Vec<Coeff>)>), DkgError> {
+        self.drive_collect_broadcast_phase_vec(
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCefBcc,
+            &label.child("preprocessing_cef_bcc"),
         )
     }
 
@@ -8007,6 +11573,9 @@ pub(crate) fn prime_field_phase_to_u8(phase: PrimeFieldMpcPhase) -> u8 {
         PrimeFieldMpcPhase::AssertBitCheck => 18,
         PrimeFieldMpcPhase::ComparisonToPublicCheck => 19,
         PrimeFieldMpcPhase::EqualityToPublicCheck => 20,
+        PrimeFieldMpcPhase::PreprocessingMaskedBroadcast => 21,
+        PrimeFieldMpcPhase::PreprocessingCarryCompare => 22,
+        PrimeFieldMpcPhase::PreprocessingCefBcc => 23,
     }
 }
 
@@ -8032,6 +11601,9 @@ pub(crate) fn prime_field_phase_from_u8(value: u8) -> Option<PrimeFieldMpcPhase>
         18 => Some(PrimeFieldMpcPhase::AssertBitCheck),
         19 => Some(PrimeFieldMpcPhase::ComparisonToPublicCheck),
         20 => Some(PrimeFieldMpcPhase::EqualityToPublicCheck),
+        21 => Some(PrimeFieldMpcPhase::PreprocessingMaskedBroadcast),
+        22 => Some(PrimeFieldMpcPhase::PreprocessingCarryCompare),
+        23 => Some(PrimeFieldMpcPhase::PreprocessingCefBcc),
         _ => None,
     }
 }

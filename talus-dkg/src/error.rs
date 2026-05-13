@@ -98,6 +98,9 @@ pub enum DkgError {
     ItVssCertificateLabelMismatch,
     /// IT-VSS complaint-resolution phases were driven out of order.
     ItVssComplaintPhaseOutOfOrder,
+    /// Vector IT-VSS dispute has no public-objective blame evidence, so v1
+    /// aborts without rejecting/blaming a dealer.
+    ItVssAbortNoBlame,
     /// Scalar IT-VSS phases were driven out of order.
     ItVssScalarPhaseOutOfOrder,
     /// Scalar IT-VSS received a replayed phase message.
@@ -422,6 +425,9 @@ pub enum DkgError {
     Power2RoundRequiresSinglePartyDriver,
     /// Production Power2Round per-party phases were driven out of order.
     Power2RoundDriverPhaseOutOfOrder,
+    /// A release Power2Round runtime log contains an opening other than
+    /// masked `C` or public `t1` high bits.
+    Power2RoundForbiddenOpeningInRelease,
     /// Transcript store I/O failed.
     TranscriptStoreIo {
         /// Storage operation.

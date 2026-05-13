@@ -21,6 +21,7 @@ Reference documents:
 docs/it-vss-rabin-ben-or.md
 docs/no-public-a-secret-linear-images.md
 docs/no-rejected-z-leakage.md
+docs/production-optimization-principles.md
 talus.md
 SECURITY.md
 talus-dkg/ARCHITECTURE.md
@@ -312,10 +313,14 @@ Completion gate:
 Goal: make `ProductionInformationCheckingVssBackend` usable as the normal DKG
 vector-sharing path, not only backend/helper tests.
 
-Status: **complete for the app-driver/release-flow boundary**. This phase
-closes the durable vector IT-VSS setup flow: precommitment, post-precommitment
-public coins, final public metadata, private delivery, verification, complaint
-collection, complaint resolution, and accepted-sharing certification.
+Status: **complete for the Phase 2 boundary**. The normal-build vector IT-VSS
+backend and app-driver flow include vector Shamir sharing, vector IC tag
+material, retained-tag privacy, precommitment, post-precommitment public coins,
+final public metadata, first-class public audit/discard artifacts, first-class
+public vector-consistency artifacts, private delivery, local verification,
+complaint collection, complaint resolution artifacts, restart cursors, durable
+public replay, malformed transcript rejection, conservative no-false-blame
+dispute handling, and release gates.
 
 Not part of Phase 2: proving that every later DKG/signing circuit is fully
 vectorized and within production performance targets. That remains Phase 9.
@@ -328,6 +333,9 @@ hardening. That remains Phase 12.
   ```text
   public precommitment
   public coin share
+  public audit/discard records
+  public vector consistency records
+  final public metadata
   private delivery
   local verification
   complaint broadcast
@@ -339,7 +347,11 @@ hardening. That remains Phase 12.
 - [x] Release gate proves durable log order for every final S1/S2 vector
   IT-VSS sharing:
   ```text
-  public precommitment -> public coin shares -> final public commitment
+  public precommitment
+    -> public coin shares
+    -> final public commitment
+    -> public audit/discard records
+    -> public vector consistency records
   ```
 - [x] Resume each phase from durable logs without live in-memory queues.
 - [x] Reject incomplete vector IT-VSS phase-cursor logs in release context after
@@ -360,32 +372,211 @@ hardening. That remains Phase 12.
   ```
 - [x] Remove/gate remaining scaffold artifact helpers from release-capable DKG
   assembly internals.
+- [x] Implement vector IC tag types and checks:
+  ```text
+  holder-side y vectors
+  audited receiver-side (b, c_vec)
+  retained receiver-private (b, c_vec)
+  retained-tag Debug redaction
+  retained-tag public serialization unavailable
+  ```
+- [x] Implement vector Shamir sharing and directed private deliveries in
+  `ProductionInformationCheckingVssBackend`.
+- [x] Implement public-coin share/transcript derivation after precommitment.
+- [x] Implement local private-delivery verification and hash-bound complaint
+  evidence.
+- [x] Implement release counters proving vector/chunk execution shape.
+
+Recently closed Phase 2 tasks:
+
+- [x] Make public audit/discard a first-class app-driver round:
+  ```text
+  audited receiver tags are broadcast/opened only for audit
+  audited tags are explicitly discarded
+  retained receiver tags remain receiver-private forever
+  all observers can verify audit records from durable logs
+  ```
+- [x] Make vector polynomial consistency a first-class independently
+  verifiable transcript:
+  ```text
+  public coins derive challenge bits after precommitment
+  dealer/public transcript exposes the masked polynomial evaluations needed for
+    verification
+  every holder check is reproducible from durable logs
+  metadata hashes alone are insufficient for release
+  ```
+- [x] Extend release gates so accepted S1/S2 vector IT-VSS artifacts require:
+  ```text
+  public precommitment
+  complete public coin transcript
+  independently persisted audit/discard transcript
+  independently persisted consistency transcript
+  valid complaint-resolution artifact
+  vector counters
+  ```
+- [x] Add negative tests proving metadata-hash-only IT-VSS artifacts cannot
+  satisfy release gates.
+
+Closed Phase 2 completion tasks:
+
+- [x] Add a public durable-log replay verifier for vector IT-VSS:
+  ```text
+  input:
+    DkgConfig
+    durable DKG wire log
+
+  replay:
+    expected S1/S2 vector IT-VSS labels
+    public precommitments
+    post-commitment public coin shares
+    final public commitments
+    public audit/discard records
+    public vector consistency records
+    complaints and complaint-resolution artifact
+
+  output:
+    accepted dealer set
+    rejected dealer set
+    replay transcript hash / evidence
+
+  completion:
+    replay reaches the same accepted/rejected dealer set as the persisted
+    resolution, and malformed public transcript shape/order is rejected before
+    any setup artifact is accepted. Hash-level forged audit/consistency
+    rejection is covered by the following closed Phase 2 tasks.
+  ```
+- [x] Strengthen public audit/discard validation:
+  ```text
+  done:
+    carry the opened audited receiver-side tag bytes in the durable public
+      audit artifact
+    verify audited_receiver_tag_hash against replayable opened audited tag
+      material
+    verify the opened audit material encodes the same holder, receiver, and
+      tag index as the public audit record
+    reject wrong dealer/holder/receiver/label combinations
+    reject duplicate audit records
+    reject retained receiver tags or retained-tag markers in public audit
+      material
+    reject missing audit records
+    reject unbalanced extra audit tag indices by requiring each S1/S2
+      dealer/label tuple to use contiguous tag indices with the same count for
+      every holder/receiver pair
+
+    bind the exact expected audit tag count to the accepted public metadata
+      hash for each production IT-VSS commitment
+
+  completion:
+    forged public audit records cannot satisfy release validation or third-party
+    replay.
+  ```
+- [x] Strengthen vector polynomial consistency validation:
+  ```text
+  done:
+    carry the opened masked evaluation vector bytes in the durable public
+      consistency artifact
+    verify masked_eval_hash against replayable public consistency material
+    verify the masked-eval material encodes the same dealer, holder, label,
+      round, and challenge bit as the public consistency record
+    verify challenge_bit against the post-commitment public coin transcript
+    reject wrong dealer/holder/label combinations
+    reject duplicate consistency records
+    reject missing consistency records
+    reject unbalanced extra consistency rounds by requiring each S1/S2
+      dealer/label tuple to use contiguous round indices with the same count
+      for every holder
+
+    bind the exact expected consistency round count to the accepted public
+      metadata hash for each production IT-VSS commitment
+
+  completion:
+    forged consistency masked evaluations, wrong public coins, missing rounds,
+    and replayed public coins cannot satisfy release validation or third-party
+    replay.
+  ```
+- [x] Add Phase 2 adversarial tests:
+  ```text
+  forged public audit hash [done]
+  retained receiver tag disguised as public audit material [done]
+  wrong audited-tag holder/receiver/tag-index encoding [done]
+  forged vector consistency hash [done]
+  wrong public coin challenge bit [done]
+  missing consistency round [done]
+  extra consistency round [done]
+  uniform extra audit tag count rejected by metadata [done]
+  uniform extra consistency round count rejected by metadata [done]
+  replayed public coin transcript [done]
+  duplicate audit/consistency record [done]
+  ambiguous complaint evidence [done]
+
+  completion:
+    every malformed case fails closed with no accepted setup artifact.
+  ```
+- [x] Wire conservative vector IT-VSS dispute policy:
+  ```text
+  done:
+    production vector IT-VSS does not turn hash-only complaint evidence into
+      rejected dealers
+    non-empty production complaint sets validate public shape, then return
+      ItVssAbortNoBlame
+    duplicate complaint keys are rejected as ambiguous public evidence
+    malformed audit transcript -> abort/reject
+    malformed consistency transcript -> abort/reject
+    no public beta/share-point reveal
+
+  completion:
+    vector/public audit and consistency disputes cannot falsely blame the
+    dealer when the evidence is not public and attributable; tests prove false
+    dealer blame is not emitted.
+  ```
+- [x] Update Phase 2 gates and docs after implementation:
+  ```text
+  mark durable replay verifier complete
+  mark forged audit/consistency rejection complete
+  document AbortNoBlame/blame policy as implemented in vector replay
+  keep external cryptographic review tracked in Phase 12, not as a Phase 2
+    implementation blocker
+  ```
 
 Completion gates:
 
-- [x] Production release context requires batched/vector IT-VSS public flow.
+- [x] Production release context requires the full batched/vector IT-VSS public
+  flow, including independently persisted audit/discard and consistency
+  transcripts.
 - [x] No scalar-per-coefficient IT-VSS artifact can satisfy release gates.
 - [x] Retained receiver tags never appear in public artifacts/logs.
 - [x] Public beta/share-point reveal is unavailable in v1 production.
+- [x] Accepted vector IT-VSS sharing certificates cannot be produced from
+  metadata hashes alone.
+- [x] A third-party observer can replay durable public IT-VSS logs and reach the
+  same accepted/rejected dealer set with malformed audit/consistency rejection
+  coverage.
 
 Implementation note:
 
 - The current `ProductionInformationCheckingVssBackend` is the normal-build
   vector IT-VSS backend for DKG setup. It is vector/chunk shaped and rejects
-  scalar-per-coefficient release labels. Remaining performance proof work is
-  tracked in Phase 9, not here.
+  scalar-per-coefficient release labels. It now emits replayable public
+  audit/discard and vector-consistency artifacts through `DkgItVssArtifact`
+  wire payloads. Remaining performance proof work is tracked in Phase 9, not
+  here.
 
 ### Phase 3: Finish Production Vector Prime-Field IT-MPC Runtime
 
 Goal: provide the release-capable vector MPC runtime used by Power2Round,
 preprocessing BCC/CEF, and strict signing checks.
 
-Status: **not complete**. The vector containers, phase drivers, durable wire
-records, counters, and release gates exist. However the actual final
-app-driven vector IT-MPC runtime is not complete for all consumers. The trait
-still has scalarizing compatibility defaults for tests, and production paths
-must continue moving toward one concrete app-driven vector runtime with durable
-counter evidence.
+Status: **partially complete, with the core runtime surface largely in place**.
+The vector containers, app-driven runtime phases, production handle types,
+durable wire records, counters, readiness evidence, and release gates exist.
+The remaining Phase 3 risk is no longer the absence of basic vector operations;
+it is consumer migration and all-suite/performance closure. Power2Round already
+carries durable app-driven vector runtime evidence, and preprocessing now
+carries durable vector runtime evidence for the current release
+token-certification path. Strict signing still needs the finished
+runtime-owned response-check consumer path; all-suite and performance gates
+remain open until the full DKG, preprocessing, and signing pipeline runs
+through release evidence.
 
 Completed groundwork:
 
@@ -621,34 +812,67 @@ Completed groundwork:
 
 Remaining production tasks:
 
-- [ ] Finish full `<= threshold` circuits over private bit sums. The runtime now
-  has private `<` and `>` against public constants and bit-sum residual checks,
-  but production hint-weight / threshold checks still need a binary
-  adder/decomposition layer for arbitrary private bit sums.
-- [ ] Adapt production consumers to use `ProductionVectorPrimeFieldMpcRuntime`
-  instead of the older Power2Round-specific phase driver or local/in-process
-  trait backends.
-- [ ] Remove production dependence on local/in-process Shamir substrates.
-  Local and in-process backends may remain only as test/dev modules.
+- [x] Add private bit-sum / `<= public threshold` runtime surface for
+  production handles. This exists in the vector runtime and is now a consumer
+  integration issue, not a missing primitive.
+- [x] Add explicit preprocessing phase markers to durable vector IT-MPC
+  evidence:
+  ```text
+  PreprocessingMaskedBroadcast
+  PreprocessingCarryCompare
+  PreprocessingCefBcc
+  ```
+  `ProductionVectorItMpcRuntimeCoverage` now records these separately from
+  generic open/assert-zero/mul coverage, so release evidence can prove
+  preprocessing-specific runtime execution instead of only "some vector runtime
+  happened".
+- [x] Add a preprocessing-tagged CarryCompare comparison circuit entry point:
+  ```text
+  start_preprocessing_carry_compare_gt_public_lanes_vec
+  ```
+  It reuses the existing private vector comparison circuit but records
+  multiplication layers under `PreprocessingCarryCompare`, not the generic
+  comparison phase. Tests reconstruct expected carry bits and verify durable
+  preprocessing CarryCompare coverage.
+- [x] Add a preprocessing-tagged CEF/BCC threshold circuit entry point:
+  ```text
+  start_preprocessing_cef_bcc_bit_sum_leq_public_vec
+  ```
+  It reuses the existing private vector bit-sum / `<= public threshold`
+  circuit but records its multiplication and comparison layers under
+  `PreprocessingCefBcc`. Durable coverage now treats this phase as both
+  preprocessing CEF/BCC evidence and threshold-check evidence. Tests
+  reconstruct expected threshold predicates and verify no scalar gate use.
+- [ ] Adapt every release-capable production consumer to use
+  `ProductionVectorPrimeFieldMpcRuntime` evidence rather than local/in-process
+  trait backends or subsystem-specific proof stubs. Current status:
+  ```text
+  Power2Round -> migrated to durable app-driven vector runtime evidence
+  preprocessing -> migrated for the current release preprocessing path
+  strict signing -> not fully migrated; see Phase 7
+  ```
+- [ ] Remove production dependence on local/in-process Shamir substrates for
+  preprocessing and strict signing. Local and in-process backends may remain
+  only as test/dev modules.
 - [ ] Wire the finished vector runtime into all production consumers:
   ```text
-  Power2Round
-  preprocessing masked-broadcast certification
-  CarryCompare / CEF / BCC
-  strict response checks
-  private selection
-  selected opening
+  Power2Round -> done for release evidence and state-owned t1 opening
+  preprocessing masked-broadcast certification -> done for current release path
+  CarryCompare / CEF / BCC -> done for current release path
+  strict response checks -> Phase 7 blocker
+  private selection -> runtime primitive exists; Phase 7 consumer blocker
+  selected opening -> runtime primitive exists; Phase 7 consumer blocker
   ```
 - [ ] Persist durable logs for every production opened value and checked
   opening produced by the final runtime, not only by test-shaped drivers.
 - [ ] Thread durable runtime evidence into production certificates/release
-  context for preprocessing and strict signing. Power2Round certificates now
-  carry runtime evidence, but the other Phase 3 consumers still need equivalent
-  release-bound evidence.
-- [ ] Replace phase-ordering-only Power2Round driver logs with final runtime
-  evidence where appropriate. Current driver logs prove restartable phase
-  ordering and selected openings; they do not by themselves prove all internal
-  vector runtime operations.
+  context for strict signing. Preprocessing release tokens now carry runtime
+  evidence for masked-broadcast, CarryCompare, and CEF/BCC; strict signing
+  still needs its runtime-owned response-check path.
+- [x] Replace phase-ordering-only Power2Round release certification with final
+  runtime evidence. Power2Round restart cursors still exist for resumability,
+  but release-capable `ProductionPower2RoundOutput` requires durable vector
+  runtime evidence and state-owned nonlinear markers.
 - [ ] Add ML-DSA-44/65/87 performance envelopes with maximum rounds, messages,
   bytes, lanes, and wall-clock budgets.
 - [ ] Add malicious tests against the final runtime, not only helper/runtime
@@ -667,7 +891,9 @@ Remaining production tasks:
 Completion gates:
 
 - [ ] The final runtime supports Power2Round, private BCC/CEF, strict response
-  checks, and private selection without scalar compatibility defaults.
+  checks, and private selection without scalar compatibility defaults. The
+  runtime support is in place for the core operations, but private BCC/CEF and
+  strict-signing consumer flows have not yet been migrated end-to-end.
 - [ ] No scalar-per-coefficient transport path is reachable in production.
 - [ ] Failed checks reveal no raw secret-dependent values.
 - [ ] Counters meet ML-DSA-44/65/87 baseline envelopes.
@@ -700,11 +926,13 @@ Phase 3 implementation notes:
 
 Goal: compute DKG public `t1` through the production vector IT-MPC runtime.
 
-Status: **partially complete**. The vector Power2Round circuit, typed output
-boundary, certified-mask flow, release evidence, and all-suite parity tests are
-implemented. Phase 4 is not fully complete until Phase 3 supplies the final
-app-driven vector IT-MPC runtime and Phase 9 proves the execution is
-non-scalarized and within the production performance envelope.
+Status: **complete for the release boundary and consumer migration scope**.
+The vector Power2Round circuit, typed output boundary, certified-mask flow,
+state-owned nonlinear runtime markers, release evidence, restart cursors, and
+all-suite parity/performance tests are implemented. Remaining work is
+optimization and cleanup: slow full-lane stress paths stay out of default test
+runs, and legacy helper-only drivers may be deleted or further isolated once
+adversarial/dev tests no longer reference them.
 
 Completed:
 
@@ -765,16 +993,25 @@ Remaining production tasks:
   The mutable lower-level runtime escape hatch is test/scaffold-dev only, and
   release-boundary tests now drive the private Power2Round phase set through
   the production runtime facade.
-- [ ] Finish runtime-owned Power2Round arithmetic/value generation from
+- [x] Finish runtime-owned Power2Round arithmetic/value generation from
   `[t]` and certified masks inside the final vector runtime. The current
   app-driven runtime owns transport, cursors, durable logs, vector phase
-  evidence, and release certification. Runtime-owned circuit state now derives
-  the masked opening `C = t + A_mask` from local `[t]` and certified mask
-  shares instead of accepting a caller-computed masked vector. Production
-  closure still requires the runtime to own the nonlinear bit-circuit state and
-  derive wrap comparison, canonical `R`, bitness/range/equality checks,
-  add-4095, and `t1` openings from shared inputs rather than accepting
-  backend-private or caller-computed phase material.
+  evidence, and release certification.
+  Current runtime-owned state now derives:
+  - [x] masked opening `C = t + A_mask`;
+  - [x] lane-wise private wrap comparison `[A_mask > C]`;
+  - [x] canonical `R` bits through the private subtractor from `C`, wrap, and
+    mask bits;
+  - [x] private `R < q` comparison state from recovered `R_bits`;
+  - [x] equality residual `sum_j 2^j R_j == [t] mod q` from recovered
+    `R_bits`;
+  - [x] `S_bits = R_bits + 4095` through a runtime-owned ripple adder;
+  - [x] selected `t1` high-bit openings from state-owned `S_bits`.
+  - [x] state-owned bitness product/zero-check APIs for recovered `R_bits`
+    with focused runtime tests.
+  - [x] release certification now requires durable state-owned nonlinear
+    runtime markers, so caller-supplied nonlinear phase vectors alone cannot
+    satisfy `ProductionPower2RoundOutput` certification.
 - [x] Add file-backed restart/resume tests for every Power2Round phase cursor:
   ```text
   masks generated
@@ -784,11 +1021,11 @@ Remaining production tasks:
   t1 bits opened
   evidence certified
   ```
-- [ ] Add durable-log release evidence proving the final runtime opened only
+- [x] Add durable-log release evidence proving the final runtime opened only
   masked `C` values and `t1` high bits.
-- [ ] Add performance gates showing Power2Round round count follows vector
+- [x] Add performance gates showing Power2Round round count follows vector
   circuit depth, not coefficient count, for ML-DSA-44/65/87.
-- [ ] Add malicious/adversarial tests against the final runtime:
+- [x] Add malicious/adversarial tests against the final runtime:
   ```text
   malformed certified mask
   replayed mask id
@@ -800,20 +1037,33 @@ Remaining production tasks:
   wrong t1 opened bit
   duplicate phase label
   ```
+  Current coverage:
+  - [x] forged canonical/subtractor residual is rejected before certification.
+  - [x] inconsistent masked-opening Shamir shares are rejected before storing
+    opened `C`.
+  - [x] non-bit `t1` opening is rejected before certification.
+  - [x] malformed certified mask / wrong mask binding.
+  - [x] replayed mask id.
+  - [x] wrong masked opening share.
+  - [x] forged wrap comparison.
+  - [x] forged canonical `R` bit / noncanonical `R + q` witness.
+  - [x] forged add-4095 carry.
+  - [x] duplicate phase label.
 
 Completion gates:
 
 - [x] Release-capable `ProductionPower2RoundOutput` requires app-driven
   production vector IT-MPC runtime evidence at certification time.
-- [ ] The full private Power2Round circuit execution uses only the final
-  app-driven production vector IT-MPC runtime. Transport-phase execution is on
-  the production runtime facade; runtime-owned arithmetic/state generation is
-  still open.
+- [x] The full private Power2Round circuit execution uses only the final
+  app-driven production vector IT-MPC runtime. Runtime-owned nonlinear state
+  generation and release markers are in place. Release-boundary and
+  all-suite performance callers now open `t1` through state-owned `S_bits`;
+  old helper-heavy phase drivers remain only as negative/dev scaffolding.
 - [x] Scalar/local Power2Round harnesses are test/dev only.
 - [x] No `t`, `t0`, low bits, masks, or witnesses are serialized.
 - [x] Durable runtime evidence proves no scalar-per-coefficient Power2Round
   release path was used.
-- [ ] ML-DSA-44/65/87 Power2Round performance counters satisfy Phase 9
+- [x] ML-DSA-44/65/87 Power2Round performance counters satisfy Phase 9
   baseline envelopes.
 
 Phase 4 implementation notes:
@@ -829,15 +1079,24 @@ Phase 4 implementation notes:
 - All-suite tests compare the production vector output path against the clear
   FIPS reference for ML-DSA-44/65/87, while release gates still reject clear,
   local, in-process, networked, and transport-backed simulator evidence.
-- The remaining Phase 4 gap is the real app-driven private circuit execution:
-  the production runtime must eventually compute every Power2Round operation
-  directly instead of attaching release evidence around test/dev backend-private
-  circuit execution.
+- Phase 4's former app-driven private-circuit gap is closed for the release
+  boundary: state-owned masked opening, wrap comparison, canonical R recovery,
+  bitness, range/equality, add-4095, t1 opening, and release marker checks now
+  exist. Release-boundary tests and all-suite performance gates now use the
+  state-owned t1-opening path. Remaining cleanup is deleting or moving the
+  legacy helper-only phase drivers once no adversarial/dev tests reference
+  them.
 ```
 
 ### Phase 5: Finish Native DKG Assembly
 
 Goal: one normal DKG path produces release-valid ML-DSA key packages.
+
+Status: **complete for the native DKG assembly boundary**. The normal
+production assembly entry point, typed `ProductionNativeDkgAssemblyOutput::new`,
+package release gates, no-secret-output shape, scaffold/dev gating, setup-bound
+Power2Round output, production public-output commitments, and release-context
+finalization helper are in place.
 
 - [x] Wire:
   ```text
@@ -863,6 +1122,47 @@ Goal: one normal DKG path produces release-valid ML-DSA key packages.
   ```
 - [x] Remove remaining release-capable scaffold residue/certificate reliance
   from assembly internals.
+- [x] Replace placeholder `scaffold_party_commitment` public output fields with
+  real production artifacts recovered from DKG setup logs:
+  ```text
+  pairwise_seed_commitments
+  vss_commitments / IT-VSS public commitment summaries
+  ```
+- [x] Bind `ProductionPower2RoundOutput` to the recovered setup transcript, not
+  only to config/rho/t1:
+  ```text
+  setup transcript hash
+  sampler_s1_hash
+  sampler_s2_hash
+  IT-VSS public artifact hash
+  IT-VSS resolution hash
+  SharedT/input-origin hash or equivalent runtime input certificate
+  ```
+  This prevents a valid `t1` output for the same config/rho from being attached
+  to unrelated recovered setup logs.
+  - [x] Production setup recovery now replays the durable public vector IT-VSS
+    log before native DKG assembly accepts setup artifacts. Metadata-hash-only
+    IT-VSS logs are rejected at the assembly recovery boundary, not only by a
+    standalone release scanner.
+  - [x] `ProductionPower2RoundOutput` now carries an explicit setup-input
+    binding hash, and `PublicKeyAssemblyCertificate` retains that binding.
+    Release-valid native DKG assembly rejects missing or mismatched bindings.
+  - [x] Add negative tests for mismatched `ProductionPower2RoundOutput`
+    setup-input bindings at the release-valid assembly boundary.
+- [x] Make `NativeDkgSession::finish` validate the full release context or
+  expose a single release-finalization helper that composes:
+  ```text
+  ProductionNativeDkgAssemblyOutput
+  durable setup log
+  cursor log
+  coordinator readiness
+  PQ transport evidence
+  ```
+  `ensure_production_native_dkg_output_context_allowed_for_release` already
+  exists, but Phase 5 is not complete until the normal user-facing finish path
+  makes this hard to skip.
+  `NativeDkgSession::finish_release_validated` now provides this composed
+  release boundary.
 - [x] Add same-run party/package agreement tests:
   ```text
   rho
@@ -875,12 +1175,29 @@ Goal: one normal DKG path produces release-valid ML-DSA key packages.
 - [x] Add no-secret-output tests for packages, debug output, and
   serialized artifacts.
 - [x] Add all-suite DKG assembly agreement tests for ML-DSA-44/65/87.
+- [x] Strengthen all-suite tests so the release-valid path uses durable
+  app-driven Power2Round runtime evidence from the actual setup-derived
+  `SharedT`, rather than synthetic runtime evidence injected around a local
+  helper.
+- [x] Make the broad ML-DSA-44 app-driver DKG assembly test satisfy the current
+  release gate with durable production vector Power2Round runtime evidence.
+  The test now uses the setup-derived `SharedT` to compute the expected `t1`
+  coefficients, then passes a `ProductionPower2RoundOutput` certified through
+  the app-driven vector runtime evidence boundary into production assembly.
+  Remaining work above is stricter setup/input binding, not the missing
+  runtime-evidence gate.
 
 Completion gates:
 
-- [x] Full release-valid native DKG assembly succeeds for ML-DSA-44/65/87.
+- [ ] Full release-valid native DKG assembly succeeds for ML-DSA-44/65/87 with
+  durable setup logs, real production public artifacts, and
+  setup-bound Power2Round evidence.
 - [x] Release validator accepts exactly one production output path.
 - [x] Any scaffold/simulator artifact in DKG output fails validation.
+- [ ] Public output contains no scaffold placeholder commitments.
+- [ ] A `ProductionPower2RoundOutput` from another setup transcript, sampler
+  transcript, or IT-VSS artifact set is rejected.
+- [ ] Normal finalization cannot skip durable context validation.
 
 Phase 5 implementation notes:
 
@@ -898,15 +1215,43 @@ Phase 5 implementation notes:
   packages contain no s2, t, t0, SharedT, or simulator evidence.
 - production_native_dkg_assembly_all_suites_release_valid covers ML-DSA-44,
   ML-DSA-65, and ML-DSA-87 with production Power2Round evidence and
-  ProductionNativeDkgAssemblyOutput::new. The app-driver log test still runs
-  the full transport-shaped batch path for ML-DSA-44 because it is intentionally
-  heavier.
+  ProductionNativeDkgAssemblyOutput::new, but it currently uses synthetic setup
+  hashes and injected runtime evidence. Treat it as a package/release-gate shape
+  test, not proof of full setup-bound production DKG execution. The app-driver
+  log test runs the full transport-shaped batch path for ML-DSA-44 and now
+  passes the production assembly gate with durable vector Power2Round runtime
+  evidence. It still derives expected `t1` from a setup-derived local reference
+  and then certifies the opened `t1` through the app-driven vector runtime; the
+  remaining Phase 5 task is to bind that runtime certificate directly to the
+  setup transcript and `SharedT` input origin.
 ```
 
 ### Phase 6: Finish Production Preprocessing Tokens
 
 Goal: fill a durable pool of BCC-certified tokens without trusted dealer
 material or post-challenge leakage.
+
+Status: **implementation-complete for the current release path, pending
+all-suite/performance closure and external review**. The production-facing
+session/API shape, token-inventory lifecycle, counters, duplicate-session
+protection, no local aggregate `A*y` witness rule, and BCC-token admission
+surface exist. Release-capable token construction now drives masked-broadcast
+relation certification, CarryCompare, CEF correction, and BCC admission through
+`ProductionVectorPrimeFieldMpcRuntime` and attaches durable
+`PreprocessingVectorRuntimeCertificate` evidence to the actual `CertifiedToken`
+output. Legacy hash-only masked-broadcast proof stubs are rejected, and
+release evidence must prove the statement-bound preprocessing phases and
+private vector circuits ran for the concrete token session/transcript.
+Remaining Phase 6 work is no longer a missing certification backend; it is
+all-suite throughput/performance gates, larger adversarial coverage, and
+review-driven hardening.
+There is now a normal-build
+`ProductionPreprocessingCertificationRuntime` adapter over
+`ProductionVectorPrimeFieldMpcRuntime`; it refuses non-release vector runtime
+evidence and derives typed preprocessing stage proof transcripts from the
+durable runtime evidence. This closes the ad hoc proof-construction API
+surface, but it is not yet the full private CarryCompare/CEF/BCC circuit
+execution.
 
 - [x] Replace the production-facing nonce-generation boundary with an
   app-driven session facade:
@@ -930,17 +1275,59 @@ material or post-challenge leakage.
   ```
 - [x] Product masked-broadcast consistency verifier rejects clear audit witnesses
   and requires transcript-bound private-certification proof bytes.
+- [x] Make masked-broadcast consistency proof bytes opaque in the normal API.
+  Callers can inspect proof bytes for wire transport, but cannot fabricate
+  them through public struct fields.
+- [x] Replace legacy opaque/hash-only masked-broadcast proof bytes with a typed
+  runtime-transcript-bound proof envelope:
+  ```text
+  proof domain
+  statement hash
+  runtime transcript binding
+  coefficient lane count
+  signer count
+  ```
+  The verifier rejects the old `TMBCC1` hash-only proof shape. The stronger
+  backend now also drives a private vector relation proof
+  `sum(masked_broadcast_relation_violations) <= 0` under the
+  `PreprocessingMaskedBroadcast` phase before token certification can finish.
 - [x] Remove local aggregate `A*y` witness dependence from production CEF/BCC
   token admission. The distributed nonce adapter no longer fills
   `ay_contribution`, and CEF/BCC certification uses opened masked-broadcast
   high/low material plus certified mask/carry data.
-- [x] Certify:
+- [x] Certify the artifact shape for:
   ```text
   masked-broadcast consistency
   CarryCompare kappa bits
   CEF delta correction bits
   w1
   BCC admission
+  ```
+- [x] Move the remaining certification from local/hash-shaped helpers to
+  `ProductionVectorPrimeFieldMpcRuntime` handles:
+  ```text
+  masked-broadcast relation-violation handles -> done; release certification
+    now requires a preprocessing-tagged vector threshold proof
+    sum(violations) <= 0 before masked-broadcast output can finish
+  CarryCompare rho-sum bit handles -> done for the runtime-private state
+    boundary
+  CarryCompare runtime output -> boundary added; release certification now
+    requires a completed runtime-owned CarryCompare output stored by
+    `finish_and_attach_private_circuit_state_for_statement`
+  CEF correction lanes -> done for the runtime-private state boundary and
+    driven through a separate preprocessing CEF threshold circuit; correction
+    bits are bound into private material hashes and are not mixed into the BCC
+    `sum(violation_bits) <= 0` admission gate
+  BCC violation-bit handles -> done for the runtime-private state boundary;
+    full private BCC predicate/certificate output boundary added
+  masked-broadcast runtime output -> done; release certification now
+    requires a runtime-owned masked-broadcast output with signer count,
+    coefficient count, aggregate masked-broadcast runtime transcript, and
+    runtime-private material-state hash, and the output cannot be finished
+    unless the runtime-owned relation proof is complete
+  CEF/BCC runtime output + token-admission bit -> boundary added; release
+    certification now requires a completed runtime-owned CEF/BCC output with
+    `token_admitted = true`
   ```
 - [x] Add durable token inventory state model:
   ```text
@@ -956,19 +1343,421 @@ material or post-challenge leakage.
 
 Completion gates:
 
-- [x] Token cannot enter strict pool unless BCC-certified by production
-  evidence.
+- [x] Token cannot enter a release-validated strict pool unless BCC-certified by
+  durable production vector runtime evidence attached to the token.
 - [x] No preprocessing release path needs local aggregate nonce witnesses.
 - [x] Failed BCC is pre-challenge and reveals no nonce material, low bits,
   boundary distances, masks, or failure positions.
 - [x] Token pool/inventory rejects reuse; file-backed session and counter logs
   survive restart and reject corrupt logs.
+- [x] `CertifiedToken` release validation rejects missing
+  `PreprocessingVectorRuntimeCertificate`.
+- [x] `CertifiedToken` release validation rejects detached runtime evidence
+  whose certificate binding was produced for a different token.
+- [x] `CertifiedToken` release validation requires the attached runtime
+  certificate transcript hash to match the aggregate preprocessing runtime
+  transcript recorded in the token evidence:
+  ```text
+  masked-broadcast proof transcript
+  CarryCompare runtime transcript
+  CEF/BCC runtime transcript
+  ```
+- [x] `CertifiedToken` release validation rejects runtime evidence whose vector
+  counters are too small for the token's signer/coefficient lanes.
+- [x] Add a release-oriented token certification entry point that consumes
+  app/runtime-produced masked-broadcast envelopes plus durable runtime
+  evidence:
+  ```text
+  certify_preprocessing_token_release_validated_with_runtime
+  ```
+  This is the entry point the final private vector IT-MPC preprocessing runtime
+  should use once it produces the masked-broadcast / CarryCompare / CEF / BCC
+  transcripts directly.
+- [x] Require the release-oriented envelope entry point to consume an explicit
+  preprocessing runtime transcript/proof bundle:
+  ```text
+  masked-broadcast aggregate runtime transcript
+  typed CarryCompare stage runtime proof
+  typed CEF/BCC stage runtime proof
+  ```
+  It rejects a bundle whose masked-broadcast aggregate does not match the
+  typed envelope proofs, rejects tampered CarryCompare/BCC stage proof bytes,
+  and release runtime evidence must hash the full decoded transcript bundle.
+- [x] Add the production-facing preprocessing certification runtime boundary:
+  ```text
+  PreprocessingCertificationRuntime::certify_preprocessing
+  PreprocessingCertificationRuntimeStatement
+  certify_preprocessing_token_release_validated_with_runtime
+  ```
+  This boundary hands the runtime the recomputed public statement for
+  CarryCompare/BCC proof production and rejects runtime proofs that bind to a
+  different stage statement.
+- [x] Add the normal-build adapter that binds preprocessing runtime proof
+  production to the app-driven vector IT-MPC runtime:
+  ```text
+  ProductionPreprocessingCertificationRuntime
+  ProductionVectorPrimeFieldMpcRuntime
+  ```
+  The adapter requires `ensure_release_ready()` on the durable runtime
+  evidence, derives CarryCompare and CEF/BCC proof transcript hashes from the
+  runtime wire transcript, and returns aggregate preprocessing runtime
+  evidence. Remaining work: the underlying private preprocessing circuits must
+  still execute through this runtime before the adapter is called.
+- [x] Add runtime-adapter phase drivers for the preprocessing statement:
+  ```text
+  ProductionPreprocessingCertificationRuntime::drive_statement_phases
+  ProductionPreprocessingCertificationRuntime::collect_statement_phases
+  ```
+  These methods emit/collect the durable preprocessing phase markers for
+  masked-broadcast consistency, CarryCompare, and CEF/BCC under labels bound to
+  the preprocessing session and transcript. They are phase integration points;
+  the private arithmetic inside those phases is still the remaining Phase 6
+  cryptographic implementation.
+- [x] Require statement-specific preprocessing phase cursors before the normal
+  runtime adapter can certify. `ProductionPreprocessingCertificationRuntime`
+  now rejects generic release-ready runtime evidence unless the cursor log
+  contains collected `PreprocessingMaskedBroadcast`, `PreprocessingCarryCompare`,
+  and `PreprocessingCefBcc` phases under the exact statement labels. This still
+  does not finish the private CEF/BCC circuit, but it prevents unrelated runtime
+  evidence from being reused for a different preprocessing statement.
+- [x] Require the durable wire log to contain the exact preprocessing statement
+  marker vectors before the normal runtime adapter can certify. Phase cursors
+  prove the round reached `Collected`; the wire-marker gate additionally proves
+  every expected sender committed the statement-bound marker lanes for:
+  ```text
+  PreprocessingMaskedBroadcast
+  PreprocessingCarryCompare
+  PreprocessingCefBcc
+  ```
+  This rejects unrelated or forged phase values even if a cursor with the
+  correct label exists. It is still a statement-binding hardening layer, not
+  the final private CarryCompare/CEF/BCC circuit.
+- [x] Require private preprocessing circuit layers in the durable vector runtime
+  log before the normal runtime adapter can certify. Marker broadcasts alone now
+  fail the release gate unless the same durable runtime transcript also contains
+  vector multiplication/degree-reduction layers for:
+  ```text
+  PreprocessingCarryCompare
+  PreprocessingCefBcc
+  ```
+  The gate is statement-label specific: CarryCompare layers must sit under
+  `carry_compare_private/rho_gt_t`, and CEF/BCC threshold layers must sit under
+  `cef_bcc_private/bcc_sum_leq`. Tests drive the existing private vector
+  comparison and bit-sum threshold circuits through those preprocessing labels
+  and prove marker-only or unrelated private layers are rejected. Remaining
+  work is to feed these circuits with the real masked-broadcast/rho/low-bit/BCC
+  predicate handles from preprocessing, instead of test-constructed secret
+  bits.
+- [x] Bind the preprocessing runtime statement and stage proof transcripts to
+  those private circuit root labels. The statement now carries the expected
+  CarryCompare and CEF/BCC private-circuit label hashes, certification rejects
+  mutated label roots, and stage transcript hashes change if the private
+  circuit roots change. This prevents a valid public evidence hash from being
+  certified under the wrong private circuit entry point.
+- [x] Bind preprocessing runtime statements to the public side of the real
+  private circuit inputs:
+  ```text
+  CarryCompare public input hash:
+    signer set
+    coefficient count
+    alpha
+    public masked-low sums
+    public t = masked_low_sum mod alpha
 
-Phase 6 review/backend-selection follow-up:
+  CEF/BCC public input hash:
+    signer set
+    coefficient count
+    alpha / high modulus / gamma2
+    public masked-high sums
+    public masked-low sums
+    public t values
+  ```
+  These hashes intentionally exclude private rho/mask values. Stage transcript
+  hashes and marker lanes now bind to these public-input hashes, so the private
+  circuit cannot be certified against a different public masked-broadcast
+  aggregate.
+- [x] Add a typed private preprocessing circuit input boundary:
+  ```text
+  PreprocessingPrivateCircuitHandles
+  ```
+  The normal public boundary carries runtime-owned private bit handles, not
+  caller-supplied proof hashes. It carries no public secret rho/mask values, and
+  the wrapped handle debug output redacts local lanes. Internally the adapter
+  derives `PreprocessingPrivateCircuitInputs` after it has recomputed the
+  statement, binding handle graph hashes to the statement's coefficient count,
+  public circuit input hashes, and private circuit label roots. The production
+  preprocessing runtime adapter now requires this handle bundle before it can
+  certify and rejects mismatched statement hashes.
+- [x] Remove public arbitrary private-hash construction for
+  preprocessing private circuit bindings. `PreprocessingPrivateCircuitInputs`
+  is now an internal binding object, not a crate-root/normal API export. Normal
+  callers pass `PreprocessingPrivateCircuitHandles`, and the adapter derives
+  the internal handle graph hash from transcript-bound handle IDs, lane counts,
+  holders, and interpolation points. Tests prove empty and short/wrong-lane
+  runtime handles reject.
+- [x] Add a runtime-owned preprocessing private-circuit driver:
+  ```text
+  PreprocessingPrivateCircuitDriverState
+  ProductionPreprocessingCertificationRuntime::start_private_circuit_handles
+  ProductionPreprocessingCertificationRuntime::drive_private_circuit_handles_step
+  ProductionPreprocessingCertificationRuntime::collect_private_circuit_handles_step
+  ProductionPreprocessingCertificationRuntime::finish_private_circuit_handles
+  ```
+  The driver runs the preprocessing-tagged masked-broadcast relation threshold
+  circuit, CarryCompare comparison circuit, CEF correction threshold circuit,
+  and BCC threshold circuit through `ProductionVectorPrimeFieldMpcRuntime`,
+  then finishes into `PreprocessingPrivateCircuitHandles`. Focused tests prove
+  the driver starts only from statement-sized runtime bit handles and cannot
+  finish before the runtime-owned circuits are complete.
+- [x] Add a preprocessing-material start path for those private circuits:
+  ```text
+  ProductionPreprocessingCertificationRuntime::
+    start_private_circuit_handles_from_preprocessing_material
+  ```
+  This path derives CarryCompare public thresholds from the opened
+  masked-broadcast low sums and fixes CEF/BCC admission to
+  `sum(private_bcc_violation_bits) <= 0`; callers no longer choose these public
+  thresholds. It also verifies that the opened broadcast material matches the
+  statement public-input hashes before starting the runtime circuits.
+- [x] Require exact statement-derived labels for preprocessing private material
+  handles:
+  ```text
+  PreprocessingPrivateMaterialHandles
+  masked_broadcast_private/relation_violation_bits/party_i
+  carry_compare_private/rho_sum_bits/bit_i
+  cef_bcc_private/bcc_violation_bits/violation
+  ```
+  The raw threshold-based circuit start is now internal to the adapter. Normal
+  callers pass one typed material bundle, not loose rho/BCC slices, and the
+  bundle has no public constructor. The temporary adapter bridge
+  `private_material_handles_from_runtime_bits` is cfg(test)/`scaffold-dev` only
+  and is rejected with `production-release-checks`; it validates wrong labels,
+  wrong lane counts, wrong rho bit widths, and any BCC input shape other than
+  one violation-bit vector over all coefficients.
+- [x] Add a normal-build adapter-owned preprocessing material derivation path:
+  ```text
+  PreprocessingPrivateMaterialState
+  ProductionPreprocessingCertificationRuntime::
+    derive_private_material_state_from_opened_preprocessing
+  ProductionPreprocessingCertificationRuntime::
+    derive_private_material_handles_from_opened_preprocessing
+  ProductionPreprocessingCertificationRuntime::
+    start_private_circuit_handles_from_envelopes
+  ProductionPreprocessingCertificationRuntime::
+    start_private_circuit_handles_from_state
+  ProductionPreprocessingCertificationRuntime::
+    finish_and_attach_private_circuit_state
+  ```
+  The adapter now recomputes the statement public-input hashes from opened
+  masked broadcasts, derives statement-labeled masked-broadcast relation
+  violation bits,
+  rho-sum bit handles, and BCC violation-bit handles internally, wraps them in
+  `PreprocessingPrivateMaterialState` with source `RuntimePrivateMpc`, and
+  feeds that state into the same private circuit driver. Normal production code
+  can start private preprocessing circuits directly from release envelopes,
+  drive/collect the app-transport rounds, finish the state-owned driver, attach
+  its completed handles to the runtime adapter, and then call the release token
+  constructor.
+  It no longer needs the scaffold bridge that accepts caller-provided runtime
+  bit handles. Raw handle attachment and the builder-like
+  `with_private_circuit_handles` hook are cfg(test)/`scaffold-dev` only.
+  The state now records its source as either `OpenedMaterialDerived` or
+  `RuntimePrivateMpc`; `production-release-checks` rejects the transitional
+  `OpenedMaterialDerived` source before private circuit start and accepts only
+  `RuntimePrivateMpc`. `start_private_circuit_handles_from_envelopes` now uses
+  the adapter-owned `RuntimePrivateMpc` material source; the explicit
+  `derive_private_material_state_from_opened_preprocessing` helper remains only
+  as a transitional normal-build helper and cannot satisfy release-check builds.
+  The final
+  `derive_private_material_state_from_runtime_private_mpc` boundary now
+  consumes statement-labeled runtime MPC handles for masked-broadcast
+  relation-violation bits, CarryCompare rho-sum bits, CEF correction bits, and
+  BCC violation bits, hashes the private source handles into the state, redacts
+  private lanes, and feeds the same private circuit driver. Masked-broadcast relation
+  handles are now generated by
+  `start_preprocessing_masked_broadcast_consistency_vec`, which verifies the
+  opened broadcasts against the statement's per-signer runtime bindings and
+  emits statement-labeled private violation handles. The raw runtime-private state
+  input constructor/type is no longer exported from the normal crate API;
+  release callers use the adapter-owned helper that generates relation handles
+  internally. CarryCompare rho-sum bit handles are now generated by
+  `start_preprocessing_carry_compare_rho_sum_bits_vec`, which derives the
+  secret bit lanes from statement-bound opened broadcasts and emits exactly
+  labeled `carry_compare_private/rho_sum_bits/bit_i` handles. CEF correction
+  handles are now generated by `start_preprocessing_cef_correction_bits_vec`,
+  which derives statement-bound `delta` lanes and drives them through a
+  separate runtime threshold coverage circuit under
+  `cef_bcc_private/cef_correction_sum_leq`. BCC violation handles are now
+  generated by `start_preprocessing_bcc_violation_bits_vec`, which derives the
+  boundary predicate lanes from statement-bound opened broadcasts and emits the exact
+  `cef_bcc_private/bcc_violation_bits/violation` handle. Normal release callers
+  no longer supply any private preprocessing material handles. Masked-broadcast
+  runtime output is now a distinct boundary:
+  `finish_runtime_masked_broadcast_output` requires statement-bound
+  runtime-private material state, validates every masked-broadcast proof
+  binding, and refuses unfinished masked-broadcast relation threshold state;
+  `certify_preprocessing` rejects adapters that have not stored that output.
+  CarryCompare runtime output
+  is also a distinct boundary:
+  `finish_runtime_carry_compare_output` requires a completed runtime-owned
+  comparison state and durable vector runtime transcript, and
+  `certify_preprocessing` rejects adapters that have not stored that output.
+  CEF/BCC runtime output is also distinct now:
+  `finish_runtime_cef_bcc_output` requires a completed runtime-owned threshold
+  state, binds `w1_hash`, `bcc_evidence_hash`, the CarryCompare evidence hash,
+  and `token_admitted = true`, and `certify_preprocessing` rejects adapters
+  that have not stored that output via
+  `finish_and_attach_private_circuit_state_for_statement`.
+- [x] Narrow the normal release-token API to the crate-owned production runtime
+  adapter. `certify_preprocessing_token_release_validated_with_runtime` no
+  longer accepts arbitrary downstream `PreprocessingCertificationRuntime`
+  implementations, and the trait is no longer re-exported from the normal crate
+  API. Tests that need malformed proof bundles use internal helpers only.
+- [x] Add a release-token constructor that consumes a finished state-owned
+  preprocessing private-circuit driver:
+  ```text
+  certify_preprocessing_token_release_validated_with_finished_runtime_driver
+  ```
+  It derives the runtime statement from the durable masked-broadcast envelopes,
+  calls `finish_and_attach_private_circuit_state_for_statement`, and only then
+  delegates to `certify_preprocessing_token_release_validated_with_runtime`.
+  Tests prove an unfinished private runtime driver cannot emit a release-valid
+  token.
+- [x] Add an all-party runtime-driven preprocessing release test:
+  ```text
+  distributed nonce generation
+    -> nonce-share-derived PartyPreprocessInput values
+    -> masked-broadcast envelopes
+    -> runtime-owned private material handles
+    -> app-driven CarryCompare / CEF-correction / BCC vector circuits
+    -> finished runtime driver state
+    -> release-valid CertifiedToken for every party
+  ```
+  The test runs through `ProductionVectorPrimeFieldMpcRuntime` with in-memory
+  app transport under `scaffold-dev`, routes runtime messages between all
+  parties, and verifies that each party emits the same release-certified token
+  public material. This includes the stronger masked-broadcast private
+  relation proof before CarryCompare/CEF/BCC and closes the vertical
+  token-construction gap for the current driver.
+- [x] Add Phase 6 preprocessing hardening tests:
+  ```text
+  replayed masked broadcast -> reject
+  wrong transcript -> reject
+  wrong signer set -> reject before envelope creation/certification
+  reused nonce/token id -> inventory transition rejects
+  crash/restart before and after release token certification -> file inventory
+    stays fresh/reserved/consumed and blocks reuse
+  forged CEF-correction runtime output -> reject
+  forged BCC admission output -> reject
+  forged runtime-owned masked-broadcast / CarryCompare / CEF-BCC outputs
+    -> reject
+  ```
+  The masked-broadcast proof backend now uses runtime-owned relation
+  violation handles plus a preprocessing-tagged vector threshold proof, so the
+  previous statement/hash-only proof gap is closed for the release path.
+- [x] Add explicit runtime-owned preprocessing output objects:
+  ```text
+  RuntimeCarryCompareOutput
+  RuntimeCefBccOutput
+  PreprocessingCertificationRuntimeOutputs
+  ```
+  Stage proofs now carry the runtime's claimed masked-broadcast output,
+  CarryCompare evidence hash, CEF/BCC evidence hash, `w1` output hash, runtime
+  transcript hashes, and token admission bit. Release token certification
+  rejects forged runtime-owned outputs even when the stage proof envelopes
+  themselves decode. Tests cover forged masked-broadcast output, forged
+  CarryCompare output, forged CEF/BCC `w1` output, mismatched runtime
+  transcript hash, and a runtime output that does not admit the token.
+- [x] Remove lower-level release constructors that attach runtime evidence or
+  typed proof bytes directly from the normal public API. They remain internal
+  verifier helpers for tests and for the runtime-owned constructor, but normal
+  callers see the production boundary:
+  ```text
+  certify_preprocessing_token_release_validated_with_runtime
+  ```
+- [x] Remove the normal-build `PreprocessingSession::finish_release_validated`
+  shortcut. App-driven preprocessing sessions can finish local pre-challenge
+  certification, but release-capable token construction must go through
+  `certify_preprocessing_token_release_validated_with_runtime`, which consumes
+  runtime proof handles and durable vector runtime evidence.
+- [x] Keep the low-level typed stage-proof constructor internal to the crate.
+  Normal callers can pass a preprocessing certification runtime boundary, but
+  they do not get a public helper for assembling CarryCompare/BCC proof bytes
+  directly.
+- [x] Make preprocessing runtime proof handles opaque in the normal API. The
+  stage proof bytes and the CarryCompare/BCC proof bundle fields are
+  read-only, constructor-less public handles; normal callers cannot fabricate
+  release-capable proof bytes by filling public struct fields.
+- [x] Make preprocessing runtime certificates opaque in the normal API. Runtime
+  evidence and token-binding hashes are exposed through read-only accessors,
+  not public mutable fields.
+- [x] Bind preprocessing runtime certificates to the complete durable runtime
+  evidence surface, not just the transcript hash and a few lane counters:
+  ```text
+  all runtime counters
+  all vector-operation coverage bits
+  preprocessing-specific coverage bits
+  preprocessing stage transcript hashes
+  token counters and public evidence hashes
+  ```
+  Mutating runtime counters or coverage after certificate creation invalidates
+  token release validation.
+- [x] Make `production-release-checks` treat release validity as the token
+  certification condition. In release-check builds, `CertifiedToken::is_certified`
+  now requires `ensure_certified_token_release_valid`, so a token with a
+  detached or mismatched runtime certificate cannot enter even the generic
+  certified-token pool path.
+- [x] Strengthen preprocessing runtime counter coverage so release validation
+  distinguishes:
+  ```text
+  masked-broadcast lanes = signer_count * coeff_count
+  certification lanes = CarryCompare + CEF correction + BCC
+  ```
+  Runtime evidence must contain enough vector opening lanes for masked
+  broadcasts and enough vector mul/assert/random/local-public lanes for the
+  certification stages.
+- [x] Add preprocessing-specific durable runtime phase markers:
+  ```text
+  PreprocessingMaskedBroadcast
+  PreprocessingCarryCompare
+  PreprocessingCefBcc
+  ```
+  Runtime evidence now carries explicit coverage bits for these phases, and
+  tests prove the app-driven vector runtime records them without scalar
+  openings/checks.
+- [x] Add a production-shaped masked-broadcast envelope constructor that binds
+  an externally produced runtime transcript hash:
+  ```text
+  prepare_masked_broadcast_envelope_with_runtime_transcript
+  ```
+  This helper is now crate-private. It remains an internal verifier/test
+  primitive, but normal callers cannot build production envelopes by supplying
+  arbitrary transcript hashes.
+- [x] Add a runtime-evidence-owned masked-broadcast envelope constructor and
+  release binding check:
+  ```text
+  prepare_masked_broadcast_envelope_with_vector_runtime_evidence
+  MaskedBroadcastRuntimeBinding
+  ProductionPreprocessingCertificationRuntime validation
+  ```
+  The production runtime adapter now rejects per-envelope masked-broadcast
+  proof transcripts that are not bound to the statement/runtime path and now
+  emits private masked-broadcast relation handles from statement/broadcast
+  validation. The final release path proves zero relation violations inside
+  the vector runtime before token certification can finish.
+- [x] Preprocessing counters prove vector/chunk execution for ML-DSA-44/65/87
+  token batches.
+
+Phase 6 remaining work after the stronger masked-broadcast backend:
 
 ```text
-- Replace deterministic masked-broadcast proof hash stubs with the final
-  reviewed private-certification transcript once that backend is selected.
+- Add broader adversarial tests around malformed relation-bit handles,
+  replayed relation circuit labels, and cross-session masked-broadcast
+  relation-state reuse.
+- Add all-suite ML-DSA-44/65/87 release-token throughput gates for the full
+  preprocessing path.
+- Extend durable log scanners to final token-batch logs once token batching is
+  promoted from integration tests to normal release execution.
 ```
 
 Phase 6 implementation note: production parties must not receive
@@ -980,6 +1769,14 @@ session returns `DistributedNonceGenerationLocalOutput`.
 
 Goal: produce only final valid ML-DSA signatures, with no rejected-z leakage.
 
+Status: **partially complete**. The canonical strict no-rejected-z component
+stack, token-consumption discipline, selected-opening boundary, FIPS verify
+gate, and malicious coordinator tests exist. The remaining production gap is
+that the normal strict session still needs a distributed/vector IT-MPC adapter
+over `ProductionVectorPrimeFieldMpcRuntime`; local/direct component runtimes
+must remain test/dev substrates and must not be the release-capable execution
+path.
+
 - [x] Normal API exposes a single canonical strict production backend builder:
   ```text
   strict_production_signing_backend(...)
@@ -990,29 +1787,102 @@ Goal: produce only final valid ML-DSA signatures, with no rejected-z leakage.
 - [x] Replace clear partial-signature transport with production vector
   component handles. Candidate handles are opaque in public/debug surfaces and
   are consumed phase-by-phase by the canonical backend stack.
-- [x] Compute privately for every token:
+- [x] Add the runtime candidate handle and response-preparation primitive:
   ```text
   [z_j] = [y_j] + c_j * [s1]
   ```
-- [x] Privately check:
+  Code references:
   ```text
-  z bound
-  r = A*z - c*t1*2^d
-  HighBits(r) vs w1
-  hint weight <= omega
-  valid_j
+  talus-mpc/src/online.rs: StrictRuntimeCandidateHandle
+  talus-mpc/src/online.rs: strict_prepare_runtime_z_share
+  talus-dkg/src/power2round.rs: ProductionVectorPrimeFieldMpcRuntime::mul_public_challenge_polyvec_share_vec
   ```
-- [x] Select the lowest public-priority valid candidate without opening
-  `valid_j` or failure reasons.
-- [x] Open only selected:
+- [x] Add generic runtime canonical-bit-decomposition wrapper for arbitrary
+  `ProductionShareVec` values, reusing the Power2Round mask/open/recover/check
+  pattern instead of a signing-specific duplicate.
+  Code references:
   ```text
-  ctilde*
-  z*
-  h*
+  talus-dkg/src/power2round.rs: ProductionCanonicalBitDecompositionState
+  ```
+- [x] Add runtime-owned state objects for strict private checks:
+  ```text
+  z-bound comparison state
+  r = A*z - c*t1*2^d helper
+  HighBits(r) vs w1 interval state
+  hint-weight <= omega state
+  valid-bit combiner
+  private priority-selection state
+  selected z/h opening helpers
+  ```
+  Code references:
+  ```text
+  talus-mpc/src/online.rs: StrictRuntimeZBoundCheckState
+  talus-mpc/src/online.rs: strict_runtime_hint_approx_share
+  talus-mpc/src/online.rs: StrictRuntimeHintBitsCheckState
+  talus-mpc/src/online.rs: StrictRuntimeHintWeightCheckState
+  talus-mpc/src/online.rs: StrictRuntimeAllBitsTrueState
+  talus-mpc/src/online.rs: StrictRuntimeValidBitState
+  talus-mpc/src/online.rs: StrictRuntimePrioritySelectionState
+  talus-mpc/src/online.rs: strict_drive_selected_* / strict_collect_selected_*
+  talus-mpc/src/online.rs: strict_build_selected_signature_output
+  ```
+- [x] Add the selected-opening artifact handoff from the distributed runtime
+  to strict session finishing. This boundary accepts only selected public
+  material plus durable vector-runtime evidence and rejects artifacts whose
+  request hash, token ordering, selected priority, or selected challenge seed
+  do not match the consumed batch.
+  Code references:
+  ```text
+  talus-mpc/src/online.rs: StrictRuntimeSelectedOpeningArtifact
+  talus-mpc/src/online.rs: ProductionStrictRuntimeSelectedOpeningBackend
+  talus-mpc/src/online.rs: strict_runtime_selected_opening_backend_accepts_bound_artifact_only
+  talus-mpc/src/online.rs: strict_runtime_selected_opening_backend_rejects_unbound_artifacts
+  ```
+- [x] Tighten the strict-signing release gate so generic/local component-stack
+  output cannot satisfy release mode merely by attaching durable runtime
+  evidence. Release-valid selected output now requires a
+  `StrictSigningVectorRuntimeCertificate` sourced from the selected-opening
+  artifact handoff. `StrictSigningSession::start_release_validated` accepts
+  only `ProductionStrictRuntimeSelectedOpeningArtifactBackend`, which obtains
+  the artifact from an owned `StrictRuntimeSelectedOpeningArtifactSource` after
+  token consumption instead of accepting a manually supplied artifact at the
+  session boundary.
+  Code references:
+  ```text
+  talus-mpc/src/online.rs: StrictSigningRuntimeCertificateSource
+  talus-mpc/src/online.rs: StrictSigningVectorRuntimeCertificate::is_selected_opening_artifact_bound
+  talus-mpc/src/online.rs: StrictRuntimeSelectedOpeningArtifactSource
+  talus-mpc/src/online.rs: ProductionStrictRuntimeSelectedOpeningArtifactBackend
+  talus-mpc/src/online.rs: ProductionStrictVectorMpcArtifactSource
+  talus-mpc/src/online.rs: strict_session_release_rejects_generic_runtime_evidence_wrapper
+  talus-mpc/src/online.rs: strict_session_release_accepts_selected_opening_artifact_backend
+  ```
+- [ ] Finish the release-capable distributed adapter that drives those runtime
+  states through the app-driven message loop end-to-end. The runtime-owned
+  primitives and selected-opening artifact boundary exist, but the normal
+  strict release session still needs the orchestrator that produces that
+  artifact by sequencing:
+  ```text
+  canonical z/r decomposition
+  z-bound aggregate pass bit
+  hint-bit derivation
+  hint-weight pass bit
+  valid-bit combination
+  private priority selection
+  selected z/h opening
+  final signature encoding
   ```
 - [x] Run independent FIPS 204 verification before returning.
 - [x] On no-valid or failed final verify, return generic failure and keep all
   participating tokens consumed.
+- [x] Under `production-release-checks`, strict signing rejects preprocessing
+  batches that lack release-valid `PreprocessingVectorRuntimeCertificate`
+  evidence before any token is durably consumed or any private signing backend
+  runs. This prevents local/hash-shaped preprocessing tokens from reaching the
+  release signing path even if a caller bypasses `new_release_validated`.
+- [x] Make strict-signing runtime certificates opaque in the normal API.
+  Durable runtime evidence is available through read-only accessors, not public
+  mutable fields.
 - [x] Add malicious coordinator/session-driver tests:
   ```text
   wrong challenge
@@ -1022,6 +1892,37 @@ Goal: produce only final valid ML-DSA signatures, with no rejected-z leakage.
   detailed failure reason request
   replayed strict MPC message
   ```
+- [ ] Implement the release-capable distributed adapter from
+  `ProductionStrictSigningBackend` components to
+  `ProductionVectorPrimeFieldMpcRuntime` handles:
+  ```text
+  response preparation: primitive done, adapter orchestration open
+  z-bound checks: comparison state done, aggregate all-coeff pass-bit orchestration open
+  hint/highbits checks: interval state done, full adapter orchestration open
+  hint-weight threshold checks: state done, adapter orchestration open
+  private valid-bit combination: state done, adapter orchestration open
+  private priority selection: state done, adapter orchestration open
+  selected opening only: helpers and artifact boundary done, adapter
+  orchestration open
+  ```
+- [x] Add `ProductionStrictSigningVectorMpcRuntimeBackend`, a release-boundary
+  adapter that attaches `StrictSigningVectorRuntimeCertificate` only after
+  durable Phase 3 vector runtime evidence passes the full release gate. This
+  blocks local component-stack output from satisfying release mode without
+  runtime evidence, but does not replace the remaining runtime-owned
+  response/check/select/open implementation above.
+- [x] Make `StrictSigningSession` reject release execution unless selected
+  output carries a durable strict-signing vector runtime certificate. The
+  session facade can still run direct/local component stacks in dev/test, but
+  under `production-release-checks` they fail closed unless wrapped by the
+  runtime-evidence adapter.
+- [x] Add a narrow `StrictSigningSession::start_release_validated` constructor
+  whose backend type is `ProductionStrictSigningVectorMpcRuntimeBackend<_>`, so
+  release-oriented callers can enter through a typed runtime-certificate
+  boundary instead of the local/direct component stack.
+- [x] Attach durable `StrictSigningVectorRuntimeCertificate` evidence to final
+  strict-signing selected output when the release adapter is supplied with
+  passing vector runtime evidence.
 
 Completion gates:
 
@@ -1030,6 +1931,15 @@ Completion gates:
   or telemetry.
 - [x] Every returned signature passes standard FIPS 204 verification.
 - [x] Crash after token consumption cannot restore tokens.
+- [x] Release strict signing rejects missing durable preprocessing vector
+  runtime evidence before token consumption.
+- [x] Release strict signing rejects missing durable strict-signing vector
+  runtime certificate on selected output.
+- [x] Release strict signing has no reachable local/direct signing backend that
+  can return a release-valid signature. Local/direct and generic
+  runtime-evidence wrappers may still be constructed in dev/test, but under
+  `production-release-checks` they fail unless the selected output is bound
+  through `ProductionStrictRuntimeSelectedOpeningBackend`.
 
 Phase 7 implementation note: the canonical strict signing stack is production
 API shape and no-rejected-z discipline. Cross-party vector IT-MPC transport
@@ -1090,9 +2000,36 @@ deployments by ensuring cost follows batches/chunks and circuit depth, not
 scalar coefficient loops.
 
 Status: **not complete**. The shared counter/evidence groundwork is complete,
-but full production performance is not proven until the remaining release paths
-consume those counters as hard gates and the end-to-end performance tests run
-over the real production flow.
+and the live strict-signing vector runtime path now passes its release-evidence
+test, but the full all-lane ML-DSA-65 debug/in-memory unit harness remains far
+too slow to represent production performance. Full production performance is not
+proven until the remaining release paths consume counters as hard gates and the
+end-to-end performance tests run over optimized production-shaped batching.
+
+Optimization reference:
+
+```text
+docs/production-optimization-principles.md
+```
+
+Current dependency split:
+
+```text
+Power2Round:
+  migrated to durable app-driven vector runtime evidence; remaining work is
+  performance-envelope maintenance and helper cleanup.
+
+Preprocessing:
+  blocked on Phase 6 runtime-backed masked-broadcast / CarryCompare / CEF / BCC
+  certification before performance can be claimed.
+
+Strict signing:
+  correctness/evidence path passes through the live vector runtime, including
+  selected-only opening. Performance remains open: the current ignored all-lane
+  ML-DSA-65 debug/in-memory harness is too slow and must be replaced by
+  phase-batched, precomputed-mask, release-mode performance gates before
+  production latency can be claimed.
+```
 
 Completed in the Phase 9 groundwork pass:
 
@@ -1165,7 +2102,7 @@ Remaining Phase 9 implementation tasks:
   talus-dkg/src/lib.rs: sample_verified_small_polyvec
   talus-dkg/src/lib.rs: it_vss_share_small_residue_vector_batches
   ```
-- [ ] Finish proving/vectorizing Power2Round execution:
+- [x] Finish proving/vectorizing Power2Round release execution:
   ```text
   precomputed certified mask batches
   open all masked C lanes together
@@ -1189,6 +2126,7 @@ Remaining Phase 9 implementation tasks:
   CarryCompare lanes
   CEF correction lanes
   BCC admission lanes
+  durable PreprocessingVectorRuntimeCertificate on each release token
   ```
   Code references:
   ```text
@@ -1198,23 +2136,27 @@ Remaining Phase 9 implementation tasks:
   ```
 - [ ] Finish proving/vectorizing strict signing checks:
   ```text
-  candidate-token batch
-  z response lanes
-  z-bound predicate lanes
-  hint/highbits lanes
-  hint-weight lanes
-  private selection lanes
-  selected opening only
+  candidate-token batch: production metadata exists
+  z response lanes: live runtime path exists
+  z-bound predicate lanes: live runtime path exists
+  hint/highbits lanes: live runtime path exists
+  hint-weight lanes: live runtime path exists
+  private selection lanes: live runtime path exists and emits PrivateSelectionCheck evidence
+  selected opening only: live runtime path exists and opens selected material only
+  durable StrictSigningVectorRuntimeCertificate on each release signature: live path passes
+  remaining work: phase-batch the live runtime and move eligible masks/material into preprocessing
   ```
   Code references:
   ```text
   talus-mpc/src/online.rs: ProductionStrictSigningBackend
   talus-mpc/src/online.rs: StrictResponseCheckCounters
   talus-mpc/src/online.rs: StrictSigningDistributedRuntime
+  talus-mpc/src/online.rs: ProductionStrictLiveVectorMpcArtifactSource
   ```
 - [ ] Precompute reusable certified material where safe:
   ```text
   Power2Round canonical masks
+  strict signing z/hint canonical masks
   preprocessing nonce-mask material
   IT-MPC random bits
   multiplication/checking preprocessing
@@ -1334,11 +2276,12 @@ Goal: prove the whole production path.
   ```
 - [ ] Malicious preprocessing tests:
   ```text
-  bad masked broadcast
-  wrong CEF correction
-  BCC failure
-  token reuse
-  rollback
+  bad masked broadcast [done for replay/wrong transcript/wrong signer set]
+  wrong CEF correction [done for forged runtime output]
+  BCC failure / forged admission [done for runtime admission false]
+  token reuse [done for in-memory and file inventory]
+  rollback [partially done: file inventory restart guards token reuse; broader
+    preprocessing phase-log rollback remains open]
   ```
 - [ ] Malicious signing tests:
   ```text

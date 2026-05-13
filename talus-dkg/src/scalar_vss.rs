@@ -519,6 +519,11 @@ pub enum ProductionItVssComplaintPhase {
     BroadcastPublicCoins,
     /// Dealers broadcast public information-checking metadata.
     BroadcastPublicCommitments,
+    /// Receivers publish audited information-checking tags, which are
+    /// discarded and never retained.
+    BroadcastPublicAudits,
+    /// Dealers publish replayable vector-polynomial consistency records.
+    BroadcastConsistencyRecords,
     /// Dealers send directed private shares and information-checking tags.
     DeliverPrivateShares,
     /// Receivers verify directed private deliveries locally.
@@ -537,11 +542,13 @@ impl ProductionItVssComplaintPhase {
             Self::BroadcastPublicPrecommitments => 1,
             Self::BroadcastPublicCoins => 2,
             Self::BroadcastPublicCommitments => 3,
-            Self::DeliverPrivateShares => 4,
-            Self::VerifyPrivateDeliveries => 5,
-            Self::BroadcastComplaints => 6,
-            Self::ResolveComplaints => 7,
-            Self::CertifyAcceptedSharings => 8,
+            Self::BroadcastPublicAudits => 4,
+            Self::BroadcastConsistencyRecords => 5,
+            Self::DeliverPrivateShares => 6,
+            Self::VerifyPrivateDeliveries => 7,
+            Self::BroadcastComplaints => 8,
+            Self::ResolveComplaints => 9,
+            Self::CertifyAcceptedSharings => 10,
         }
     }
 
@@ -550,11 +557,13 @@ impl ProductionItVssComplaintPhase {
             1 => Some(Self::BroadcastPublicPrecommitments),
             2 => Some(Self::BroadcastPublicCoins),
             3 => Some(Self::BroadcastPublicCommitments),
-            4 => Some(Self::DeliverPrivateShares),
-            5 => Some(Self::VerifyPrivateDeliveries),
-            6 => Some(Self::BroadcastComplaints),
-            7 => Some(Self::ResolveComplaints),
-            8 => Some(Self::CertifyAcceptedSharings),
+            4 => Some(Self::BroadcastPublicAudits),
+            5 => Some(Self::BroadcastConsistencyRecords),
+            6 => Some(Self::DeliverPrivateShares),
+            7 => Some(Self::VerifyPrivateDeliveries),
+            8 => Some(Self::BroadcastComplaints),
+            9 => Some(Self::ResolveComplaints),
+            10 => Some(Self::CertifyAcceptedSharings),
             _ => None,
         }
     }
@@ -565,6 +574,8 @@ pub const PRODUCTION_IT_VSS_COMPLAINT_PHASES: &[ProductionItVssComplaintPhase] =
     ProductionItVssComplaintPhase::BroadcastPublicPrecommitments,
     ProductionItVssComplaintPhase::BroadcastPublicCoins,
     ProductionItVssComplaintPhase::BroadcastPublicCommitments,
+    ProductionItVssComplaintPhase::BroadcastPublicAudits,
+    ProductionItVssComplaintPhase::BroadcastConsistencyRecords,
     ProductionItVssComplaintPhase::DeliverPrivateShares,
     ProductionItVssComplaintPhase::VerifyPrivateDeliveries,
     ProductionItVssComplaintPhase::BroadcastComplaints,

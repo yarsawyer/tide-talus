@@ -10,21 +10,29 @@ use talus_core::{
     TalusPerformanceCounters,
 };
 use talus_dkg::{
-    ensure_production_vector_it_mpc_runtime_evidence_for_release, evaluate_shamir_polynomial,
-    hash_it_vss_complaint_resolution, hash_it_vss_public_commitment,
+    ensure_preprocessing_wire_log_private_circuits_for_release,
+    ensure_prime_field_mpc_counters_vectorized_for_release,
+    ensure_prime_field_mpc_wire_log_contains_broadcast_vec, evaluate_shamir_polynomial,
+    hash_it_vss_complaint_resolution, hash_it_vss_public_commitment, power2round_label_hash,
     production_it_vss_public_coin_share, production_it_vss_public_coin_transcript, DkgConfig,
     DkgError, ItVssComplaintResolution, ItVssPrivateShareDelivery, ItVssPublicCommitment,
-    ItVssPublicPrecommitment, ItVssSharingDomain, ItVssSharingLabel,
+    ItVssPublicPrecommitment, ItVssSharingDomain, ItVssSharingLabel, Power2RoundTranscriptLabel,
+    PrimeFieldMpcPhase, PrimeFieldMpcPhaseCursor, PrimeFieldMpcPhaseCursorLog,
+    PrimeFieldMpcPhaseCursorState, PrimeFieldMpcPhaseDriverStatus, PrimeFieldMpcRoundKind,
+    PrimeFieldMpcWireMessageLog, ProductionBitShareVec, ProductionBitSumLeqPublicVecState,
     ProductionInformationCheckingVssBackend, ProductionItVssBackend,
     ProductionItVssPreparedDealerOutput, ProductionItVssPublicCoinShare,
-    ProductionItVssSecurityParams, ProductionVectorItMpcRuntimeEvidence,
+    ProductionItVssSecurityParams, ProductionPublicComparisonVecState,
+    ProductionVectorItMpcCollectResult, ProductionVectorItMpcEntropy,
+    ProductionVectorItMpcRuntimeEvidence, ProductionVectorPrimeFieldMpcRuntime,
 };
 use talus_mpc_core::PartyId;
 use talus_wire::{
     decode_commit_payload, decode_masked_broadcast_open_payload, encode_commit_payload,
-    encode_masked_broadcast_open_payload, signing_set_hash, validate_round_batch, CommitPayload,
-    ExpectedContext, MaskedBroadcastOpenPayload, PayloadKind, RoundId, SuiteId, WireHeader,
-    WireMessage, WIRE_PROTOCOL_VERSION,
+    encode_masked_broadcast_open_payload, signing_set_hash, validate_round_batch,
+    AuthenticatedP2pTransport, CommitPayload, EquivocationResistantBroadcast, ExpectedContext,
+    MaskedBroadcastOpenPayload, PayloadKind, RoundId, SuiteId, WireHeader, WireMessage,
+    WIRE_PROTOCOL_VERSION,
 };
 use zeroize::Zeroizing;
 
@@ -127,6 +135,12 @@ pub enum PreprocessingOutbound {
 /// Nonce generation, product masked-broadcast proofs, and crash-safe token
 /// persistence plug in behind this same facade rather than changing the
 /// application transport API.
+///
+/// `finish` returns a pre-challenge certified token. Release-capable token
+/// output must be built through
+/// [`certify_preprocessing_token_release_validated_with_runtime`], which
+/// requires the private vector-runtime proof bundle and durable runtime
+/// evidence before attaching a release certificate.
 pub struct PreprocessingSession<P, S, V>
 where
     P: MlDsaParams,
@@ -278,6 +292,7 @@ where
             self.inputs,
             self.envelopes,
             preprocessing_session_open_hash::<P>(self.options.session_id, &self.options.signer_set),
+            None,
         )
     }
 
@@ -1023,8 +1038,2002 @@ struct PreparedMaskedBroadcast {
 /// Masked-broadcast consistency proof bytes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaskedBroadcastConsistencyProof {
-    /// Backend-specific proof bytes. Empty is valid only for local clear-audit tests.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl MaskedBroadcastConsistencyProof {
+    /// Returns backend-specific proof bytes.
+    ///
+    /// This is read-only in the normal API. Production callers should obtain
+    /// proof bytes through the preprocessing runtime/envelope constructors,
+    /// not by fabricating public struct fields.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+const MASKED_BROADCAST_RUNTIME_PROOF_PREFIX: &[u8; 6] = b"TMBCR1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaskedBroadcastRuntimeProofParts {
+    statement_hash: [u8; 32],
+    runtime_transcript_hash: [u8; 32],
+    coeff_count: usize,
+    signer_count: usize,
+}
+
+/// One masked-broadcast proof binding included in the preprocessing runtime
+/// statement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaskedBroadcastRuntimeBinding {
+    /// Party whose masked broadcast is certified by this binding.
+    pub party: PartyId,
+    /// Hash of the exact masked-broadcast consistency statement.
+    pub statement_hash: [u8; 32],
+    /// Runtime transcript hash claimed by the envelope proof.
+    pub runtime_transcript_hash: [u8; 32],
+}
+
+/// Runtime transcript hashes for the private preprocessing certification
+/// stages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreprocessingCertificationRuntimeTranscripts {
+    /// Aggregate runtime transcript for masked-broadcast consistency.
+    pub masked_broadcast: [u8; 32],
+    /// Runtime transcript for CarryCompare certification.
+    pub carry_compare: [u8; 32],
+    /// Runtime transcript for CEF/BCC certification.
+    pub bcc: [u8; 32],
+}
+
+impl PreprocessingCertificationRuntimeTranscripts {
+    /// Returns true when every stage transcript is present.
+    pub fn is_complete(self) -> bool {
+        self.masked_broadcast != [0u8; 32]
+            && self.carry_compare != [0u8; 32]
+            && self.bcc != [0u8; 32]
+    }
+}
+
+/// Runtime-owned masked-broadcast certification output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeMaskedBroadcastOutput {
+    /// Number of signers covered by masked-broadcast certification.
+    pub signer_count: usize,
+    /// Number of coefficients covered per signer.
+    pub coeff_count: usize,
+    /// Aggregate runtime transcript hash for masked-broadcast consistency.
+    pub runtime_transcript_hash: [u8; 32],
+    /// Hash of the runtime-private material state that produced the relation
+    /// proof bits.
+    pub material_state_hash: [u8; 32],
+}
+
+/// Runtime-owned CarryCompare certification output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeCarryCompareOutput {
+    /// Number of coefficients covered by the private CarryCompare circuit.
+    pub coeff_count: usize,
+    /// Public evidence hash for the certified CarryCompare result.
+    pub evidence_hash: [u8; 32],
+    /// Runtime transcript hash for the private CarryCompare circuit.
+    pub runtime_transcript_hash: [u8; 32],
+}
+
+/// Runtime-owned CEF/BCC certification output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeCefBccOutput {
+    /// Number of coefficients covered by CEF/BCC.
+    pub coeff_count: usize,
+    /// Hash of the `w1` vector emitted for token admission.
+    pub w1_hash: [u8; 32],
+    /// CarryCompare evidence hash consumed by the CEF/BCC stage.
+    pub carry_compare_evidence_hash: [u8; 32],
+    /// Public evidence hash for the certified BCC result.
+    pub bcc_evidence_hash: [u8; 32],
+    /// Runtime transcript hash for the private CEF/BCC circuit.
+    pub runtime_transcript_hash: [u8; 32],
+    /// True only when the runtime admits this token pre-challenge.
+    pub token_admitted: bool,
+}
+
+/// Runtime-owned preprocessing certification outputs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreprocessingCertificationRuntimeOutputs {
+    /// Masked-broadcast private-certification output.
+    pub masked_broadcast: RuntimeMaskedBroadcastOutput,
+    /// CarryCompare private-circuit output.
+    pub carry_compare: RuntimeCarryCompareOutput,
+    /// CEF/BCC private-circuit output.
+    pub cef_bcc: RuntimeCefBccOutput,
+}
+
+/// Private preprocessing certification stage whose runtime proof is bound into
+/// release-capable token evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreprocessingCertificationStage {
+    /// CarryCompare certification stage.
+    CarryCompare,
+    /// CEF/BCC certification stage.
+    Bcc,
+}
+
+impl PreprocessingCertificationStage {
+    #[allow(dead_code)]
+    fn code(self) -> u8 {
+        match self {
+            Self::CarryCompare => 1,
+            Self::Bcc => 2,
+        }
+    }
+
+    fn domain(self) -> &'static [u8] {
+        match self {
+            Self::CarryCompare => b"carry-compare",
+            Self::Bcc => b"cef-bcc",
+        }
+    }
+}
+
+/// Runtime proof bytes for one private preprocessing certification stage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreprocessingCertificationStageRuntimeProof {
+    bytes: Vec<u8>,
+}
+
+impl PreprocessingCertificationStageRuntimeProof {
+    /// Returns the typed proof bytes emitted by the private vector runtime.
+    ///
+    /// This is intentionally read-only in the normal API. Release-capable
+    /// preprocessing proof construction is owned by the crate runtime boundary,
+    /// so callers cannot manufacture stage proofs by filling public fields.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Runtime proofs required by the release-oriented preprocessing token
+/// constructor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreprocessingCertificationRuntimeProofs {
+    /// Aggregate runtime transcript for masked-broadcast consistency. This is
+    /// checked against the typed masked-broadcast proof envelopes.
+    masked_broadcast: [u8; 32],
+    /// CarryCompare runtime proof.
+    carry_compare: PreprocessingCertificationStageRuntimeProof,
+    /// CEF/BCC runtime proof.
+    bcc: PreprocessingCertificationStageRuntimeProof,
+    /// Runtime-owned outputs claimed by the private preprocessing circuits.
+    outputs: PreprocessingCertificationRuntimeOutputs,
+}
+
+impl PreprocessingCertificationRuntimeProofs {
+    /// Returns the aggregate masked-broadcast runtime transcript hash.
+    pub fn masked_broadcast_runtime_transcript(&self) -> [u8; 32] {
+        self.masked_broadcast
+    }
+
+    /// Returns the CarryCompare runtime proof.
+    pub fn carry_compare(&self) -> &PreprocessingCertificationStageRuntimeProof {
+        &self.carry_compare
+    }
+
+    /// Returns the CEF/BCC runtime proof.
+    pub fn bcc(&self) -> &PreprocessingCertificationStageRuntimeProof {
+        &self.bcc
+    }
+
+    /// Returns the runtime-owned preprocessing outputs.
+    pub fn outputs(&self) -> PreprocessingCertificationRuntimeOutputs {
+        self.outputs
+    }
+
+    /// Extracts the runtime transcript hashes carried by the typed proof
+    /// envelopes. Full statement validation happens when token certification
+    /// recomputes the CarryCompare and BCC public evidence hashes.
+    pub fn transcripts(
+        &self,
+    ) -> Result<PreprocessingCertificationRuntimeTranscripts, PreprocessError> {
+        let carry = decode_preprocessing_stage_runtime_proof(&self.carry_compare)
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+        let bcc = decode_preprocessing_stage_runtime_proof(&self.bcc)
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+        if carry.stage != PreprocessingCertificationStage::CarryCompare
+            || bcc.stage != PreprocessingCertificationStage::Bcc
+            || self.masked_broadcast == [0u8; 32]
+            || carry.runtime_transcript_hash == [0u8; 32]
+            || bcc.runtime_transcript_hash == [0u8; 32]
+            || self.outputs.masked_broadcast.runtime_transcript_hash != self.masked_broadcast
+            || self.outputs.masked_broadcast.signer_count == 0
+            || self.outputs.masked_broadcast.coeff_count == 0
+            || self.outputs.masked_broadcast.material_state_hash == [0u8; 32]
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        Ok(PreprocessingCertificationRuntimeTranscripts {
+            masked_broadcast: self.masked_broadcast,
+            carry_compare: carry.runtime_transcript_hash,
+            bcc: bcc.runtime_transcript_hash,
+        })
+    }
+}
+
+/// Public statement handed to the preprocessing private vector runtime when it
+/// certifies CarryCompare and BCC.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreprocessingCertificationRuntimeStatement {
+    /// Preprocessing session identifier.
+    pub session_id: SessionId,
+    /// Transcript hash of the opened preprocessing material.
+    pub transcript_hash: TranscriptHash,
+    /// Sorted signer set.
+    pub signer_set: Vec<PartyId>,
+    /// Number of coefficients certified per signer.
+    pub coeff_count: usize,
+    /// Aggregate masked-broadcast runtime transcript derived from typed
+    /// envelope proofs.
+    pub masked_broadcast_runtime_transcript: [u8; 32],
+    /// Per-envelope masked-broadcast runtime bindings. Production runtime
+    /// adapters must verify these against their durable vector runtime
+    /// transcript before certifying CarryCompare/BCC.
+    pub masked_broadcast_bindings: Vec<MaskedBroadcastRuntimeBinding>,
+    /// Public CarryCompare evidence hash that the runtime proof must bind.
+    pub carry_compare_evidence_hash: [u8; 32],
+    /// Public BCC evidence hash that the runtime proof must bind.
+    pub bcc_evidence_hash: [u8; 32],
+    /// Hash of the `w1` vector that runtime-owned CEF/BCC must emit.
+    pub w1_hash: [u8; 32],
+    /// Public input hash for the private CarryCompare circuit.
+    pub carry_compare_public_input_hash: [u8; 32],
+    /// Public input hash for the private CEF/BCC circuit.
+    pub cef_bcc_public_input_hash: [u8; 32],
+    /// Root label hash for the private CarryCompare circuit.
+    pub carry_compare_private_circuit_label_hash: [u8; 32],
+    /// Root label hash for the private CEF/BCC circuit.
+    pub cef_bcc_private_circuit_label_hash: [u8; 32],
+}
+
+/// Runtime-owned private preprocessing input binding.
+///
+/// This object does not contain private rho/mask shares. It binds the runtime's
+/// private handle graph to the public statement hashes and private circuit root
+/// labels that release certification expects. The actual secret shares remain
+/// inside the vector IT-MPC runtime.
+#[derive(Clone, Eq, PartialEq)]
+struct PreprocessingPrivateCircuitInputs {
+    coeff_count: usize,
+    carry_compare_public_input_hash: [u8; 32],
+    cef_bcc_public_input_hash: [u8; 32],
+    carry_compare_private_circuit_label_hash: [u8; 32],
+    cef_bcc_private_circuit_label_hash: [u8; 32],
+    carry_compare_private_handle_hash: [u8; 32],
+    cef_correction_private_handle_hash: [u8; 32],
+    cef_bcc_private_handle_hash: [u8; 32],
+}
+
+impl PreprocessingPrivateCircuitInputs {
+    /// Builds a binding from runtime-owned private preprocessing bit handles.
+    fn from_runtime_bit_handles(
+        statement: &PreprocessingCertificationRuntimeStatement,
+        carry_compare_bits: &[ProductionBitShareVec],
+        cef_correction_bits: &[ProductionBitShareVec],
+        bcc_violation_bits: &[ProductionBitShareVec],
+    ) -> Result<Self, PreprocessError> {
+        let carry_compare_private_handle_hash = hash_preprocessing_private_bit_handles(
+            b"carry-compare",
+            statement,
+            carry_compare_bits,
+        )?;
+        let cef_correction_private_handle_hash = if cef_correction_bits.is_empty() {
+            hash_preprocessing_optional_absent_private_handles(b"cef-correction", statement)
+        } else {
+            hash_preprocessing_private_bit_handles(
+                b"cef-correction",
+                statement,
+                cef_correction_bits,
+            )?
+        };
+        let cef_bcc_private_handle_hash = hash_preprocessing_private_bit_handles(
+            b"bcc-violation",
+            statement,
+            bcc_violation_bits,
+        )?;
+        Self::from_handle_hashes(
+            statement,
+            carry_compare_private_handle_hash,
+            cef_correction_private_handle_hash,
+            cef_bcc_private_handle_hash,
+        )
+    }
+
+    fn from_handle_hashes(
+        statement: &PreprocessingCertificationRuntimeStatement,
+        carry_compare_private_handle_hash: [u8; 32],
+        cef_correction_private_handle_hash: [u8; 32],
+        cef_bcc_private_handle_hash: [u8; 32],
+    ) -> Result<Self, PreprocessError> {
+        if carry_compare_private_handle_hash == [0u8; 32]
+            || cef_correction_private_handle_hash == [0u8; 32]
+            || cef_bcc_private_handle_hash == [0u8; 32]
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        ensure_preprocessing_statement_public_input_hashes(statement)?;
+        ensure_preprocessing_statement_private_label_hashes(statement)?;
+        Ok(Self {
+            coeff_count: statement.coeff_count,
+            carry_compare_public_input_hash: statement.carry_compare_public_input_hash,
+            cef_bcc_public_input_hash: statement.cef_bcc_public_input_hash,
+            carry_compare_private_circuit_label_hash: statement
+                .carry_compare_private_circuit_label_hash,
+            cef_bcc_private_circuit_label_hash: statement.cef_bcc_private_circuit_label_hash,
+            carry_compare_private_handle_hash,
+            cef_correction_private_handle_hash,
+            cef_bcc_private_handle_hash,
+        })
+    }
+}
+
+impl fmt::Debug for PreprocessingPrivateCircuitInputs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreprocessingPrivateCircuitInputs")
+            .field("coeff_count", &self.coeff_count)
+            .field(
+                "carry_compare_public_input_hash",
+                &self.carry_compare_public_input_hash,
+            )
+            .field("cef_bcc_public_input_hash", &self.cef_bcc_public_input_hash)
+            .field(
+                "carry_compare_private_circuit_label_hash",
+                &self.carry_compare_private_circuit_label_hash,
+            )
+            .field(
+                "cef_bcc_private_circuit_label_hash",
+                &self.cef_bcc_private_circuit_label_hash,
+            )
+            .field("carry_compare_private_handle_hash", &"<redacted>")
+            .field("cef_correction_private_handle_hash", &"<redacted>")
+            .field("cef_bcc_private_handle_hash", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Runtime-owned private preprocessing bit handles.
+///
+/// This is the public handle bundle callers give to the production
+/// preprocessing adapter. It does not contain secret rho/mask values in public
+/// output; the wrapped `ProductionBitShareVec` handles redact local lanes in
+/// `Debug` and are transcript-bound by the vector runtime.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PreprocessingPrivateCircuitHandles {
+    carry_compare_bits: Vec<ProductionBitShareVec>,
+    cef_correction_bits: Vec<ProductionBitShareVec>,
+    bcc_violation_bits: Vec<ProductionBitShareVec>,
+}
+
+impl PreprocessingPrivateCircuitHandles {
+    /// Builds a preprocessing private handle bundle.
+    pub fn new(
+        carry_compare_bits: Vec<ProductionBitShareVec>,
+        bcc_violation_bits: Vec<ProductionBitShareVec>,
+    ) -> Result<Self, PreprocessError> {
+        Self::from_preprocessing_bits(carry_compare_bits, Vec::new(), bcc_violation_bits)
+    }
+
+    fn from_preprocessing_bits(
+        carry_compare_bits: Vec<ProductionBitShareVec>,
+        cef_correction_bits: Vec<ProductionBitShareVec>,
+        bcc_violation_bits: Vec<ProductionBitShareVec>,
+    ) -> Result<Self, PreprocessError> {
+        if carry_compare_bits.is_empty() || bcc_violation_bits.is_empty() {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        Ok(Self {
+            carry_compare_bits,
+            cef_correction_bits,
+            bcc_violation_bits,
+        })
+    }
+
+    fn bind_to_statement(
+        &self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+    ) -> Result<PreprocessingPrivateCircuitInputs, PreprocessError> {
+        PreprocessingPrivateCircuitInputs::from_runtime_bit_handles(
+            statement,
+            &self.carry_compare_bits,
+            &self.cef_correction_bits,
+            &self.bcc_violation_bits,
+        )
+    }
+}
+
+impl fmt::Debug for PreprocessingPrivateCircuitHandles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreprocessingPrivateCircuitHandles")
+            .field("carry_compare_bits", &self.carry_compare_bits.len())
+            .field("cef_correction_bits", &self.cef_correction_bits.len())
+            .field("bcc_violation_bits", &self.bcc_violation_bits.len())
+            .field("lanes", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Runtime-owned private preprocessing material handles before certification.
+///
+/// This is the only normal-build input accepted by the preprocessing private
+/// circuit driver. It groups the secret rho-sum bit handles and the secret BCC
+/// violation-bit handle under labels derived from one preprocessing statement.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PreprocessingPrivateMaterialHandles {
+    masked_broadcast_relation_bits: Vec<ProductionBitShareVec>,
+    rho_sum_bits_by_bit_le: Vec<ProductionBitShareVec>,
+    cef_correction_bits: Vec<ProductionBitShareVec>,
+    bcc_violation_bits: Vec<ProductionBitShareVec>,
+}
+
+impl PreprocessingPrivateMaterialHandles {
+    fn from_runtime_handles<P: MlDsaParams>(
+        statement: &PreprocessingCertificationRuntimeStatement,
+        masked_broadcast_relation_bits: Vec<ProductionBitShareVec>,
+        rho_sum_bits_by_bit_le: Vec<ProductionBitShareVec>,
+        cef_correction_bits: Vec<ProductionBitShareVec>,
+        bcc_violation_bits: Vec<ProductionBitShareVec>,
+    ) -> Result<Self, PreprocessError> {
+        ensure_preprocessing_masked_broadcast_relation_labels(
+            statement,
+            &masked_broadcast_relation_bits,
+        )?;
+        ensure_preprocessing_private_material_handle_labels::<P>(
+            statement,
+            &rho_sum_bits_by_bit_le,
+            &cef_correction_bits,
+            &bcc_violation_bits,
+        )?;
+        Ok(Self {
+            masked_broadcast_relation_bits,
+            rho_sum_bits_by_bit_le,
+            cef_correction_bits,
+            bcc_violation_bits,
+        })
+    }
+
+    fn masked_broadcast_relation_bits(&self) -> &[ProductionBitShareVec] {
+        &self.masked_broadcast_relation_bits
+    }
+
+    fn rho_sum_bits_by_bit_le(&self) -> &[ProductionBitShareVec] {
+        &self.rho_sum_bits_by_bit_le
+    }
+
+    fn bcc_violation_bits(&self) -> &[ProductionBitShareVec] {
+        &self.bcc_violation_bits
+    }
+
+    fn cef_correction_bits(&self) -> &[ProductionBitShareVec] {
+        &self.cef_correction_bits
+    }
+}
+
+impl fmt::Debug for PreprocessingPrivateMaterialHandles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreprocessingPrivateMaterialHandles")
+            .field(
+                "masked_broadcast_relation_bits",
+                &self.masked_broadcast_relation_bits.len(),
+            )
+            .field("rho_sum_bits_by_bit_le", &self.rho_sum_bits_by_bit_le.len())
+            .field("cef_correction_bits", &self.cef_correction_bits.len())
+            .field("bcc_violation_bits", &self.bcc_violation_bits.len())
+            .field("lanes", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Runtime-private IT-MPC source handles for preprocessing material.
+///
+/// This object is the final-source boundary for Phase 6: masked-broadcast
+/// relation-violation bits, rho-sum bits, and BCC violation bits are supplied
+/// as runtime-owned handles under statement-derived labels. It has no public
+/// fields and all lane values remain redacted.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct PreprocessingRuntimePrivateMpcStateInput {
+    masked_broadcast_relation_bits: Vec<ProductionBitShareVec>,
+    rho_sum_bits_by_bit_le: Vec<ProductionBitShareVec>,
+    cef_correction_bits: Vec<ProductionBitShareVec>,
+    bcc_violation_bits: Vec<ProductionBitShareVec>,
+}
+
+impl PreprocessingRuntimePrivateMpcStateInput {
+    /// Builds a runtime-private preprocessing state input from runtime-owned
+    /// handles.
+    fn new<P: MlDsaParams>(
+        statement: &PreprocessingCertificationRuntimeStatement,
+        masked_broadcast_relation_bits: Vec<ProductionBitShareVec>,
+        rho_sum_bits_by_bit_le: Vec<ProductionBitShareVec>,
+        cef_correction_bits: Vec<ProductionBitShareVec>,
+        bcc_violation_bits: Vec<ProductionBitShareVec>,
+    ) -> Result<Self, PreprocessError> {
+        ensure_preprocessing_runtime_private_mpc_input_labels::<P>(
+            statement,
+            &masked_broadcast_relation_bits,
+            &rho_sum_bits_by_bit_le,
+            &cef_correction_bits,
+            &bcc_violation_bits,
+        )?;
+        Ok(Self {
+            masked_broadcast_relation_bits,
+            rho_sum_bits_by_bit_le,
+            cef_correction_bits,
+            bcc_violation_bits,
+        })
+    }
+
+    fn into_material_handles<P: MlDsaParams>(
+        self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+    ) -> Result<PreprocessingPrivateMaterialHandles, PreprocessError> {
+        PreprocessingPrivateMaterialHandles::from_runtime_handles::<P>(
+            statement,
+            self.masked_broadcast_relation_bits,
+            self.rho_sum_bits_by_bit_le,
+            self.cef_correction_bits,
+            self.bcc_violation_bits,
+        )
+    }
+}
+
+impl fmt::Debug for PreprocessingRuntimePrivateMpcStateInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreprocessingRuntimePrivateMpcStateInput")
+            .field(
+                "masked_broadcast_relation_bits",
+                &self.masked_broadcast_relation_bits.len(),
+            )
+            .field("rho_sum_bits_by_bit_le", &self.rho_sum_bits_by_bit_le.len())
+            .field("cef_correction_bits", &self.cef_correction_bits.len())
+            .field("bcc_violation_bits", &self.bcc_violation_bits.len())
+            .field("lanes", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Source of runtime-owned preprocessing private material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreprocessingPrivateMaterialStateSource {
+    /// Transitional integration source derived from opened preprocessing
+    /// material. This is allowed in normal/dev builds but rejected by
+    /// `production-release-checks`.
+    OpenedMaterialDerived,
+    /// Final source owned by the private preprocessing IT-MPC backend.
+    RuntimePrivateMpc,
+}
+
+/// Runtime-owned preprocessing private material state.
+///
+/// This is the normal-build source for preprocessing CarryCompare/CEF/BCC
+/// private circuit handles. It is created only by crate-owned adapter methods
+/// from statement-bound preprocessing material, and it redacts all private lane
+/// values.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PreprocessingPrivateMaterialState {
+    source: PreprocessingPrivateMaterialStateSource,
+    statement_hash: [u8; 32],
+    opened_broadcast_hash: [u8; 32],
+    source_handle_hash: [u8; 32],
+    material: PreprocessingPrivateMaterialHandles,
+}
+
+impl PreprocessingPrivateMaterialState {
+    fn new(
+        source: PreprocessingPrivateMaterialStateSource,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+        source_handle_hash: [u8; 32],
+        material: PreprocessingPrivateMaterialHandles,
+    ) -> Result<Self, PreprocessError> {
+        let statement_hash = hash_preprocessing_runtime_statement(statement);
+        let opened_broadcast_hash = hash_preprocessing_opened_broadcasts(statement, broadcasts)?;
+        if statement_hash == [0u8; 32]
+            || opened_broadcast_hash == [0u8; 32]
+            || source_handle_hash == [0u8; 32]
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        Ok(Self {
+            source,
+            statement_hash,
+            opened_broadcast_hash,
+            source_handle_hash,
+            material,
+        })
+    }
+
+    /// Returns the private material source class.
+    pub fn source(&self) -> PreprocessingPrivateMaterialStateSource {
+        self.source
+    }
+
+    fn ensure_matches(
+        &self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+    ) -> Result<(), PreprocessError> {
+        if self.statement_hash != hash_preprocessing_runtime_statement(statement)
+            || self.opened_broadcast_hash
+                != hash_preprocessing_opened_broadcasts(statement, broadcasts)?
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        Ok(())
+    }
+
+    fn ensure_allowed_for_release(&self) -> Result<(), PreprocessError> {
+        #[cfg(feature = "production-release-checks")]
+        {
+            if self.source != PreprocessingPrivateMaterialStateSource::RuntimePrivateMpc {
+                return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    fn material(&self) -> &PreprocessingPrivateMaterialHandles {
+        &self.material
+    }
+}
+
+impl fmt::Debug for PreprocessingPrivateMaterialState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreprocessingPrivateMaterialState")
+            .field("source", &self.source)
+            .field("statement_hash", &self.statement_hash)
+            .field("opened_broadcast_hash", &self.opened_broadcast_hash)
+            .field("source_handle_hash", &"<redacted>")
+            .field("material", &"<redacted>")
+            .finish()
+    }
+}
+
+/// App-driven state for the preprocessing private certification circuits.
+///
+/// The state runs the production vector runtime's preprocessing-tagged
+/// CarryCompare comparison followed by the preprocessing-tagged CEF/BCC
+/// threshold check. It yields `PreprocessingPrivateCircuitHandles` only after
+/// both runtime-owned circuits have completed.
+#[derive(Debug)]
+pub struct PreprocessingPrivateCircuitDriverState {
+    masked_broadcast: ProductionBitSumLeqPublicVecState,
+    carry_compare: ProductionPublicComparisonVecState,
+    cef_correction: Option<ProductionBitSumLeqPublicVecState>,
+    bcc: ProductionBitSumLeqPublicVecState,
+    material_state_hash: [u8; 32],
+}
+
+impl PreprocessingPrivateCircuitDriverState {
+    /// Returns true when both private preprocessing circuits have completed.
+    pub fn is_done(&self) -> bool {
+        self.masked_broadcast.is_done()
+            && self.carry_compare.is_done()
+            && self
+                .cef_correction
+                .as_ref()
+                .map(|state| state.is_done())
+                .unwrap_or(true)
+            && self.bcc.is_done()
+    }
+}
+
+/// Production-facing runtime boundary for preprocessing certification.
+pub trait PreprocessingCertificationRuntime {
+    /// Produces typed CarryCompare/BCC runtime proofs plus durable vector IT-MPC
+    /// runtime evidence for one preprocessing statement.
+    fn certify_preprocessing<P: MlDsaParams>(
+        &mut self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+    ) -> Result<
+        (
+            PreprocessingCertificationRuntimeProofs,
+            ProductionVectorItMpcRuntimeEvidence,
+        ),
+        PreprocessError,
+    >;
+}
+
+/// Production preprocessing certification adapter backed by the app-driven
+/// vector prime-field IT-MPC runtime.
+///
+/// This adapter is the normal-build boundary for release-capable preprocessing
+/// certificates: it refuses runtime evidence that does not pass the Phase 3
+/// durable vector-runtime gate and derives CarryCompare/BCC stage proof
+/// transcripts from that durable runtime transcript. The remaining Phase 6
+/// cryptographic work is to make the preprocessing CarryCompare/CEF/BCC
+/// circuits themselves execute through this runtime before this adapter is
+/// called.
+pub struct ProductionPreprocessingCertificationRuntime<'a, T, L, C> {
+    runtime: &'a mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>,
+    private_handles: Option<PreprocessingPrivateCircuitHandles>,
+    runtime_masked_broadcast_output: Option<RuntimeMaskedBroadcastOutput>,
+    runtime_carry_compare_output: Option<RuntimeCarryCompareOutput>,
+    runtime_cef_bcc_output: Option<RuntimeCefBccOutput>,
+}
+
+impl<'a, T, L, C> ProductionPreprocessingCertificationRuntime<'a, T, L, C> {
+    /// Wraps one app-driven vector IT-MPC runtime for preprocessing
+    /// certification.
+    pub fn new(runtime: &'a mut ProductionVectorPrimeFieldMpcRuntime<T, L, C>) -> Self {
+        Self {
+            runtime,
+            private_handles: None,
+            runtime_masked_broadcast_output: None,
+            runtime_carry_compare_output: None,
+            runtime_cef_bcc_output: None,
+        }
+    }
+
+    /// Attaches runtime-owned private preprocessing circuit handles.
+    ///
+    /// This direct raw-handle hook is test/scaffold-only. Normal release flows
+    /// must attach through `finish_and_attach_private_circuit_state`, which
+    /// proves the handles came from a `PreprocessingPrivateMaterialState`.
+    #[cfg(any(test, feature = "scaffold-dev"))]
+    pub fn with_private_circuit_handles(
+        mut self,
+        handles: PreprocessingPrivateCircuitHandles,
+    ) -> Self {
+        self.private_handles = Some(handles);
+        self.runtime_masked_broadcast_output = None;
+        self.runtime_carry_compare_output = None;
+        self.runtime_cef_bcc_output = None;
+        self
+    }
+
+    /// Attaches completed runtime-owned private preprocessing circuit handles.
+    #[cfg(any(test, feature = "scaffold-dev"))]
+    pub fn attach_private_circuit_handles(&mut self, handles: PreprocessingPrivateCircuitHandles) {
+        self.private_handles = Some(handles);
+        self.runtime_masked_broadcast_output = None;
+        self.runtime_carry_compare_output = None;
+        self.runtime_cef_bcc_output = None;
+    }
+}
+
+impl<T, L, C> ProductionPreprocessingCertificationRuntime<'_, T, L, C>
+where
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    /// Emits the preprocessing marker phases for one public certification
+    /// statement.
+    ///
+    /// This records durable vector-runtime coverage for the preprocessing
+    /// statement. It is not a substitute for the private CarryCompare/CEF/BCC
+    /// circuit; it is the app-driven phase boundary that the final private
+    /// circuit will use for its durable transcript.
+    pub fn drive_statement_phases(
+        &mut self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+    ) -> Result<(), PreprocessError> {
+        let label = preprocessing_certification_runtime_label(statement);
+        self.runtime
+            .drive_preprocessing_masked_broadcast_vec(
+                &label.child("masked_broadcast"),
+                &preprocessing_statement_marker_lanes(
+                    b"masked-broadcast",
+                    statement,
+                    statement
+                        .signer_set
+                        .len()
+                        .saturating_mul(statement.coeff_count),
+                ),
+            )
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        self.runtime
+            .drive_preprocessing_carry_compare_vec(
+                &label.child("carry_compare"),
+                &preprocessing_statement_marker_lanes(
+                    b"carry-compare",
+                    statement,
+                    statement.coeff_count,
+                ),
+            )
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        self.runtime
+            .drive_preprocessing_cef_bcc_vec(
+                &label.child("cef_bcc"),
+                &preprocessing_statement_marker_lanes(b"cef-bcc", statement, statement.coeff_count),
+            )
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        Ok(())
+    }
+
+    /// Collects the preprocessing marker phases for one public certification
+    /// statement.
+    pub fn collect_statement_phases(
+        &mut self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+    ) -> Result<(), PreprocessError> {
+        let label = preprocessing_certification_runtime_label(statement);
+        let phases = [
+            self.runtime
+                .drive_collect_preprocessing_masked_broadcast_vec(&label.child("masked_broadcast"))
+                .map(|(status, _)| status),
+            self.runtime
+                .drive_collect_preprocessing_carry_compare_vec(&label.child("carry_compare"))
+                .map(|(status, _)| status),
+            self.runtime
+                .drive_collect_preprocessing_cef_bcc_vec(&label.child("cef_bcc"))
+                .map(|(status, _)| status),
+        ];
+        for phase in phases {
+            if !matches!(
+                phase.map_err(map_preprocessing_runtime_dkg_error)?,
+                PrimeFieldMpcPhaseDriverStatus::Collected { .. }
+            ) {
+                return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Produces runtime-owned masked-broadcast relation-violation handles.
+    ///
+    /// This is the first Phase 6 private-state source boundary: callers no
+    /// longer fabricate `masked_broadcast_private/relation_violation_bits`
+    /// handles directly. The adapter verifies that each opened masked
+    /// broadcast matches the public runtime statement and its per-party
+    /// runtime binding, then creates statement-labeled private relation bits.
+    /// A valid opened broadcast contributes zero violation bits; the private
+    /// driver later proves `sum(violation_bits) <= 0` through the vector MPC
+    /// runtime. Invalid public relation material fails closed before any token
+    /// can be certified.
+    pub fn start_preprocessing_masked_broadcast_consistency_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+    ) -> Result<Vec<ProductionBitShareVec>, PreprocessError> {
+        let (carry_public, cef_bcc_public) = preprocessing_public_circuit_input_hashes::<P>(
+            statement.session_id,
+            statement.transcript_hash,
+            &statement.signer_set,
+            broadcasts,
+        )?;
+        if carry_public != statement.carry_compare_public_input_hash
+            || cef_bcc_public != statement.cef_bcc_public_input_hash
+            || broadcasts.len() != statement.signer_set.len()
+            || statement.masked_broadcast_bindings.len() != statement.signer_set.len()
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+
+        let root = preprocessing_certification_runtime_label(statement);
+        let relation_root = root
+            .child("masked_broadcast_private")
+            .child("relation_violation_bits");
+        let mut relation_bits = Vec::with_capacity(statement.signer_set.len());
+        let mut runtime_hashes = Vec::with_capacity(statement.signer_set.len());
+        for (idx, party) in statement.signer_set.iter().enumerate() {
+            let broadcast = broadcasts
+                .iter()
+                .find(|broadcast| broadcast.party == *party)
+                .ok_or(PreprocessError::MaskedBroadcastConsistencyMismatch(*party))?;
+            if broadcast.masked_highs.len() != statement.coeff_count
+                || broadcast.masked_lows.len() != statement.coeff_count
+                || broadcast.transcript_hash != statement.transcript_hash
+            {
+                return Err(PreprocessError::MaskedBroadcastConsistencyMismatch(*party));
+            }
+            let binding = statement
+                .masked_broadcast_bindings
+                .iter()
+                .find(|binding| binding.party == *party)
+                .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+            let consistency_statement = MaskedBroadcastConsistencyStatement {
+                session_id: statement.session_id,
+                signer_set: statement.signer_set.clone(),
+                broadcast: broadcast.clone(),
+                coeff_count: statement.coeff_count,
+            };
+            if binding.statement_hash
+                != masked_broadcast_statement_hash::<P>(&consistency_statement)
+                || binding.runtime_transcript_hash == [0u8; 32]
+            {
+                return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+            }
+            runtime_hashes.push(binding.runtime_transcript_hash);
+            let proof = production_masked_broadcast_consistency_proof_with_runtime_transcript::<P>(
+                &consistency_statement,
+                binding.runtime_transcript_hash,
+            );
+            verify_private_certified_masked_broadcast::<P>(&consistency_statement, &proof)?;
+            relation_bits.push(
+                self.runtime
+                    .bit_share_vec_from_local_lanes::<P>(
+                        config,
+                        &relation_root.child(format!("party_{}_violation_{idx}", party.0)),
+                        vec![0; statement.coeff_count],
+                    )
+                    .map_err(map_preprocessing_runtime_dkg_error)?,
+            );
+        }
+        if masked_broadcast_runtime_transcript_hash(
+            statement.session_id,
+            statement.transcript_hash,
+            statement.signer_set.len(),
+            statement.coeff_count,
+            &runtime_hashes,
+        ) != statement.masked_broadcast_runtime_transcript
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        Ok(relation_bits)
+    }
+
+    /// Produces runtime-owned CarryCompare rho-sum bit handles from opened
+    /// masked broadcasts.
+    ///
+    /// The rho-sum bits are derived internally from the statement-bound
+    /// opened broadcasts and emitted under the exact
+    /// `carry_compare_private/rho_sum_bits/bit_i` labels expected by the
+    /// private preprocessing circuit. Normal release callers no longer provide
+    /// these handles directly.
+    pub fn start_preprocessing_carry_compare_rho_sum_bits_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+    ) -> Result<Vec<ProductionBitShareVec>, PreprocessError> {
+        let (carry_public, cef_bcc_public) = preprocessing_public_circuit_input_hashes::<P>(
+            statement.session_id,
+            statement.transcript_hash,
+            &statement.signer_set,
+            broadcasts,
+        )?;
+        if carry_public != statement.carry_compare_public_input_hash
+            || cef_bcc_public != statement.cef_bcc_public_input_hash
+            || broadcasts.len() != statement.signer_set.len()
+            || broadcasts
+                .iter()
+                .any(|broadcast| broadcast.transcript_hash != statement.transcript_hash)
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let (rho_sum_bits, _, _) = preprocessing_private_material_lanes_from_opened_broadcasts::<P>(
+            statement, broadcasts,
+        )?;
+        let root = preprocessing_certification_runtime_label(statement);
+        let rho_root = root.child("carry_compare_private").child("rho_sum_bits");
+        rho_sum_bits
+            .into_iter()
+            .enumerate()
+            .map(|(bit_idx, lanes)| {
+                self.runtime
+                    .bit_share_vec_from_local_lanes::<P>(
+                        config,
+                        &rho_root.child(format!("bit_{bit_idx}")),
+                        lanes,
+                    )
+                    .map_err(map_preprocessing_runtime_dkg_error)
+            })
+            .collect()
+    }
+
+    /// Produces runtime-owned CEF correction-bit handles from opened
+    /// masked broadcasts.
+    ///
+    /// The returned vector contains exactly one bit-share vector under
+    /// `cef_bcc_private/cef_correction_bits/delta`. These correction bits are
+    /// legitimate CEF carries, so they are bound through a separate runtime
+    /// threshold circuit and are not mixed into the BCC violation check.
+    pub fn start_preprocessing_cef_correction_bits_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+    ) -> Result<Vec<ProductionBitShareVec>, PreprocessError> {
+        let (carry_public, cef_bcc_public) = preprocessing_public_circuit_input_hashes::<P>(
+            statement.session_id,
+            statement.transcript_hash,
+            &statement.signer_set,
+            broadcasts,
+        )?;
+        if carry_public != statement.carry_compare_public_input_hash
+            || cef_bcc_public != statement.cef_bcc_public_input_hash
+            || broadcasts.len() != statement.signer_set.len()
+            || broadcasts
+                .iter()
+                .any(|broadcast| broadcast.transcript_hash != statement.transcript_hash)
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let (_, cef_correction_bits, _) =
+            preprocessing_private_material_lanes_from_opened_broadcasts::<P>(
+                statement, broadcasts,
+            )?;
+        let root = preprocessing_certification_runtime_label(statement);
+        let cef_handle = self
+            .runtime
+            .bit_share_vec_from_local_lanes::<P>(
+                config,
+                &root
+                    .child("cef_bcc_private")
+                    .child("cef_correction_bits")
+                    .child("delta"),
+                cef_correction_bits,
+            )
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        Ok(vec![cef_handle])
+    }
+
+    /// Produces runtime-owned BCC violation-bit handles from opened
+    /// masked broadcasts.
+    ///
+    /// The returned vector contains exactly one bit-share vector under
+    /// `cef_bcc_private/bcc_violation_bits/violation`. Normal release callers
+    /// no longer supply any private preprocessing material handles directly.
+    pub fn start_preprocessing_bcc_violation_bits_vec<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+    ) -> Result<Vec<ProductionBitShareVec>, PreprocessError> {
+        let (carry_public, cef_bcc_public) = preprocessing_public_circuit_input_hashes::<P>(
+            statement.session_id,
+            statement.transcript_hash,
+            &statement.signer_set,
+            broadcasts,
+        )?;
+        if carry_public != statement.carry_compare_public_input_hash
+            || cef_bcc_public != statement.cef_bcc_public_input_hash
+            || broadcasts.len() != statement.signer_set.len()
+            || broadcasts
+                .iter()
+                .any(|broadcast| broadcast.transcript_hash != statement.transcript_hash)
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let (_, _, bcc_violation_bits) =
+            preprocessing_private_material_lanes_from_opened_broadcasts::<P>(
+                statement, broadcasts,
+            )?;
+        let root = preprocessing_certification_runtime_label(statement);
+        let bcc_handle = self
+            .runtime
+            .bit_share_vec_from_local_lanes::<P>(
+                config,
+                &root
+                    .child("cef_bcc_private")
+                    .child("bcc_violation_bits")
+                    .child("violation"),
+                bcc_violation_bits,
+            )
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        Ok(vec![bcc_handle])
+    }
+
+    /// Builds the typed private-material bundle accepted by the preprocessing
+    /// circuit driver from already-created runtime bit handles.
+    ///
+    /// This is a test/scaffold-dev bridge. Normal production builds must not
+    /// construct private preprocessing material from caller-supplied bit
+    /// handles; the remaining Phase 6 work is to derive this bundle from the
+    /// runtime's actual preprocessing IT-MPC state.
+    #[cfg(any(test, feature = "scaffold-dev"))]
+    pub fn private_material_handles_from_runtime_bits<P: MlDsaParams>(
+        &self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        masked_broadcast_relation_bits: Vec<ProductionBitShareVec>,
+        rho_sum_bits_by_bit_le: Vec<ProductionBitShareVec>,
+        cef_correction_bits: Vec<ProductionBitShareVec>,
+        bcc_violation_bits: Vec<ProductionBitShareVec>,
+    ) -> Result<PreprocessingPrivateMaterialHandles, PreprocessError> {
+        PreprocessingPrivateMaterialHandles::from_runtime_handles::<P>(
+            statement,
+            masked_broadcast_relation_bits,
+            rho_sum_bits_by_bit_le,
+            cef_correction_bits,
+            bcc_violation_bits,
+        )
+    }
+
+    /// Derives the typed private-material handle bundle from the current
+    /// preprocessing commit/open material.
+    ///
+    /// This is the normal-build adapter path for the current preprocessing
+    /// implementation: callers provide the same opened masked broadcasts that
+    /// are bound into the public runtime statement, and the adapter constructs
+    /// statement-labeled runtime handles internally. The direct constructor
+    /// from arbitrary runtime bit handles remains test/scaffold-only.
+    fn derive_private_material_handles_from_opened_preprocessing<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+    ) -> Result<PreprocessingPrivateMaterialHandles, PreprocessError> {
+        let (carry_public, cef_bcc_public) = preprocessing_public_circuit_input_hashes::<P>(
+            statement.session_id,
+            statement.transcript_hash,
+            &statement.signer_set,
+            broadcasts,
+        )?;
+        if carry_public != statement.carry_compare_public_input_hash
+            || cef_bcc_public != statement.cef_bcc_public_input_hash
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let rho_handles = self.start_preprocessing_carry_compare_rho_sum_bits_vec::<P>(
+            config, statement, broadcasts,
+        )?;
+        let cef_correction_handles =
+            self.start_preprocessing_cef_correction_bits_vec::<P>(config, statement, broadcasts)?;
+        let bcc_handles =
+            self.start_preprocessing_bcc_violation_bits_vec::<P>(config, statement, broadcasts)?;
+        let masked_broadcast_handles = self
+            .start_preprocessing_masked_broadcast_consistency_vec::<P>(
+                config, statement, broadcasts,
+            )?;
+        PreprocessingPrivateMaterialHandles::from_runtime_handles::<P>(
+            statement,
+            masked_broadcast_handles,
+            rho_handles,
+            cef_correction_handles,
+            bcc_handles,
+        )
+    }
+
+    /// Derives runtime-owned preprocessing private material state from opened
+    /// release-envelope material.
+    ///
+    /// This is the normal-build state source for the current Phase 6
+    /// implementation. It replaces public raw-handle attachment with a
+    /// statement-bound object that later feeds the private CarryCompare and
+    /// CEF/BCC circuit driver.
+    pub fn derive_private_material_state_from_opened_preprocessing<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+    ) -> Result<PreprocessingPrivateMaterialState, PreprocessError> {
+        let material = self.derive_private_material_handles_from_opened_preprocessing::<P>(
+            config, statement, broadcasts,
+        )?;
+        PreprocessingPrivateMaterialState::new(
+            PreprocessingPrivateMaterialStateSource::OpenedMaterialDerived,
+            statement,
+            broadcasts,
+            hash_opened_material_private_source_handles(&material),
+            material,
+        )
+    }
+
+    /// Derives preprocessing private material from the final private IT-MPC
+    /// source.
+    ///
+    /// The boundary is intentionally present now so release policy can require
+    /// this source. The implementation remains a Phase 6 blocker until the
+    /// masked-broadcast/rho/BCC predicate state is produced by the private
+    /// preprocessing IT-MPC backend.
+    fn derive_private_material_state_from_runtime_private_mpc<P: MlDsaParams>(
+        &self,
+        _config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+        input: PreprocessingRuntimePrivateMpcStateInput,
+    ) -> Result<PreprocessingPrivateMaterialState, PreprocessError> {
+        let _ = core::marker::PhantomData::<P>;
+        let (carry_public, cef_bcc_public) = preprocessing_public_circuit_input_hashes::<P>(
+            statement.session_id,
+            statement.transcript_hash,
+            &statement.signer_set,
+            broadcasts,
+        )?;
+        if carry_public != statement.carry_compare_public_input_hash
+            || cef_bcc_public != statement.cef_bcc_public_input_hash
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        ensure_preprocessing_runtime_private_mpc_input_labels::<P>(
+            statement,
+            &input.masked_broadcast_relation_bits,
+            &input.rho_sum_bits_by_bit_le,
+            &input.cef_correction_bits,
+            &input.bcc_violation_bits,
+        )?;
+        let source_handle_hash = hash_runtime_private_mpc_source_handles(statement, &input)?;
+        let material = input.into_material_handles::<P>(statement)?;
+        PreprocessingPrivateMaterialState::new(
+            PreprocessingPrivateMaterialStateSource::RuntimePrivateMpc,
+            statement,
+            broadcasts,
+            source_handle_hash,
+            material,
+        )
+    }
+
+    /// Derives preprocessing private material state from runtime-private
+    /// handles generated by the adapter.
+    ///
+    /// This is the current production-facing Phase 6 private-material boundary:
+    /// masked-broadcast relation-violation bits, CarryCompare rho-sum bits, and
+    /// BCC violation bits are all derived from `statement + broadcasts` by the
+    /// adapter.
+    pub fn derive_private_material_state_from_runtime_private_mpc_handles<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+    ) -> Result<PreprocessingPrivateMaterialState, PreprocessError> {
+        let relation_bits = self.start_preprocessing_masked_broadcast_consistency_vec::<P>(
+            config, statement, broadcasts,
+        )?;
+        let rho_sum_bits_by_bit_le = self.start_preprocessing_carry_compare_rho_sum_bits_vec::<P>(
+            config, statement, broadcasts,
+        )?;
+        let cef_correction_bits =
+            self.start_preprocessing_cef_correction_bits_vec::<P>(config, statement, broadcasts)?;
+        let bcc_violation_bits =
+            self.start_preprocessing_bcc_violation_bits_vec::<P>(config, statement, broadcasts)?;
+        let input = PreprocessingRuntimePrivateMpcStateInput::new::<P>(
+            statement,
+            relation_bits,
+            rho_sum_bits_by_bit_le,
+            cef_correction_bits,
+            bcc_violation_bits,
+        )?;
+        self.derive_private_material_state_from_runtime_private_mpc::<P>(
+            config, statement, broadcasts, input,
+        )
+    }
+
+    /// Starts the runtime-owned private preprocessing certification circuits.
+    ///
+    /// `carry_bits_by_bit_le` are the secret bits for the CarryCompare input
+    /// and `carry_thresholds` are the public lane thresholds. `cef_bcc_bits`
+    /// are the private predicate/input bits consumed by the CEF/BCC threshold
+    /// circuit. The returned state must be driven and collected to completion
+    /// before `finish_private_circuit_handles` can produce certification
+    /// handles.
+    fn start_private_circuit_handles<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        masked_broadcast_relation_bits: &[ProductionBitShareVec],
+        carry_bits_by_bit_le: &[ProductionBitShareVec],
+        carry_thresholds: &[Coeff],
+        cef_correction_bits: &[ProductionBitShareVec],
+        bcc_violation_bits: &[ProductionBitShareVec],
+    ) -> Result<PreprocessingPrivateCircuitDriverState, PreprocessError> {
+        if carry_thresholds.len() != statement.coeff_count {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        for bit in masked_broadcast_relation_bits
+            .iter()
+            .chain(carry_bits_by_bit_le.iter())
+            .chain(cef_correction_bits.iter())
+            .chain(bcc_violation_bits.iter())
+        {
+            if bit.len() != statement.coeff_count {
+                return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+            }
+        }
+        let root = preprocessing_certification_runtime_label(statement);
+        let masked_broadcast = self
+            .runtime
+            .start_preprocessing_masked_broadcast_bit_sum_leq_public_vec::<P>(
+                config,
+                masked_broadcast_relation_bits,
+                0,
+                &root
+                    .child("masked_broadcast_private")
+                    .child("relation_sum_leq"),
+            )
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        let carry_compare = self
+            .runtime
+            .start_preprocessing_carry_compare_gt_public_lanes_vec::<P>(
+                config,
+                carry_bits_by_bit_le,
+                carry_thresholds,
+                &root.child("carry_compare_private").child("rho_gt_t"),
+            )
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        let cef_correction = if cef_correction_bits.is_empty() {
+            None
+        } else {
+            Some(
+                self.runtime
+                    .start_preprocessing_cef_bcc_bit_sum_leq_public_vec::<P>(
+                        config,
+                        cef_correction_bits,
+                        cef_correction_bits.len() as u32,
+                        &root
+                            .child("cef_bcc_private")
+                            .child("cef_correction_sum_leq"),
+                    )
+                    .map_err(map_preprocessing_runtime_dkg_error)?,
+            )
+        };
+        let bcc = self
+            .runtime
+            .start_preprocessing_cef_bcc_bit_sum_leq_public_vec::<P>(
+                config,
+                bcc_violation_bits,
+                0,
+                &root.child("cef_bcc_private").child("bcc_sum_leq"),
+            )
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        Ok(PreprocessingPrivateCircuitDriverState {
+            masked_broadcast,
+            carry_compare,
+            cef_correction,
+            bcc,
+            material_state_hash: [0u8; 32],
+        })
+    }
+
+    /// Starts private preprocessing circuits from the public opened
+    /// masked-broadcast material and runtime-owned private material handles.
+    ///
+    /// This is the production-shaped entry point for preprocessing
+    /// certification. The public CarryCompare thresholds are derived from the
+    /// opened masked-low sums, and BCC admission is expressed as
+    /// `sum(private_bcc_violation_bits) <= 0`. The private material bundle is
+    /// already validated against the statement-derived transcript labels.
+    fn start_private_circuit_handles_from_preprocessing_material<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+        private_material: &PreprocessingPrivateMaterialHandles,
+    ) -> Result<PreprocessingPrivateCircuitDriverState, PreprocessError> {
+        let (carry_public, cef_bcc_public) = preprocessing_public_circuit_input_hashes::<P>(
+            statement.session_id,
+            statement.transcript_hash,
+            &statement.signer_set,
+            broadcasts,
+        )?;
+        if carry_public != statement.carry_compare_public_input_hash
+            || cef_bcc_public != statement.cef_bcc_public_input_hash
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let carry_thresholds =
+            preprocessing_carry_thresholds_from_broadcasts::<P>(statement, broadcasts)?;
+        self.start_private_circuit_handles::<P>(
+            config,
+            statement,
+            private_material.masked_broadcast_relation_bits(),
+            private_material.rho_sum_bits_by_bit_le(),
+            &carry_thresholds,
+            private_material.cef_correction_bits(),
+            private_material.bcc_violation_bits(),
+        )
+    }
+
+    /// Starts private preprocessing circuits from runtime-owned private
+    /// material state.
+    pub fn start_private_circuit_handles_from_state<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        broadcasts: &[MaskedBroadcast],
+        state: &PreprocessingPrivateMaterialState,
+    ) -> Result<PreprocessingPrivateCircuitDriverState, PreprocessError> {
+        state.ensure_allowed_for_release()?;
+        state.ensure_matches(statement, broadcasts)?;
+        let mut driver = self.start_private_circuit_handles_from_preprocessing_material::<P>(
+            config,
+            statement,
+            broadcasts,
+            state.material(),
+        )?;
+        driver.material_state_hash = hash_preprocessing_private_material_state(state);
+        Ok(driver)
+    }
+
+    /// Opens release envelopes, derives their runtime statement, constructs
+    /// adapter-owned runtime-private material state, and starts the private
+    /// preprocessing circuits.
+    ///
+    /// This is the normal entry point before driving
+    /// `drive_private_circuit_handles_step` / `collect_private_circuit_handles_step`.
+    /// After the returned state is done, callers finish it into
+    /// `PreprocessingPrivateCircuitHandles` and attach those handles before
+    /// calling `certify_preprocessing_token_release_validated_with_runtime`.
+    pub fn start_private_circuit_handles_from_envelopes<P: MlDsaParams>(
+        &self,
+        config: &DkgConfig,
+        session_id: SessionId,
+        inputs: Vec<PartyPreprocessInput>,
+        envelopes: Vec<BroadcastEnvelope>,
+        expected_transcript: TranscriptHash,
+    ) -> Result<
+        (
+            PreprocessingCertificationRuntimeStatement,
+            Vec<MaskedBroadcast>,
+            PreprocessingPrivateCircuitDriverState,
+        ),
+        PreprocessError,
+    > {
+        let broadcasts = open_broadcasts(session_id, &envelopes, expected_transcript)?;
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<P>(
+            session_id,
+            inputs,
+            envelopes,
+            expected_transcript,
+        )?;
+        let private_material_state = self
+            .derive_private_material_state_from_runtime_private_mpc_handles::<P>(
+                config,
+                &statement,
+                &broadcasts,
+            )?;
+        let state = self.start_private_circuit_handles_from_state::<P>(
+            config,
+            &statement,
+            &broadcasts,
+            &private_material_state,
+        )?;
+        Ok((statement, broadcasts, state))
+    }
+
+    /// Drives the next app-transport round for the private preprocessing
+    /// circuits.
+    pub fn drive_private_circuit_handles_step<P, E>(
+        &mut self,
+        config: &DkgConfig,
+        state: &mut PreprocessingPrivateCircuitDriverState,
+        entropy: &mut E,
+    ) -> Result<PrimeFieldMpcPhaseDriverStatus, PreprocessError>
+    where
+        P: MlDsaParams,
+        E: ProductionVectorItMpcEntropy,
+    {
+        if !state.masked_broadcast.is_done() {
+            return self
+                .runtime
+                .drive_bit_sum_leq_public_vec_step::<P, E>(
+                    config,
+                    &mut state.masked_broadcast,
+                    entropy,
+                )
+                .map_err(map_preprocessing_runtime_dkg_error);
+        }
+        if !state.carry_compare.is_done() {
+            return self
+                .runtime
+                .drive_public_comparison_vec_step::<P, E>(config, &mut state.carry_compare, entropy)
+                .map_err(map_preprocessing_runtime_dkg_error);
+        }
+        if let Some(cef_correction) = state.cef_correction.as_mut() {
+            if !cef_correction.is_done() {
+                return self
+                    .runtime
+                    .drive_bit_sum_leq_public_vec_step::<P, E>(config, cef_correction, entropy)
+                    .map_err(map_preprocessing_runtime_dkg_error);
+            }
+        }
+        self.runtime
+            .drive_bit_sum_leq_public_vec_step::<P, E>(config, &mut state.bcc, entropy)
+            .map_err(map_preprocessing_runtime_dkg_error)
+    }
+
+    /// Collects the pending app-transport round for the private preprocessing
+    /// circuits.
+    pub fn collect_private_circuit_handles_step<P: MlDsaParams>(
+        &mut self,
+        config: &DkgConfig,
+        state: &mut PreprocessingPrivateCircuitDriverState,
+    ) -> Result<ProductionVectorItMpcCollectResult<()>, PreprocessError> {
+        if !state.masked_broadcast.is_done() {
+            return self
+                .runtime
+                .collect_bit_sum_leq_public_vec_step::<P>(config, &mut state.masked_broadcast)
+                .map(|result| match result {
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        ProductionVectorItMpcCollectResult::Waiting(status)
+                    }
+                    ProductionVectorItMpcCollectResult::Collected { status, .. } => {
+                        ProductionVectorItMpcCollectResult::Collected { status, value: () }
+                    }
+                })
+                .map_err(map_preprocessing_runtime_dkg_error);
+        }
+        if !state.carry_compare.is_done() {
+            return self
+                .runtime
+                .collect_public_comparison_vec_step::<P>(config, &mut state.carry_compare)
+                .map(|result| match result {
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        ProductionVectorItMpcCollectResult::Waiting(status)
+                    }
+                    ProductionVectorItMpcCollectResult::Collected { status, .. } => {
+                        ProductionVectorItMpcCollectResult::Collected { status, value: () }
+                    }
+                })
+                .map_err(map_preprocessing_runtime_dkg_error);
+        }
+        if let Some(cef_correction) = state.cef_correction.as_mut() {
+            if !cef_correction.is_done() {
+                return self
+                    .runtime
+                    .collect_bit_sum_leq_public_vec_step::<P>(config, cef_correction)
+                    .map(|result| match result {
+                        ProductionVectorItMpcCollectResult::Waiting(status) => {
+                            ProductionVectorItMpcCollectResult::Waiting(status)
+                        }
+                        ProductionVectorItMpcCollectResult::Collected { status, .. } => {
+                            ProductionVectorItMpcCollectResult::Collected { status, value: () }
+                        }
+                    })
+                    .map_err(map_preprocessing_runtime_dkg_error);
+            }
+        }
+        self.runtime
+            .collect_bit_sum_leq_public_vec_step::<P>(config, &mut state.bcc)
+            .map(|result| match result {
+                ProductionVectorItMpcCollectResult::Waiting(status) => {
+                    ProductionVectorItMpcCollectResult::Waiting(status)
+                }
+                ProductionVectorItMpcCollectResult::Collected { status, .. } => {
+                    ProductionVectorItMpcCollectResult::Collected { status, value: () }
+                }
+            })
+            .map_err(map_preprocessing_runtime_dkg_error)
+    }
+
+    /// Finishes completed private preprocessing circuits into the handle bundle
+    /// required by release certification.
+    pub fn finish_private_circuit_handles(
+        &self,
+        state: &PreprocessingPrivateCircuitDriverState,
+    ) -> Result<PreprocessingPrivateCircuitHandles, PreprocessError> {
+        if state.material_state_hash == [0u8; 32] {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let masked_broadcast = state
+            .masked_broadcast
+            .result()
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?
+            .clone();
+        if masked_broadcast.len() == 0 {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let carry = state
+            .carry_compare
+            .result()
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?
+            .clone();
+        let cef_correction = state
+            .cef_correction
+            .as_ref()
+            .and_then(|state| state.result().cloned())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let bcc = state
+            .bcc
+            .result()
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?
+            .clone();
+        PreprocessingPrivateCircuitHandles::from_preprocessing_bits(
+            vec![carry],
+            cef_correction,
+            vec![bcc],
+        )
+    }
+
+    /// Finishes the runtime-owned masked-broadcast output from the
+    /// statement-bound runtime-private material state.
+    ///
+    /// This binds masked-broadcast certification to the same private material
+    /// state that feeds CarryCompare and CEF/BCC. It does not expose relation
+    /// bits or per-party failure information.
+    pub fn finish_runtime_masked_broadcast_output<P: MlDsaParams>(
+        &self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        state: &PreprocessingPrivateCircuitDriverState,
+    ) -> Result<RuntimeMaskedBroadcastOutput, PreprocessError> {
+        let _ = core::marker::PhantomData::<P>;
+        if state.material_state_hash == [0u8; 32]
+            || statement.masked_broadcast_runtime_transcript == [0u8; 32]
+            || statement.signer_set.is_empty()
+            || statement.coeff_count == 0
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let relation_ok = state
+            .masked_broadcast
+            .result()
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+        if relation_ok.len() != statement.coeff_count {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let evidence = self
+            .runtime
+            .runtime_evidence()
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        validate_masked_broadcast_bindings_for_vector_runtime::<P>(
+            statement,
+            evidence.transcript_hash,
+        )?;
+        Ok(RuntimeMaskedBroadcastOutput {
+            signer_count: statement.signer_set.len(),
+            coeff_count: statement.coeff_count,
+            runtime_transcript_hash: statement.masked_broadcast_runtime_transcript,
+            material_state_hash: state.material_state_hash,
+        })
+    }
+
+    /// Finishes the runtime-owned CarryCompare output from a completed private
+    /// preprocessing driver state.
+    ///
+    /// This binds the public CarryCompare output object to an actually
+    /// completed preprocessing-tagged comparison circuit and the durable vector
+    /// runtime transcript. It does not expose the private carry bits.
+    pub fn finish_runtime_carry_compare_output<P: MlDsaParams>(
+        &self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        state: &PreprocessingPrivateCircuitDriverState,
+    ) -> Result<RuntimeCarryCompareOutput, PreprocessError> {
+        if state.material_state_hash == [0u8; 32] {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let carry = state
+            .carry_compare
+            .result()
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+        if carry.len() != statement.coeff_count {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let private_handle_hash = hash_preprocessing_private_bit_handles(
+            b"runtime-carry-compare-output",
+            statement,
+            core::slice::from_ref(carry),
+        )?;
+        if private_handle_hash == [0u8; 32] {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let evidence = self
+            .runtime
+            .runtime_evidence()
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        let runtime_transcript_hash =
+            preprocessing_stage_runtime_transcript_hash_from_vector_runtime_evidence(
+                PreprocessingCertificationStage::CarryCompare,
+                statement,
+                evidence.transcript_hash,
+            );
+        if runtime_transcript_hash == [0u8; 32] {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        Ok(RuntimeCarryCompareOutput {
+            coeff_count: statement.coeff_count,
+            evidence_hash: statement.carry_compare_evidence_hash,
+            runtime_transcript_hash,
+        })
+    }
+
+    /// Finishes the runtime-owned CEF/BCC output from a completed private
+    /// preprocessing driver state.
+    ///
+    /// This binds the public CEF/BCC output object to an actually completed
+    /// preprocessing-tagged threshold circuit and the durable vector runtime
+    /// transcript. It does not open the private BCC predicate bits.
+    pub fn finish_runtime_cef_bcc_output<P: MlDsaParams>(
+        &self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        state: &PreprocessingPrivateCircuitDriverState,
+        carry_output: RuntimeCarryCompareOutput,
+    ) -> Result<RuntimeCefBccOutput, PreprocessError> {
+        if state.material_state_hash == [0u8; 32] {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        if carry_output.coeff_count != statement.coeff_count
+            || carry_output.evidence_hash != statement.carry_compare_evidence_hash
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let cef_correction = state
+            .cef_correction
+            .as_ref()
+            .and_then(|state| state.result())
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+        let bcc = state
+            .bcc
+            .result()
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+        if cef_correction.len() != statement.coeff_count || bcc.len() != statement.coeff_count {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let cef_private_handle_hash = hash_preprocessing_private_bit_handles(
+            b"runtime-cef-correction-output",
+            statement,
+            core::slice::from_ref(cef_correction),
+        )?;
+        let bcc_private_handle_hash = hash_preprocessing_private_bit_handles(
+            b"runtime-cef-bcc-output",
+            statement,
+            core::slice::from_ref(bcc),
+        )?;
+        if cef_private_handle_hash == [0u8; 32] || bcc_private_handle_hash == [0u8; 32] {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let evidence = self
+            .runtime
+            .runtime_evidence()
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        let runtime_transcript_hash =
+            preprocessing_stage_runtime_transcript_hash_from_vector_runtime_evidence(
+                PreprocessingCertificationStage::Bcc,
+                statement,
+                evidence.transcript_hash,
+            );
+        if runtime_transcript_hash == [0u8; 32] {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        Ok(RuntimeCefBccOutput {
+            coeff_count: statement.coeff_count,
+            w1_hash: statement.w1_hash,
+            carry_compare_evidence_hash: carry_output.evidence_hash,
+            bcc_evidence_hash: statement.bcc_evidence_hash,
+            runtime_transcript_hash,
+            token_admitted: true,
+        })
+    }
+
+    /// Finishes state-owned private preprocessing circuits and attaches their
+    /// handles to this runtime adapter for release token certification.
+    pub fn finish_and_attach_private_circuit_state(
+        &mut self,
+        state: &PreprocessingPrivateCircuitDriverState,
+    ) -> Result<(), PreprocessError> {
+        let handles = self.finish_private_circuit_handles(state)?;
+        self.private_handles = Some(handles);
+        self.runtime_masked_broadcast_output = None;
+        self.runtime_carry_compare_output = None;
+        self.runtime_cef_bcc_output = None;
+        Ok(())
+    }
+
+    /// Finishes state-owned private preprocessing circuits, stores the
+    /// runtime-owned CarryCompare output, and attaches completed private
+    /// handles for release token certification.
+    pub fn finish_and_attach_private_circuit_state_for_statement<P: MlDsaParams>(
+        &mut self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+        state: &PreprocessingPrivateCircuitDriverState,
+    ) -> Result<(), PreprocessError> {
+        let masked_broadcast_output =
+            self.finish_runtime_masked_broadcast_output::<P>(statement, state)?;
+        let carry_output = self.finish_runtime_carry_compare_output::<P>(statement, state)?;
+        let cef_bcc_output =
+            self.finish_runtime_cef_bcc_output::<P>(statement, state, carry_output)?;
+        let handles = self.finish_private_circuit_handles(state)?;
+        self.private_handles = Some(handles);
+        self.runtime_masked_broadcast_output = Some(masked_broadcast_output);
+        self.runtime_carry_compare_output = Some(carry_output);
+        self.runtime_cef_bcc_output = Some(cef_bcc_output);
+        Ok(())
+    }
+}
+
+impl<T, L, C> PreprocessingCertificationRuntime
+    for ProductionPreprocessingCertificationRuntime<'_, T, L, C>
+where
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+{
+    fn certify_preprocessing<P: MlDsaParams>(
+        &mut self,
+        statement: &PreprocessingCertificationRuntimeStatement,
+    ) -> Result<
+        (
+            PreprocessingCertificationRuntimeProofs,
+            ProductionVectorItMpcRuntimeEvidence,
+        ),
+        PreprocessError,
+    > {
+        let initial_evidence = self
+            .runtime
+            .runtime_evidence()
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        ensure_preprocessing_vector_runtime_evidence_for_release(&initial_evidence)?;
+        ensure_preprocessing_statement_public_input_hashes(statement)?;
+        ensure_preprocessing_statement_private_label_hashes(statement)?;
+        let private_inputs = self
+            .private_handles
+            .as_ref()
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?
+            .bind_to_statement(statement)?;
+        ensure_preprocessing_private_circuit_inputs_match_statement(statement, &private_inputs)?;
+        let (carry_private_mul_labels, cef_bcc_private_mul_labels) =
+            preprocessing_statement_private_circuit_mul_labels::<P>(statement);
+        ensure_preprocessing_wire_log_private_circuits_for_release(
+            self.runtime.inner().runtime().wire_log(),
+            &carry_private_mul_labels,
+            &cef_bcc_private_mul_labels,
+        )
+        .map_err(map_preprocessing_runtime_dkg_error)?;
+        let mut evidence = self
+            .runtime
+            .runtime_evidence()
+            .map_err(map_preprocessing_runtime_dkg_error)?;
+        let raw_runtime_transcript = evidence.transcript_hash;
+
+        validate_masked_broadcast_bindings_for_vector_runtime::<P>(
+            statement,
+            raw_runtime_transcript,
+        )?;
+        let masked_broadcast_output = self
+            .runtime_masked_broadcast_output
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+        if masked_broadcast_output.signer_count != statement.signer_set.len()
+            || masked_broadcast_output.coeff_count != statement.coeff_count
+            || masked_broadcast_output.runtime_transcript_hash
+                != statement.masked_broadcast_runtime_transcript
+            || masked_broadcast_output.material_state_hash == [0u8; 32]
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+
+        let carry_runtime_transcript =
+            preprocessing_stage_runtime_transcript_hash_from_vector_runtime_evidence(
+                PreprocessingCertificationStage::CarryCompare,
+                statement,
+                raw_runtime_transcript,
+            );
+        let carry_compare_output = self
+            .runtime_carry_compare_output
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+        if carry_compare_output.coeff_count != statement.coeff_count
+            || carry_compare_output.evidence_hash != statement.carry_compare_evidence_hash
+            || carry_compare_output.runtime_transcript_hash != carry_runtime_transcript
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let bcc_runtime_transcript =
+            preprocessing_stage_runtime_transcript_hash_from_vector_runtime_evidence(
+                PreprocessingCertificationStage::Bcc,
+                statement,
+                raw_runtime_transcript,
+            );
+        let cef_bcc_output = self
+            .runtime_cef_bcc_output
+            .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+        if cef_bcc_output.coeff_count != statement.coeff_count
+            || cef_bcc_output.w1_hash != statement.w1_hash
+            || cef_bcc_output.carry_compare_evidence_hash != statement.carry_compare_evidence_hash
+            || cef_bcc_output.bcc_evidence_hash != statement.bcc_evidence_hash
+            || cef_bcc_output.runtime_transcript_hash != bcc_runtime_transcript
+            || !cef_bcc_output.token_admitted
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+
+        let proofs = PreprocessingCertificationRuntimeProofs {
+            masked_broadcast: statement.masked_broadcast_runtime_transcript,
+            carry_compare: preprocessing_certification_stage_runtime_proof_inner::<P>(
+                PreprocessingCertificationStage::CarryCompare,
+                statement.session_id,
+                statement.transcript_hash,
+                statement.signer_set.len(),
+                statement.coeff_count,
+                statement.carry_compare_evidence_hash,
+                carry_runtime_transcript,
+            )?,
+            bcc: preprocessing_certification_stage_runtime_proof_inner::<P>(
+                PreprocessingCertificationStage::Bcc,
+                statement.session_id,
+                statement.transcript_hash,
+                statement.signer_set.len(),
+                statement.coeff_count,
+                statement.bcc_evidence_hash,
+                bcc_runtime_transcript,
+            )?,
+            outputs: PreprocessingCertificationRuntimeOutputs {
+                masked_broadcast: masked_broadcast_output,
+                carry_compare: carry_compare_output,
+                cef_bcc: cef_bcc_output,
+            },
+        };
+
+        evidence.transcript_hash = preprocessing_runtime_transcript_aggregate_hash(
+            statement.session_id,
+            statement.transcript_hash,
+            proofs.transcripts()?,
+        )?;
+        Ok((proofs, evidence))
+    }
+}
+
+const PREPROCESSING_STAGE_RUNTIME_PROOF_PREFIX: &[u8; 6] = b"TPRSR1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreprocessingStageRuntimeProofParts {
+    stage: PreprocessingCertificationStage,
+    statement_hash: [u8; 32],
+    runtime_transcript_hash: [u8; 32],
+    coeff_count: usize,
+    signer_count: usize,
+}
+
+/// Aggregates the three preprocessing certification runtime transcript hashes
+/// into the transcript hash expected by release-capable preprocessing runtime
+/// evidence.
+pub fn preprocessing_runtime_transcript_aggregate_hash(
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    transcripts: PreprocessingCertificationRuntimeTranscripts,
+) -> Result<[u8; 32], PreprocessError> {
+    if !transcripts.is_complete() {
+        return Err(PreprocessError::PreChallengeCertificationIncomplete);
+    }
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing aggregate runtime transcript v1");
+    hasher.update(session_id.0);
+    hasher.update(transcript_hash.0);
+    hasher.update(transcripts.masked_broadcast);
+    hasher.update(transcripts.carry_compare);
+    hasher.update(transcripts.bcc);
+    Ok(hasher.finalize().into())
+}
+
+/// Encodes a typed private-runtime proof for one preprocessing certification
+/// stage.
+#[cfg(test)]
+pub fn preprocessing_certification_stage_runtime_proof<P: MlDsaParams>(
+    stage: PreprocessingCertificationStage,
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_count: usize,
+    coeff_count: usize,
+    evidence_hash: [u8; 32],
+    runtime_transcript_hash: [u8; 32],
+) -> Result<PreprocessingCertificationStageRuntimeProof, PreprocessError> {
+    preprocessing_certification_stage_runtime_proof_inner::<P>(
+        stage,
+        session_id,
+        transcript_hash,
+        signer_count,
+        coeff_count,
+        evidence_hash,
+        runtime_transcript_hash,
+    )
+}
+
+#[allow(dead_code)]
+fn preprocessing_certification_stage_runtime_proof_inner<P: MlDsaParams>(
+    stage: PreprocessingCertificationStage,
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_count: usize,
+    coeff_count: usize,
+    evidence_hash: [u8; 32],
+    runtime_transcript_hash: [u8; 32],
+) -> Result<PreprocessingCertificationStageRuntimeProof, PreprocessError> {
+    if runtime_transcript_hash == [0u8; 32] {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    let parts = expected_preprocessing_stage_runtime_proof_parts::<P>(
+        stage,
+        session_id,
+        transcript_hash,
+        signer_count,
+        coeff_count,
+        evidence_hash,
+        runtime_transcript_hash,
+    );
+    let mut bytes = Vec::with_capacity(6 + 1 + 32 + 32 + 4 + 4);
+    bytes.extend_from_slice(PREPROCESSING_STAGE_RUNTIME_PROOF_PREFIX);
+    bytes.push(parts.stage.code());
+    bytes.extend_from_slice(&parts.statement_hash);
+    bytes.extend_from_slice(&parts.runtime_transcript_hash);
+    bytes.extend_from_slice(&(parts.coeff_count as u32).to_le_bytes());
+    bytes.extend_from_slice(&(parts.signer_count as u32).to_le_bytes());
+    Ok(PreprocessingCertificationStageRuntimeProof { bytes })
 }
 
 /// Public statement checked before a masked broadcast can certify a token.
@@ -1122,6 +3131,8 @@ pub struct MaskedBroadcastCertificationEvidence {
     pub coeff_count: usize,
     /// Hash of the opened masked broadcasts and verifier transcript.
     pub evidence_hash: [u8; 32],
+    /// Runtime transcript hash claimed by the masked-broadcast proof envelopes.
+    pub runtime_transcript_hash: [u8; 32],
 }
 
 /// Public evidence that CarryCompare completed before token admission.
@@ -1133,6 +3144,8 @@ pub struct CarryCompareCertificationEvidence {
     pub coeff_count: usize,
     /// Public transcript hash for the certification step.
     pub evidence_hash: [u8; 32],
+    /// Runtime transcript hash for the private CarryCompare certification.
+    pub runtime_transcript_hash: [u8; 32],
 }
 
 /// Public evidence that BCC was certified before token admission.
@@ -1144,6 +3157,8 @@ pub struct BccCertificationEvidence {
     pub coeff_count: usize,
     /// Public transcript hash for the BCC check.
     pub evidence_hash: [u8; 32],
+    /// Runtime transcript hash for the private CEF/BCC certification.
+    pub runtime_transcript_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1193,18 +3208,50 @@ pub struct PreChallengeCertificationEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreprocessingVectorRuntimeCertificate {
     /// Durable runtime evidence from the vector IT-MPC backend.
-    pub runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+    runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+    /// Hash binding this runtime evidence to one concrete certified token.
+    token_binding_hash: Option<[u8; 32]>,
 }
 
 impl PreprocessingVectorRuntimeCertificate {
     /// Builds a preprocessing runtime certificate after applying the full Phase
-    /// 3 vector-runtime release gate.
+    /// 6 preprocessing vector-runtime release gate.
     pub fn new(
         runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
     ) -> Result<Self, PreprocessError> {
-        ensure_production_vector_it_mpc_runtime_evidence_for_release(&runtime_evidence)
-            .map_err(|_| PreprocessError::PreprocessingCountersNotVectorized)?;
-        Ok(Self { runtime_evidence })
+        ensure_preprocessing_vector_runtime_evidence_for_release(&runtime_evidence)?;
+        Ok(Self {
+            runtime_evidence,
+            token_binding_hash: None,
+        })
+    }
+
+    /// Builds a runtime certificate bound to one concrete certified token.
+    pub fn for_token(
+        token: &CertifiedToken,
+        runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+    ) -> Result<Self, PreprocessError> {
+        let mut certificate = Self::new(runtime_evidence)?;
+        certificate.token_binding_hash = Some(preprocessing_runtime_token_binding_hash(
+            token,
+            &certificate.runtime_evidence,
+        ));
+        Ok(certificate)
+    }
+
+    /// Returns durable runtime evidence from the vector IT-MPC backend.
+    pub fn runtime_evidence(&self) -> &ProductionVectorItMpcRuntimeEvidence {
+        &self.runtime_evidence
+    }
+
+    /// Returns the token-binding hash, if this certificate is bound.
+    pub fn token_binding_hash(&self) -> Option<[u8; 32]> {
+        self.token_binding_hash
+    }
+
+    #[cfg(test)]
+    fn runtime_evidence_mut_for_test(&mut self) -> &mut ProductionVectorItMpcRuntimeEvidence {
+        &mut self.runtime_evidence
     }
 }
 
@@ -1683,6 +3730,82 @@ pub fn ensure_pre_challenge_certification_evidence(
     }
 }
 
+/// Validates one preprocessing token for a release-capable strict-signing pool.
+///
+/// `CertifiedToken::is_certified` is intentionally permissive in normal test
+/// builds so unit tests can construct local/dev tokens. This function is the
+/// production boundary: it requires the full pre-challenge certification
+/// evidence, vector/chunk counters, and a durable vector IT-MPC runtime
+/// certificate attached to the token itself.
+pub fn ensure_certified_token_release_valid(token: &CertifiedToken) -> Result<(), PreprocessError> {
+    ensure_pre_challenge_certification_evidence(token.session_id, &token.certification_evidence)?;
+    if token.certification_policy != token.certification_evidence.policy() {
+        return Err(PreprocessError::PreChallengeCertificationIncomplete);
+    }
+    ensure_preprocessing_counters_vectorized_for_release(
+        PreprocessingCertificationCounters::from_token(token),
+    )?;
+    let certificate = token
+        .vector_runtime_certificate
+        .as_ref()
+        .ok_or(PreprocessError::PreprocessingRuntimeCertificateMissing)?;
+    ensure_preprocessing_vector_runtime_evidence_for_release(&certificate.runtime_evidence)?;
+    ensure_preprocessing_runtime_evidence_covers_token(token, &certificate.runtime_evidence)?;
+    let expected_binding =
+        preprocessing_runtime_token_binding_hash(token, &certificate.runtime_evidence);
+    if certificate.token_binding_hash != Some(expected_binding) {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    let preprocessing_runtime_hash = preprocessing_certification_runtime_transcript_hash(token)?;
+    if certificate.runtime_evidence.transcript_hash != preprocessing_runtime_hash {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    Ok(())
+}
+
+fn preprocessing_certification_runtime_transcript_hash(
+    token: &CertifiedToken,
+) -> Result<[u8; 32], PreprocessError> {
+    preprocessing_runtime_transcript_aggregate_hash(
+        token.session_id,
+        token.transcript_hash,
+        PreprocessingCertificationRuntimeTranscripts {
+            masked_broadcast: token
+                .certification_evidence
+                .masked_broadcast
+                .map(|evidence| evidence.runtime_transcript_hash)
+                .ok_or(PreprocessError::PreChallengeCertificationIncomplete)?,
+            carry_compare: token
+                .certification_evidence
+                .carry_compare
+                .map(|evidence| evidence.runtime_transcript_hash)
+                .ok_or(PreprocessError::PreChallengeCertificationIncomplete)?,
+            bcc: token
+                .certification_evidence
+                .bcc
+                .map(|evidence| evidence.runtime_transcript_hash)
+                .ok_or(PreprocessError::PreChallengeCertificationIncomplete)?,
+        },
+    )
+}
+
+fn ensure_preprocessing_runtime_evidence_covers_token(
+    token: &CertifiedToken,
+    runtime_evidence: &ProductionVectorItMpcRuntimeEvidence,
+) -> Result<(), PreprocessError> {
+    let counters = PreprocessingCertificationCounters::from_token(token);
+    let runtime = runtime_evidence.counters;
+    let certification_lanes = counters
+        .carry_compare_lanes
+        .saturating_add(counters.cef_correction_lanes)
+        .saturating_add(counters.bcc_lanes) as u64;
+    if runtime.vector_lanes < certification_lanes || runtime.vector_mul_lanes < certification_lanes
+    {
+        return Err(PreprocessError::PreprocessingCountersNotVectorized);
+    }
+    Ok(())
+}
+
 /// Certified preprocessing token.
 pub struct CertifiedToken {
     /// Session identifier.
@@ -1749,9 +3872,14 @@ impl CertifiedToken {
         self.vector_runtime_certificate.as_ref()
     }
 
+    /// Returns whether this token is valid for a release-capable strict pool.
+    pub fn is_release_certified(&self) -> bool {
+        ensure_certified_token_release_valid(self).is_ok()
+    }
+
     /// Returns whether this token has passed preprocessing certification.
     pub fn is_certified(&self) -> bool {
-        self.certification_policy == self.certification_evidence.policy()
+        let base_certified = self.certification_policy == self.certification_evidence.policy()
             && ensure_pre_challenge_certification_evidence(
                 self.session_id,
                 &self.certification_evidence,
@@ -1762,8 +3890,8 @@ impl CertifiedToken {
             && self.certification_policy.bcc_certified
             && self.certification_policy.persistent_session_store
             && self.certification_policy.no_post_challenge_nonce_reveal
-            && (!cfg!(feature = "production-release-checks")
-                || self.vector_runtime_certificate.is_some())
+            && (!cfg!(feature = "production-release-checks") || self.is_release_certified());
+        base_certified
     }
 }
 
@@ -1840,6 +3968,24 @@ impl TokenPool {
         Ok(())
     }
 
+    /// Inserts a token only if it carries release-capable preprocessing runtime
+    /// evidence.
+    pub fn insert_release_certified(
+        &mut self,
+        token: CertifiedToken,
+    ) -> Result<(), TokenPoolError> {
+        if !token.is_release_certified() {
+            return Err(TokenPoolError::NotCertified(token.session_id));
+        }
+        if self.sessions.contains(&token.session_id) {
+            return Err(TokenPoolError::Duplicate(token.session_id));
+        }
+
+        self.sessions.push(token.session_id);
+        self.tokens.push(token);
+        Ok(())
+    }
+
     /// Reserves inventory state and inserts a certified token.
     pub fn insert_certified_with_inventory(
         &mut self,
@@ -1848,6 +3994,16 @@ impl TokenPool {
     ) -> Result<(), TokenPoolError> {
         inventory.reserve(token.session_id)?;
         self.insert_certified(token)
+    }
+
+    /// Reserves inventory state and inserts a release-certified token.
+    pub fn insert_release_certified_with_inventory(
+        &mut self,
+        token: CertifiedToken,
+        inventory: &mut impl TokenInventoryStore,
+    ) -> Result<(), TokenPoolError> {
+        inventory.reserve(token.session_id)?;
+        self.insert_release_certified(token)
     }
 
     /// Removes and returns a certified token for one session.
@@ -2166,6 +4322,10 @@ pub enum PreprocessError {
     SessionCounterExhausted,
     /// Required pre-challenge preprocessing certification is incomplete.
     PreChallengeCertificationIncomplete,
+    /// Release-capable preprocessing token is missing durable vector runtime evidence.
+    PreprocessingRuntimeCertificateMissing,
+    /// Durable vector runtime evidence is not bound to this preprocessing token.
+    PreprocessingRuntimeCertificateMismatch,
     /// Preprocessing evidence does not prove vector/chunk-shaped execution.
     PreprocessingCountersNotVectorized,
     /// Preprocessing session received a private message, but this round uses broadcast only.
@@ -2253,6 +4413,18 @@ impl fmt::Display for PreprocessError {
             Self::PreChallengeCertificationIncomplete => {
                 write!(f, "pre-challenge certification incomplete")
             }
+            Self::PreprocessingRuntimeCertificateMissing => {
+                write!(
+                    f,
+                    "preprocessing token is missing durable vector runtime certificate"
+                )
+            }
+            Self::PreprocessingRuntimeCertificateMismatch => {
+                write!(
+                    f,
+                    "preprocessing runtime certificate is not bound to this token"
+                )
+            }
             Self::PreprocessingCountersNotVectorized => {
                 write!(f, "preprocessing counters are not vectorized")
             }
@@ -2302,6 +4474,136 @@ pub fn certify_preprocessing_token<P: MlDsaParams>(
     )
 }
 
+/// Builds and certifies one release-capable preprocessing token.
+#[cfg(test)]
+pub fn certify_preprocessing_token_release_validated<P: MlDsaParams>(
+    registry: &mut impl SessionStore,
+    session_id: SessionId,
+    inputs: Vec<PartyPreprocessInput>,
+    runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+) -> Result<CertifiedToken, PreprocessError> {
+    let token = certify_preprocessing_token::<P>(registry, session_id, inputs)?;
+    let certificate = PreprocessingVectorRuntimeCertificate::for_token(&token, runtime_evidence)?;
+    let token = token.with_vector_runtime_certificate(certificate);
+    ensure_certified_token_release_valid(&token)?;
+    Ok(token)
+}
+
+/// Certifies a release-capable preprocessing token from app/runtime-produced
+/// masked-broadcast envelopes.
+///
+/// This is the release-oriented entry point for the future private vector
+/// IT-MPC preprocessing runtime: the embedding application supplies the
+/// already committed/opened envelopes and durable runtime evidence, and this
+/// function verifies the transcript before attaching the release certificate.
+fn certify_preprocessing_token_release_validated_from_envelopes<
+    P: MlDsaParams,
+    V: MaskedBroadcastConsistencyVerifier,
+>(
+    verifier: &mut V,
+    registry: &mut impl SessionStore,
+    session_id: SessionId,
+    inputs: Vec<PartyPreprocessInput>,
+    envelopes: Vec<BroadcastEnvelope>,
+    expected_transcript: TranscriptHash,
+    runtime_proofs: PreprocessingCertificationRuntimeProofs,
+    runtime_evidence: ProductionVectorItMpcRuntimeEvidence,
+) -> Result<CertifiedToken, PreprocessError> {
+    runtime_proofs.transcripts()?;
+    let token = certify_opened_masked_broadcasts_with_consistency::<P, V>(
+        verifier,
+        registry,
+        session_id,
+        inputs,
+        envelopes,
+        expected_transcript,
+        Some(&runtime_proofs),
+    )?;
+    let certificate = PreprocessingVectorRuntimeCertificate::for_token(&token, runtime_evidence)?;
+    let token = token.with_vector_runtime_certificate(certificate);
+    ensure_certified_token_release_valid(&token)?;
+    Ok(token)
+}
+
+/// Certifies a release-capable preprocessing token using an explicit private
+/// vector-runtime boundary for CarryCompare and BCC proof production.
+pub fn certify_preprocessing_token_release_validated_with_runtime<
+    P: MlDsaParams,
+    V: MaskedBroadcastConsistencyVerifier,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+>(
+    verifier: &mut V,
+    registry: &mut impl SessionStore,
+    session_id: SessionId,
+    inputs: Vec<PartyPreprocessInput>,
+    envelopes: Vec<BroadcastEnvelope>,
+    expected_transcript: TranscriptHash,
+    runtime: &mut ProductionPreprocessingCertificationRuntime<'_, T, L, C>,
+) -> Result<CertifiedToken, PreprocessError> {
+    let statement = preprocessing_certification_runtime_statement_from_envelopes::<P>(
+        session_id,
+        inputs.clone(),
+        envelopes.clone(),
+        expected_transcript,
+    )?;
+    let (runtime_proofs, runtime_evidence) = runtime.certify_preprocessing::<P>(&statement)?;
+    certify_preprocessing_token_release_validated_from_envelopes::<P, V>(
+        verifier,
+        registry,
+        session_id,
+        inputs,
+        envelopes,
+        expected_transcript,
+        runtime_proofs,
+        runtime_evidence,
+    )
+}
+
+/// Certifies a release-capable preprocessing token by first finishing a
+/// state-owned private preprocessing circuit driver.
+///
+/// This is the product-shaped constructor for callers that drive the
+/// preprocessing private phases explicitly: the caller supplies the durable
+/// masked-broadcast envelopes and a completed runtime driver state. The
+/// function attaches only the runtime-owned outputs derived from that state,
+/// then delegates to the normal release certification boundary.
+pub fn certify_preprocessing_token_release_validated_with_finished_runtime_driver<
+    P: MlDsaParams,
+    V: MaskedBroadcastConsistencyVerifier,
+    T: AuthenticatedP2pTransport + EquivocationResistantBroadcast,
+    L: PrimeFieldMpcWireMessageLog,
+    C: PrimeFieldMpcPhaseCursorLog,
+>(
+    verifier: &mut V,
+    registry: &mut impl SessionStore,
+    session_id: SessionId,
+    inputs: Vec<PartyPreprocessInput>,
+    envelopes: Vec<BroadcastEnvelope>,
+    expected_transcript: TranscriptHash,
+    runtime: &mut ProductionPreprocessingCertificationRuntime<'_, T, L, C>,
+    completed_state: &PreprocessingPrivateCircuitDriverState,
+) -> Result<CertifiedToken, PreprocessError> {
+    let statement = preprocessing_certification_runtime_statement_from_envelopes::<P>(
+        session_id,
+        inputs.clone(),
+        envelopes.clone(),
+        expected_transcript,
+    )?;
+    runtime
+        .finish_and_attach_private_circuit_state_for_statement::<P>(&statement, completed_state)?;
+    certify_preprocessing_token_release_validated_with_runtime::<P, V, T, L, C>(
+        verifier,
+        registry,
+        session_id,
+        inputs,
+        envelopes,
+        expected_transcript,
+        runtime,
+    )
+}
+
 /// Builds and certifies one local preprocessing token with an explicit consistency verifier.
 pub fn certify_preprocessing_token_with_consistency<
     P: MlDsaParams,
@@ -2334,6 +4636,7 @@ pub fn certify_preprocessing_token_with_consistency<
         inputs,
         envelopes,
         transcript_hash,
+        None,
     )
 }
 
@@ -2347,6 +4650,7 @@ fn certify_opened_masked_broadcasts_with_consistency<
     mut inputs: Vec<PartyPreprocessInput>,
     envelopes: Vec<BroadcastEnvelope>,
     expected_transcript: TranscriptHash,
+    runtime_proofs: Option<&PreprocessingCertificationRuntimeProofs>,
 ) -> Result<CertifiedToken, PreprocessError> {
     registry.reserve(session_id)?;
     inputs.sort_by_key(|input| input.party);
@@ -2382,6 +4686,7 @@ fn certify_opened_masked_broadcasts_with_consistency<
     }
 
     let broadcasts = open_broadcasts(session_id, &envelopes, expected_transcript)?;
+    let mut masked_broadcast_runtime_hashes = Vec::with_capacity(broadcasts.len());
     for broadcast in &broadcasts {
         #[cfg(any(test, feature = "paper-fast-dev"))]
         let idx = inputs
@@ -2416,6 +4721,10 @@ fn certify_opened_masked_broadcasts_with_consistency<
         )?;
         #[cfg(not(any(test, feature = "paper-fast-dev")))]
         verifier.verify_masked_broadcast::<P>(&statement, &envelope.consistency_proof)?;
+        let parts = decode_masked_broadcast_runtime_proof(&envelope.consistency_proof).ok_or(
+            PreprocessError::MaskedBroadcastProofBackendUnavailable(broadcast.party),
+        )?;
+        masked_broadcast_runtime_hashes.push(parts.runtime_transcript_hash);
     }
 
     let cef_output = certify_vector_carry_compare_and_cef::<P>(
@@ -2425,6 +4734,7 @@ fn certify_opened_masked_broadcasts_with_consistency<
         &inputs,
         &broadcasts,
         &rhos_by_party,
+        runtime_proofs,
     )?;
 
     let nonce_commitments = inputs
@@ -2443,7 +4753,23 @@ fn certify_opened_masked_broadcasts_with_consistency<
         &broadcasts,
         cef_output.carry_compare,
         cef_output.bcc,
+        &masked_broadcast_runtime_hashes,
     );
+    if let Some(proofs) = runtime_proofs {
+        let masked_runtime_transcript = certification_evidence
+            .masked_broadcast
+            .ok_or(PreprocessError::PreChallengeCertificationIncomplete)?
+            .runtime_transcript_hash;
+        let masked_output = proofs.outputs.masked_broadcast;
+        if masked_runtime_transcript != proofs.masked_broadcast
+            || masked_output.signer_count != signer_set.len()
+            || masked_output.coeff_count != coeff_count
+            || masked_output.runtime_transcript_hash != masked_runtime_transcript
+            || masked_output.material_state_hash == [0u8; 32]
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+    }
     let certification_policy =
         ensure_pre_challenge_certification_evidence(session_id, &certification_evidence)?;
 
@@ -2458,6 +4784,100 @@ fn certify_opened_masked_broadcasts_with_consistency<
         certification_evidence,
         certification_policy,
         vector_runtime_certificate: None,
+    })
+}
+
+fn preprocessing_certification_runtime_statement_from_envelopes<P: MlDsaParams>(
+    session_id: SessionId,
+    mut inputs: Vec<PartyPreprocessInput>,
+    envelopes: Vec<BroadcastEnvelope>,
+    expected_transcript: TranscriptHash,
+) -> Result<PreprocessingCertificationRuntimeStatement, PreprocessError> {
+    inputs.sort_by_key(|input| input.party);
+    validate_inputs::<P>(&inputs)?;
+    let signer_set: Vec<_> = inputs.iter().map(|input| input.party).collect();
+    let coeff_count = inputs[0].highs.len();
+    let mut rhos_by_party = Vec::with_capacity(inputs.len());
+    for input in &inputs {
+        let prepared = prepare_masked_broadcast_envelope_with_audit::<P>(
+            session_id,
+            &signer_set,
+            input,
+            expected_transcript,
+        )?;
+        let envelope = envelopes
+            .iter()
+            .find(|envelope| envelope.message.party == input.party)
+            .ok_or(PreprocessError::MaskedBroadcastConsistencyMismatch(
+                input.party,
+            ))?;
+        if envelope.message != prepared.envelope.message {
+            return Err(PreprocessError::MaskedBroadcastConsistencyMismatch(
+                input.party,
+            ));
+        }
+        rhos_by_party.push(prepared.rhos);
+    }
+    let broadcasts = open_broadcasts(session_id, &envelopes, expected_transcript)?;
+    let mut masked_broadcast_runtime_hashes = Vec::with_capacity(broadcasts.len());
+    let mut masked_broadcast_bindings = Vec::with_capacity(broadcasts.len());
+    for broadcast in &broadcasts {
+        let envelope = envelopes
+            .iter()
+            .find(|envelope| envelope.message.party == broadcast.party)
+            .ok_or(PreprocessError::MaskedBroadcastConsistencyMismatch(
+                broadcast.party,
+            ))?;
+        let parts = decode_masked_broadcast_runtime_proof(&envelope.consistency_proof).ok_or(
+            PreprocessError::MaskedBroadcastProofBackendUnavailable(broadcast.party),
+        )?;
+        masked_broadcast_runtime_hashes.push(parts.runtime_transcript_hash);
+        masked_broadcast_bindings.push(MaskedBroadcastRuntimeBinding {
+            party: broadcast.party,
+            statement_hash: parts.statement_hash,
+            runtime_transcript_hash: parts.runtime_transcript_hash,
+        });
+    }
+    let cef_output = certify_vector_carry_compare_and_cef::<P>(
+        session_id,
+        expected_transcript,
+        &signer_set,
+        &inputs,
+        &broadcasts,
+        &rhos_by_party,
+        None,
+    )?;
+    let w1_hash =
+        hash_runtime_w1_output::<P>(session_id, expected_transcript, &signer_set, &cef_output.w1);
+    let (carry_compare_public_input_hash, cef_bcc_public_input_hash) =
+        preprocessing_public_circuit_input_hashes::<P>(
+            session_id,
+            expected_transcript,
+            &signer_set,
+            &broadcasts,
+        )?;
+    let (carry_compare_private_circuit_label_hash, cef_bcc_private_circuit_label_hash) =
+        preprocessing_private_circuit_label_hashes(session_id, expected_transcript);
+    Ok(PreprocessingCertificationRuntimeStatement {
+        session_id,
+        transcript_hash: expected_transcript,
+        signer_set,
+        coeff_count,
+        masked_broadcast_runtime_transcript: masked_broadcast_runtime_transcript_hash(
+            session_id,
+            expected_transcript,
+            inputs.len(),
+            coeff_count,
+            &masked_broadcast_runtime_hashes,
+        ),
+        masked_broadcast_bindings,
+        carry_compare_evidence_hash: cef_output.carry_compare.evidence_hash,
+        bcc_evidence_hash: cef_output.bcc.evidence_hash,
+        w1_hash,
+        carry_compare_public_input_hash,
+        cef_bcc_public_input_hash,
+        carry_compare_private_circuit_label_hash,
+        cef_bcc_private_circuit_label_hash,
     })
 }
 
@@ -2481,6 +4901,93 @@ pub fn prepare_masked_broadcast_envelope<P: MlDsaParams>(
         transcript_hash,
     )?
     .envelope)
+}
+
+/// Computes one signer's masked broadcast envelope with a precomputed runtime
+/// proof transcript hash.
+///
+/// This lower-level helper is intentionally crate-private. Normal callers use
+/// `prepare_masked_broadcast_envelope_with_vector_runtime_evidence`, which
+/// derives the transcript hash from durable vector runtime evidence instead of
+/// accepting arbitrary bytes.
+fn prepare_masked_broadcast_envelope_with_runtime_transcript<P: MlDsaParams>(
+    session_id: SessionId,
+    signer_set: &[PartyId],
+    input: &PartyPreprocessInput,
+    transcript_hash: TranscriptHash,
+    runtime_transcript_hash: [u8; 32],
+) -> Result<BroadcastEnvelope, PreprocessError> {
+    let mut prepared = prepare_masked_broadcast_envelope_with_audit::<P>(
+        session_id,
+        signer_set,
+        input,
+        transcript_hash,
+    )?
+    .envelope;
+    if runtime_transcript_hash == [0u8; 32] {
+        return Err(PreprocessError::MaskedBroadcastProofBackendUnavailable(
+            input.party,
+        ));
+    }
+    let statement = MaskedBroadcastConsistencyStatement {
+        session_id,
+        signer_set: canonical_signer_set(signer_set)?,
+        broadcast: prepared.message.clone(),
+        coeff_count: input.highs.len(),
+    };
+    prepared.consistency_proof =
+        production_masked_broadcast_consistency_proof_with_runtime_transcript::<P>(
+            &statement,
+            runtime_transcript_hash,
+        );
+    Ok(prepared)
+}
+
+/// Computes one signer's masked broadcast envelope with a proof transcript
+/// derived from durable vector IT-MPC runtime evidence.
+///
+/// Release callers using `ProductionPreprocessingCertificationRuntime` should
+/// prefer this helper over passing arbitrary transcript hashes. The production
+/// runtime adapter verifies that every envelope proof uses this derivation
+/// before it emits CarryCompare/BCC stage proofs.
+pub fn prepare_masked_broadcast_envelope_with_vector_runtime_evidence<P: MlDsaParams>(
+    session_id: SessionId,
+    signer_set: &[PartyId],
+    input: &PartyPreprocessInput,
+    transcript_hash: TranscriptHash,
+    vector_runtime_evidence: &ProductionVectorItMpcRuntimeEvidence,
+) -> Result<BroadcastEnvelope, PreprocessError> {
+    let prepared = prepare_masked_broadcast_envelope_with_audit::<P>(
+        session_id,
+        signer_set,
+        input,
+        transcript_hash,
+    )?
+    .envelope;
+    let statement = MaskedBroadcastConsistencyStatement {
+        session_id,
+        signer_set: canonical_signer_set(signer_set)?,
+        broadcast: prepared.message.clone(),
+        coeff_count: input.highs.len(),
+    };
+    let statement_hash = masked_broadcast_statement_hash::<P>(&statement);
+    let runtime_transcript_hash =
+        masked_broadcast_runtime_transcript_hash_from_vector_runtime_evidence(
+            session_id,
+            transcript_hash,
+            signer_set.len(),
+            input.highs.len(),
+            statement_hash,
+            input.party,
+            vector_runtime_evidence.transcript_hash,
+        );
+    prepare_masked_broadcast_envelope_with_runtime_transcript::<P>(
+        session_id,
+        signer_set,
+        input,
+        transcript_hash,
+        runtime_transcript_hash,
+    )
 }
 
 fn prepare_masked_broadcast_envelope_with_audit<P: MlDsaParams>(
@@ -2637,7 +5144,15 @@ fn verify_private_certified_masked_broadcast<P: MlDsaParams>(
     statement: &MaskedBroadcastConsistencyStatement,
     proof: &MaskedBroadcastConsistencyProof,
 ) -> Result<(), PreprocessError> {
-    if proof.bytes != production_masked_broadcast_consistency_proof::<P>(statement).bytes {
+    let parts = decode_masked_broadcast_runtime_proof(proof).ok_or(
+        PreprocessError::MaskedBroadcastProofBackendUnavailable(statement.broadcast.party),
+    )?;
+    let expected = expected_masked_broadcast_runtime_proof_parts::<P>(statement);
+    if parts.statement_hash != expected.statement_hash
+        || parts.coeff_count != expected.coeff_count
+        || parts.signer_count != expected.signer_count
+        || parts.runtime_transcript_hash == [0u8; 32]
+    {
         return Err(PreprocessError::MaskedBroadcastProofBackendUnavailable(
             statement.broadcast.party,
         ));
@@ -2675,6 +5190,7 @@ fn certify_vector_carry_compare_and_cef<P: MlDsaParams>(
     inputs: &[PartyPreprocessInput],
     broadcasts: &[MaskedBroadcast],
     rhos_by_party: &[Vec<u32>],
+    runtime_proofs: Option<&PreprocessingCertificationRuntimeProofs>,
 ) -> Result<CertifiedCefOutput, PreprocessError> {
     if broadcasts.is_empty()
         || broadcasts.len() != signer_set.len()
@@ -2745,19 +5261,97 @@ fn certify_vector_carry_compare_and_cef<P: MlDsaParams>(
     );
     let bcc_hash =
         hash_vector_bcc_cef_evidence::<P>(session_id, transcript_hash, signer_set, &w1, carry_hash);
+    let carry_runtime_hash = if let Some(proofs) = runtime_proofs {
+        verify_preprocessing_stage_runtime_proof::<P>(
+            PreprocessingCertificationStage::CarryCompare,
+            session_id,
+            transcript_hash,
+            signer_set.len(),
+            coeff_count,
+            carry_hash,
+            &proofs.carry_compare,
+        )?
+    } else {
+        preprocessing_stage_runtime_transcript_hash(
+            b"carry-compare",
+            session_id,
+            transcript_hash,
+            coeff_count,
+            carry_hash,
+        )
+    };
+    let bcc_runtime_hash = if let Some(proofs) = runtime_proofs {
+        verify_preprocessing_stage_runtime_proof::<P>(
+            PreprocessingCertificationStage::Bcc,
+            session_id,
+            transcript_hash,
+            signer_set.len(),
+            coeff_count,
+            bcc_hash,
+            &proofs.bcc,
+        )?
+    } else {
+        preprocessing_stage_runtime_transcript_hash(
+            b"cef-bcc",
+            session_id,
+            transcript_hash,
+            coeff_count,
+            bcc_hash,
+        )
+    };
+    if carry_runtime_hash == [0u8; 32] || bcc_runtime_hash == [0u8; 32] {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    if let Some(proofs) = runtime_proofs {
+        verify_preprocessing_runtime_outputs(
+            proofs.outputs(),
+            coeff_count,
+            carry_hash,
+            bcc_hash,
+            hash_runtime_w1_output::<P>(session_id, transcript_hash, signer_set, &w1),
+            carry_runtime_hash,
+            bcc_runtime_hash,
+        )?;
+    }
     Ok(CertifiedCefOutput {
         w1,
         carry_compare: CarryCompareCertificationEvidence {
             session_id,
             coeff_count,
             evidence_hash: carry_hash,
+            runtime_transcript_hash: carry_runtime_hash,
         },
         bcc: BccCertificationEvidence {
             session_id,
             coeff_count,
             evidence_hash: bcc_hash,
+            runtime_transcript_hash: bcc_runtime_hash,
         },
     })
+}
+
+fn verify_preprocessing_runtime_outputs(
+    outputs: PreprocessingCertificationRuntimeOutputs,
+    coeff_count: usize,
+    carry_hash: [u8; 32],
+    bcc_hash: [u8; 32],
+    w1_hash: [u8; 32],
+    carry_runtime_hash: [u8; 32],
+    bcc_runtime_hash: [u8; 32],
+) -> Result<(), PreprocessError> {
+    if outputs.carry_compare.coeff_count != coeff_count
+        || outputs.carry_compare.evidence_hash != carry_hash
+        || outputs.carry_compare.runtime_transcript_hash != carry_runtime_hash
+        || outputs.cef_bcc.coeff_count != coeff_count
+        || outputs.cef_bcc.w1_hash != w1_hash
+        || outputs.cef_bcc.carry_compare_evidence_hash != carry_hash
+        || outputs.cef_bcc.bcc_evidence_hash != bcc_hash
+        || outputs.cef_bcc.runtime_transcript_hash != bcc_runtime_hash
+        || !outputs.cef_bcc.token_admitted
+    {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    Ok(())
 }
 
 fn hash_vector_carry_compare_evidence<P: MlDsaParams>(
@@ -2827,6 +5421,345 @@ fn hash_vector_bcc_cef_evidence<P: MlDsaParams>(
     hasher.finalize().into()
 }
 
+fn hash_runtime_w1_output<P: MlDsaParams>(
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_set: &[PartyId],
+    w1: &[u32],
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing runtime w1 output v1");
+    hasher.update(P::NAME.as_bytes());
+    hasher.update(session_id.0);
+    hasher.update(transcript_hash.0);
+    for party in signer_set {
+        hasher.update(party.0.to_le_bytes());
+    }
+    for &coeff in w1 {
+        hasher.update(coeff.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn preprocessing_public_circuit_input_hashes<P: MlDsaParams>(
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_set: &[PartyId],
+    broadcasts: &[MaskedBroadcast],
+) -> Result<([u8; 32], [u8; 32]), PreprocessError> {
+    let coeff_count = broadcasts
+        .first()
+        .ok_or(PreprocessError::CoeffCountMismatch)?
+        .masked_highs
+        .len();
+    if broadcasts.len() != signer_set.len() {
+        return Err(PreprocessError::CoeffCountMismatch);
+    }
+    let alpha = P::alpha() as u64;
+    let high_mod = P::HIGH_MOD as u64;
+    let mut low_sums = Vec::with_capacity(coeff_count);
+    let mut high_sums = Vec::with_capacity(coeff_count);
+    let mut t_values = Vec::with_capacity(coeff_count);
+    for coeff in 0..coeff_count {
+        let mut low_sum = 0u64;
+        let mut high_sum = 0u64;
+        for broadcast in broadcasts {
+            if broadcast.masked_highs.len() != coeff_count
+                || broadcast.masked_lows.len() != coeff_count
+            {
+                return Err(PreprocessError::CoeffCountMismatch);
+            }
+            low_sum = low_sum.saturating_add(u64::from(broadcast.masked_lows[coeff]));
+            high_sum = (high_sum + u64::from(broadcast.masked_highs[coeff])) % high_mod;
+        }
+        low_sums.push(low_sum);
+        high_sums.push(high_sum);
+        t_values.push(low_sum % alpha);
+    }
+    let carry = hash_preprocessing_carry_public_inputs::<P>(
+        session_id,
+        transcript_hash,
+        signer_set,
+        coeff_count,
+        &low_sums,
+        &t_values,
+    );
+    let cef_bcc = hash_preprocessing_cef_bcc_public_inputs::<P>(
+        session_id,
+        transcript_hash,
+        signer_set,
+        coeff_count,
+        &high_sums,
+        &low_sums,
+        &t_values,
+    );
+    Ok((carry, cef_bcc))
+}
+
+fn preprocessing_carry_thresholds_from_broadcasts<P: MlDsaParams>(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    broadcasts: &[MaskedBroadcast],
+) -> Result<Vec<Coeff>, PreprocessError> {
+    if broadcasts.len() != statement.signer_set.len() {
+        return Err(PreprocessError::CoeffCountMismatch);
+    }
+    let alpha = P::alpha() as u64;
+    let mut thresholds = Vec::with_capacity(statement.coeff_count);
+    for coeff in 0..statement.coeff_count {
+        let mut low_sum = 0u64;
+        for broadcast in broadcasts {
+            if broadcast.masked_lows.len() != statement.coeff_count
+                || broadcast.masked_highs.len() != statement.coeff_count
+            {
+                return Err(PreprocessError::CoeffCountMismatch);
+            }
+            low_sum = low_sum.saturating_add(u64::from(broadcast.masked_lows[coeff]));
+        }
+        thresholds.push((low_sum % alpha) as Coeff);
+    }
+    Ok(thresholds)
+}
+
+fn preprocessing_private_material_lanes_from_opened_broadcasts<P: MlDsaParams>(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    broadcasts: &[MaskedBroadcast],
+) -> Result<(Vec<Vec<Coeff>>, Vec<Coeff>, Vec<Coeff>), PreprocessError> {
+    if broadcasts.len() != statement.signer_set.len() {
+        return Err(PreprocessError::CoeffCountMismatch);
+    }
+    let alpha = P::alpha() as u64;
+    let high_mod = P::HIGH_MOD as u64;
+    let carry_width = bit_width_for_preprocessing_public_value(P::alpha() as u32);
+    let rhos_by_party = preprocessing_rhos_for_broadcasts::<P>(statement, broadcasts)?;
+    let mut rho_sum_bits_by_bit_le = vec![Vec::with_capacity(statement.coeff_count); carry_width];
+    let mut cef_correction_bits = Vec::with_capacity(statement.coeff_count);
+    let mut bcc_violation_bits = Vec::with_capacity(statement.coeff_count);
+
+    for coeff in 0..statement.coeff_count {
+        let mut sum_high = 0u64;
+        let mut masked_low_sum = 0u64;
+        let mut rho_sum = 0u64;
+        for (party_idx, broadcast) in broadcasts.iter().enumerate() {
+            if broadcast.masked_highs.len() != statement.coeff_count
+                || broadcast.masked_lows.len() != statement.coeff_count
+                || rhos_by_party[party_idx].len() != statement.coeff_count
+            {
+                return Err(PreprocessError::CoeffCountMismatch);
+            }
+            sum_high = (sum_high + u64::from(broadcast.masked_highs[coeff])) % high_mod;
+            masked_low_sum = masked_low_sum.saturating_add(u64::from(broadcast.masked_lows[coeff]));
+            rho_sum = rho_sum.saturating_add(u64::from(rhos_by_party[party_idx][coeff]));
+        }
+        if rho_sum >= alpha {
+            return Err(PreprocessError::CarryCompareCertificationFailed);
+        }
+        for (bit_idx, lanes) in rho_sum_bits_by_bit_le.iter_mut().enumerate() {
+            lanes.push(((rho_sum >> bit_idx) & 1) as Coeff);
+        }
+        let clear_low_sum = masked_low_sum
+            .checked_sub(rho_sum)
+            .ok_or(PreprocessError::CarryCompareCertificationFailed)?;
+        let w_coeff = reduce_mod_q_i64::<P>((alpha * sum_high) as i64 + clear_low_sum as i64);
+        let t = masked_low_sum % alpha;
+        let kappa = u64::from(rho_sum > t);
+        let delta_threshold = t as i64 - P::GAMMA2 as i64 + (kappa as i64) * alpha as i64;
+        let delta = u64::from((rho_sum as i64) < delta_threshold);
+        cef_correction_bits.push(delta as Coeff);
+        bcc_violation_bits.push(if bcc_holds_coeff::<P>(w_coeff) { 0 } else { 1 });
+    }
+    Ok((
+        rho_sum_bits_by_bit_le,
+        cef_correction_bits,
+        bcc_violation_bits,
+    ))
+}
+
+fn preprocessing_rhos_for_broadcasts<P: MlDsaParams>(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    broadcasts: &[MaskedBroadcast],
+) -> Result<Vec<Vec<u32>>, PreprocessError> {
+    let signer_set = canonical_signer_set(&statement.signer_set)?;
+    broadcasts
+        .iter()
+        .map(|broadcast| {
+            if !signer_set.contains(&broadcast.party)
+                || broadcast.masked_highs.len() != statement.coeff_count
+                || broadcast.masked_lows.len() != statement.coeff_count
+                || broadcast.transcript_hash != statement.transcript_hash
+            {
+                return Err(PreprocessError::CoeffCountMismatch);
+            }
+            let seed_input = PartyPreprocessInput {
+                party: broadcast.party,
+                highs: vec![0; statement.coeff_count],
+                lows: vec![0; statement.coeff_count],
+                y_share: Vec::new(),
+                ay_contribution: None,
+                nonce_commitment: broadcast.nonce_commitment,
+                randomness_commitment: broadcast.rho_bits_commitment,
+            };
+            Ok(rhos::<P>(
+                statement.session_id,
+                &signer_set,
+                &seed_input,
+                statement.coeff_count,
+            ))
+        })
+        .collect()
+}
+
+fn ensure_preprocessing_private_material_handle_labels<P: MlDsaParams>(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    rho_sum_bits_by_bit_le: &[ProductionBitShareVec],
+    cef_correction_bits: &[ProductionBitShareVec],
+    bcc_violation_bits: &[ProductionBitShareVec],
+) -> Result<(), PreprocessError> {
+    let carry_width = bit_width_for_preprocessing_public_value(P::alpha() as u32);
+    if rho_sum_bits_by_bit_le.len() != carry_width
+        || cef_correction_bits.len() != 1
+        || bcc_violation_bits.len() != 1
+    {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    let root = preprocessing_certification_runtime_label(statement);
+    let rho_root = root.child("carry_compare_private").child("rho_sum_bits");
+    for (bit_idx, bit) in rho_sum_bits_by_bit_le.iter().enumerate() {
+        if bit.len() != statement.coeff_count
+            || bit.id().label_hash
+                != power2round_label_hash(&rho_root.child(format!("bit_{bit_idx}")))
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+    }
+    let cef_label = root
+        .child("cef_bcc_private")
+        .child("cef_correction_bits")
+        .child("delta");
+    let cef = &cef_correction_bits[0];
+    if cef.len() != statement.coeff_count
+        || cef.id().label_hash != power2round_label_hash(&cef_label)
+    {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    let bcc_label = root
+        .child("cef_bcc_private")
+        .child("bcc_violation_bits")
+        .child("violation");
+    let bcc = &bcc_violation_bits[0];
+    if bcc.len() != statement.coeff_count
+        || bcc.id().label_hash != power2round_label_hash(&bcc_label)
+    {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_preprocessing_runtime_private_mpc_input_labels<P: MlDsaParams>(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    masked_broadcast_relation_bits: &[ProductionBitShareVec],
+    rho_sum_bits_by_bit_le: &[ProductionBitShareVec],
+    cef_correction_bits: &[ProductionBitShareVec],
+    bcc_violation_bits: &[ProductionBitShareVec],
+) -> Result<(), PreprocessError> {
+    ensure_preprocessing_masked_broadcast_relation_labels(
+        statement,
+        masked_broadcast_relation_bits,
+    )?;
+    ensure_preprocessing_private_material_handle_labels::<P>(
+        statement,
+        rho_sum_bits_by_bit_le,
+        cef_correction_bits,
+        bcc_violation_bits,
+    )
+}
+
+fn ensure_preprocessing_masked_broadcast_relation_labels(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    masked_broadcast_relation_bits: &[ProductionBitShareVec],
+) -> Result<(), PreprocessError> {
+    if masked_broadcast_relation_bits.len() != statement.signer_set.len() {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    let root = preprocessing_certification_runtime_label(statement);
+    let relation_root = root
+        .child("masked_broadcast_private")
+        .child("relation_violation_bits");
+    for (idx, (party, bit)) in statement
+        .signer_set
+        .iter()
+        .zip(masked_broadcast_relation_bits)
+        .enumerate()
+    {
+        let expected = relation_root.child(format!("party_{}_violation_{idx}", party.0));
+        if bit.len() != statement.coeff_count
+            || bit.id().label_hash != power2round_label_hash(&expected)
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn hash_preprocessing_carry_public_inputs<P: MlDsaParams>(
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_set: &[PartyId],
+    coeff_count: usize,
+    low_sums: &[u64],
+    t_values: &[u64],
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing CarryCompare public circuit inputs v1");
+    hasher.update(P::NAME.as_bytes());
+    hasher.update(session_id.0);
+    hasher.update(transcript_hash.0);
+    hasher.update((coeff_count as u32).to_le_bytes());
+    hasher.update((P::alpha() as u32).to_le_bytes());
+    for party in signer_set {
+        hasher.update(party.0.to_le_bytes());
+    }
+    for &value in low_sums {
+        hasher.update(value.to_le_bytes());
+    }
+    for &value in t_values {
+        hasher.update(value.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn hash_preprocessing_cef_bcc_public_inputs<P: MlDsaParams>(
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_set: &[PartyId],
+    coeff_count: usize,
+    high_sums: &[u64],
+    low_sums: &[u64],
+    t_values: &[u64],
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing CEF/BCC public circuit inputs v1");
+    hasher.update(P::NAME.as_bytes());
+    hasher.update(session_id.0);
+    hasher.update(transcript_hash.0);
+    hasher.update((coeff_count as u32).to_le_bytes());
+    hasher.update((P::alpha() as u32).to_le_bytes());
+    hasher.update((P::HIGH_MOD as u32).to_le_bytes());
+    hasher.update(P::GAMMA2.to_le_bytes());
+    for party in signer_set {
+        hasher.update(party.0.to_le_bytes());
+    }
+    for &value in high_sums {
+        hasher.update(value.to_le_bytes());
+    }
+    for &value in low_sums {
+        hasher.update(value.to_le_bytes());
+    }
+    for &value in t_values {
+        hasher.update(value.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
 fn reduce_mod_q_i64<P: MlDsaParams>(value: i64) -> Coeff {
     value.rem_euclid(i64::from(P::Q)) as Coeff
 }
@@ -2834,8 +5767,52 @@ fn reduce_mod_q_i64<P: MlDsaParams>(value: i64) -> Coeff {
 fn production_masked_broadcast_consistency_proof<P: MlDsaParams>(
     statement: &MaskedBroadcastConsistencyStatement,
 ) -> MaskedBroadcastConsistencyProof {
+    let parts = expected_masked_broadcast_runtime_proof_parts::<P>(statement);
+    production_masked_broadcast_consistency_proof_with_runtime_transcript::<P>(
+        statement,
+        parts.runtime_transcript_hash,
+    )
+}
+
+fn production_masked_broadcast_consistency_proof_with_runtime_transcript<P: MlDsaParams>(
+    statement: &MaskedBroadcastConsistencyStatement,
+    runtime_transcript_hash: [u8; 32],
+) -> MaskedBroadcastConsistencyProof {
+    let mut parts = expected_masked_broadcast_runtime_proof_parts::<P>(statement);
+    parts.runtime_transcript_hash = runtime_transcript_hash;
+    let mut bytes = Vec::with_capacity(6 + 32 + 32 + 4 + 4);
+    bytes.extend_from_slice(MASKED_BROADCAST_RUNTIME_PROOF_PREFIX);
+    bytes.extend_from_slice(&parts.statement_hash);
+    bytes.extend_from_slice(&parts.runtime_transcript_hash);
+    bytes.extend_from_slice(&(parts.coeff_count as u32).to_le_bytes());
+    bytes.extend_from_slice(&(parts.signer_count as u32).to_le_bytes());
+    MaskedBroadcastConsistencyProof { bytes }
+}
+
+fn expected_masked_broadcast_runtime_proof_parts<P: MlDsaParams>(
+    statement: &MaskedBroadcastConsistencyStatement,
+) -> MaskedBroadcastRuntimeProofParts {
+    let statement_hash = masked_broadcast_statement_hash::<P>(statement);
     let mut hasher = Sha3_256::new();
-    hasher.update(b"TALUS masked broadcast private consistency certificate v1");
+    hasher.update(b"TALUS masked broadcast vector runtime transcript binding v1");
+    hasher.update(P::NAME.as_bytes());
+    hasher.update(statement_hash);
+    hasher.update(statement.session_id.0);
+    hasher.update((statement.coeff_count as u32).to_le_bytes());
+    hasher.update((statement.signer_set.len() as u32).to_le_bytes());
+    MaskedBroadcastRuntimeProofParts {
+        statement_hash,
+        runtime_transcript_hash: hasher.finalize().into(),
+        coeff_count: statement.coeff_count,
+        signer_count: statement.signer_set.len(),
+    }
+}
+
+fn masked_broadcast_statement_hash<P: MlDsaParams>(
+    statement: &MaskedBroadcastConsistencyStatement,
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS masked broadcast consistency statement v1");
     hasher.update(P::NAME.as_bytes());
     hasher.update(statement.session_id.0);
     hasher.update((statement.coeff_count as u32).to_le_bytes());
@@ -2852,11 +5829,31 @@ fn production_masked_broadcast_consistency_proof<P: MlDsaParams>(
     for &low in &statement.broadcast.masked_lows {
         hasher.update(low.to_le_bytes());
     }
-    let digest: [u8; 32] = hasher.finalize().into();
-    let mut bytes = Vec::with_capacity(6 + 32);
-    bytes.extend_from_slice(b"TMBCC1");
-    bytes.extend_from_slice(&digest);
-    MaskedBroadcastConsistencyProof { bytes }
+    hasher.finalize().into()
+}
+
+fn decode_masked_broadcast_runtime_proof(
+    proof: &MaskedBroadcastConsistencyProof,
+) -> Option<MaskedBroadcastRuntimeProofParts> {
+    const LEN: usize = 6 + 32 + 32 + 4 + 4;
+    if proof.bytes.len() != LEN {
+        return None;
+    }
+    if &proof.bytes[..6] != MASKED_BROADCAST_RUNTIME_PROOF_PREFIX {
+        return None;
+    }
+    let mut statement_hash = [0u8; 32];
+    statement_hash.copy_from_slice(&proof.bytes[6..38]);
+    let mut runtime_transcript_hash = [0u8; 32];
+    runtime_transcript_hash.copy_from_slice(&proof.bytes[38..70]);
+    let coeff_count = u32::from_le_bytes(proof.bytes[70..74].try_into().ok()?) as usize;
+    let signer_count = u32::from_le_bytes(proof.bytes[74..78].try_into().ok()?) as usize;
+    Some(MaskedBroadcastRuntimeProofParts {
+        statement_hash,
+        runtime_transcript_hash,
+        coeff_count,
+        signer_count,
+    })
 }
 
 fn validate_inputs<P: MlDsaParams>(inputs: &[PartyPreprocessInput]) -> Result<(), PreprocessError> {
@@ -2950,6 +5947,28 @@ fn preprocessing_session_open_hash<P: MlDsaParams>(
 
 fn map_nonce_dkg_error(_err: DkgError) -> PreprocessError {
     PreprocessError::NonceGenerationFailed
+}
+
+fn map_preprocessing_runtime_dkg_error(_err: DkgError) -> PreprocessError {
+    PreprocessError::PreprocessingRuntimeCertificateMismatch
+}
+
+fn ensure_preprocessing_vector_runtime_evidence_for_release(
+    evidence: &ProductionVectorItMpcRuntimeEvidence,
+) -> Result<(), PreprocessError> {
+    ensure_prime_field_mpc_counters_vectorized_for_release(evidence.counters)
+        .map_err(|_| PreprocessError::PreprocessingCountersNotVectorized)?;
+    if !evidence.counters.has_durable_runtime_evidence()
+        || !evidence.coverage.mul_vec
+        || !evidence.coverage.comparison_to_public
+        || !evidence.coverage.bit_sum_or_threshold_check
+        || !evidence.coverage.preprocessing_masked_broadcast
+        || !evidence.coverage.preprocessing_carry_compare
+        || !evidence.coverage.preprocessing_cef_bcc
+    {
+        return Err(PreprocessError::PreprocessingCountersNotVectorized);
+    }
+    Ok(())
 }
 
 fn nonce_residue_modulus<P: MlDsaParams>() -> Result<u32, PreprocessError> {
@@ -3423,6 +6442,7 @@ fn local_pre_challenge_certification_evidence(
     broadcasts: &[MaskedBroadcast],
     carry_compare: CarryCompareCertificationEvidence,
     bcc: BccCertificationEvidence,
+    masked_broadcast_runtime_hashes: &[[u8; 32]],
 ) -> PreChallengeCertificationEvidence {
     PreChallengeCertificationEvidence {
         masked_broadcast: Some(MaskedBroadcastCertificationEvidence {
@@ -3437,6 +6457,13 @@ fn local_pre_challenge_certification_evidence(
                 signer_count,
                 coeff_count,
                 broadcasts,
+            ),
+            runtime_transcript_hash: masked_broadcast_runtime_transcript_hash(
+                session_id,
+                transcript_hash,
+                signer_count,
+                coeff_count,
+                masked_broadcast_runtime_hashes,
             ),
         }),
         carry_compare: Some(carry_compare),
@@ -3494,6 +6521,816 @@ fn pre_challenge_evidence_hash(
             hasher.update(low.to_le_bytes());
         }
     }
+    hasher.finalize().into()
+}
+
+fn masked_broadcast_runtime_transcript_hash(
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_count: usize,
+    coeff_count: usize,
+    runtime_hashes: &[[u8; 32]],
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS masked broadcast aggregate runtime transcript v1");
+    hasher.update(session_id.0);
+    hasher.update(transcript_hash.0);
+    hasher.update((signer_count as u32).to_le_bytes());
+    hasher.update((coeff_count as u32).to_le_bytes());
+    for runtime_hash in runtime_hashes {
+        hasher.update(runtime_hash);
+    }
+    hasher.finalize().into()
+}
+
+fn preprocessing_stage_runtime_transcript_hash(
+    domain: &[u8],
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    coeff_count: usize,
+    evidence_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing stage runtime transcript v1");
+    hasher.update(domain);
+    hasher.update(session_id.0);
+    hasher.update(transcript_hash.0);
+    hasher.update((coeff_count as u32).to_le_bytes());
+    hasher.update(evidence_hash);
+    hasher.finalize().into()
+}
+
+fn preprocessing_stage_runtime_transcript_hash_from_vector_runtime_evidence(
+    stage: PreprocessingCertificationStage,
+    statement: &PreprocessingCertificationRuntimeStatement,
+    vector_runtime_transcript_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing stage vector-runtime binding v1");
+    hasher.update(stage.domain());
+    hasher.update(statement.session_id.0);
+    hasher.update(statement.transcript_hash.0);
+    hasher.update((statement.signer_set.len() as u32).to_le_bytes());
+    hasher.update((statement.coeff_count as u32).to_le_bytes());
+    hasher.update(statement.masked_broadcast_runtime_transcript);
+    match stage {
+        PreprocessingCertificationStage::CarryCompare => {
+            hasher.update(statement.carry_compare_evidence_hash);
+            hasher.update(statement.carry_compare_public_input_hash);
+            hasher.update(statement.carry_compare_private_circuit_label_hash);
+        }
+        PreprocessingCertificationStage::Bcc => {
+            hasher.update(statement.bcc_evidence_hash);
+            hasher.update(statement.w1_hash);
+            hasher.update(statement.cef_bcc_public_input_hash);
+            hasher.update(statement.cef_bcc_private_circuit_label_hash);
+        }
+    }
+    hasher.update(vector_runtime_transcript_hash);
+    hasher.finalize().into()
+}
+
+fn preprocessing_private_circuit_label_hashes(
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+) -> ([u8; 32], [u8; 32]) {
+    let root = Power2RoundTranscriptLabel::preprocessing_root(session_id.0, transcript_hash.0);
+    (
+        power2round_label_hash(&root.child("carry_compare_private").child("rho_gt_t")),
+        power2round_label_hash(&root.child("cef_bcc_private")),
+    )
+}
+
+fn hash_preprocessing_runtime_statement(
+    statement: &PreprocessingCertificationRuntimeStatement,
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing runtime statement hash v1");
+    hasher.update(statement.session_id.0);
+    hasher.update(statement.transcript_hash.0);
+    for party in &statement.signer_set {
+        hasher.update(party.0.to_le_bytes());
+    }
+    hasher.update((statement.coeff_count as u32).to_le_bytes());
+    hasher.update(statement.masked_broadcast_runtime_transcript);
+    for binding in &statement.masked_broadcast_bindings {
+        hasher.update(binding.party.0.to_le_bytes());
+        hasher.update(binding.statement_hash);
+        hasher.update(binding.runtime_transcript_hash);
+    }
+    hasher.update(statement.carry_compare_evidence_hash);
+    hasher.update(statement.bcc_evidence_hash);
+    hasher.update(statement.w1_hash);
+    hasher.update(statement.carry_compare_public_input_hash);
+    hasher.update(statement.cef_bcc_public_input_hash);
+    hasher.update(statement.carry_compare_private_circuit_label_hash);
+    hasher.update(statement.cef_bcc_private_circuit_label_hash);
+    hasher.finalize().into()
+}
+
+fn hash_preprocessing_opened_broadcasts(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    broadcasts: &[MaskedBroadcast],
+) -> Result<[u8; 32], PreprocessError> {
+    if broadcasts.len() != statement.signer_set.len() {
+        return Err(PreprocessError::CoeffCountMismatch);
+    }
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing opened broadcast state hash v1");
+    hasher.update(statement.session_id.0);
+    hasher.update(statement.transcript_hash.0);
+    hasher.update((statement.coeff_count as u32).to_le_bytes());
+    for broadcast in broadcasts {
+        if !statement.signer_set.contains(&broadcast.party)
+            || broadcast.masked_highs.len() != statement.coeff_count
+            || broadcast.masked_lows.len() != statement.coeff_count
+            || broadcast.transcript_hash != statement.transcript_hash
+        {
+            return Err(PreprocessError::CoeffCountMismatch);
+        }
+        hasher.update(broadcast.party.0.to_le_bytes());
+        hasher.update(broadcast.nonce_commitment.0);
+        hasher.update(broadcast.rho_bits_commitment.0);
+        hasher.update(broadcast.transcript_hash.0);
+        for &value in &broadcast.masked_highs {
+            hasher.update(value.to_le_bytes());
+        }
+        for &value in &broadcast.masked_lows {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn hash_preprocessing_private_material_state(
+    state: &PreprocessingPrivateMaterialState,
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing private material state hash v1");
+    hasher.update([match state.source {
+        PreprocessingPrivateMaterialStateSource::OpenedMaterialDerived => 1,
+        PreprocessingPrivateMaterialStateSource::RuntimePrivateMpc => 2,
+    }]);
+    hasher.update(state.statement_hash);
+    hasher.update(state.opened_broadcast_hash);
+    hasher.update(state.source_handle_hash);
+    for bit in state.material.masked_broadcast_relation_bits() {
+        let id = bit.id();
+        hasher.update(b"masked-broadcast-relation");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    for bit in state.material.rho_sum_bits_by_bit_le() {
+        let id = bit.id();
+        hasher.update(b"rho-sum");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    for bit in state.material.cef_correction_bits() {
+        let id = bit.id();
+        hasher.update(b"cef-correction");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    for bit in state.material.bcc_violation_bits() {
+        let id = bit.id();
+        hasher.update(b"bcc-violation");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn hash_opened_material_private_source_handles(
+    material: &PreprocessingPrivateMaterialHandles,
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS opened-material preprocessing source handles v1");
+    for bit in material.masked_broadcast_relation_bits() {
+        let id = bit.id();
+        hasher.update(b"masked-broadcast-relation");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    for bit in material.rho_sum_bits_by_bit_le() {
+        let id = bit.id();
+        hasher.update(b"rho-sum");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    for bit in material.cef_correction_bits() {
+        let id = bit.id();
+        hasher.update(b"cef-correction");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    for bit in material.bcc_violation_bits() {
+        let id = bit.id();
+        hasher.update(b"bcc-violation");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn hash_runtime_private_mpc_source_handles(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    input: &PreprocessingRuntimePrivateMpcStateInput,
+) -> Result<[u8; 32], PreprocessError> {
+    if input.masked_broadcast_relation_bits.is_empty() {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS runtime-private preprocessing source handles v1");
+    hasher.update(hash_preprocessing_runtime_statement(statement));
+    for bit in &input.masked_broadcast_relation_bits {
+        let id = bit.id();
+        hasher.update(b"masked-broadcast-relation");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    for bit in &input.rho_sum_bits_by_bit_le {
+        let id = bit.id();
+        hasher.update(b"rho-sum");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    for bit in &input.cef_correction_bits {
+        let id = bit.id();
+        hasher.update(b"cef-correction");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    for bit in &input.bcc_violation_bits {
+        let id = bit.id();
+        hasher.update(b"bcc-violation");
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn preprocessing_certification_runtime_label(
+    statement: &PreprocessingCertificationRuntimeStatement,
+) -> Power2RoundTranscriptLabel {
+    Power2RoundTranscriptLabel::preprocessing_root(
+        statement.session_id.0,
+        statement.transcript_hash.0,
+    )
+}
+
+#[allow(dead_code)]
+fn ensure_preprocessing_statement_phase_cursors(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    cursors: &[PrimeFieldMpcPhaseCursor],
+) -> Result<(), PreprocessError> {
+    let root = preprocessing_certification_runtime_label(statement);
+    let expected_senders = statement.signer_set.len();
+    let expected = [
+        (
+            PrimeFieldMpcRoundKind::Open,
+            PrimeFieldMpcPhase::PreprocessingMaskedBroadcast,
+            root.child("masked_broadcast")
+                .child("preprocessing_masked_broadcast"),
+        ),
+        (
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCarryCompare,
+            root.child("carry_compare")
+                .child("preprocessing_carry_compare"),
+        ),
+        (
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCefBcc,
+            root.child("cef_bcc").child("preprocessing_cef_bcc"),
+        ),
+    ];
+    for (kind, phase, label) in expected {
+        let label_hash = power2round_label_hash(&label);
+        let found = cursors.iter().any(|cursor| {
+            cursor.kind == kind
+                && cursor.phase == phase
+                && cursor.receiver.is_none()
+                && cursor.label_hash == label_hash
+                && cursor.state == PrimeFieldMpcPhaseCursorState::Collected
+                && cursor.expected == expected_senders
+                && cursor.got == expected_senders
+        });
+        if !found {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_preprocessing_statement_public_input_hashes(
+    statement: &PreprocessingCertificationRuntimeStatement,
+) -> Result<(), PreprocessError> {
+    if statement.carry_compare_public_input_hash == [0u8; 32]
+        || statement.cef_bcc_public_input_hash == [0u8; 32]
+    {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_preprocessing_statement_private_label_hashes(
+    statement: &PreprocessingCertificationRuntimeStatement,
+) -> Result<(), PreprocessError> {
+    let (carry, cef_bcc) =
+        preprocessing_private_circuit_label_hashes(statement.session_id, statement.transcript_hash);
+    if statement.carry_compare_private_circuit_label_hash != carry
+        || statement.cef_bcc_private_circuit_label_hash != cef_bcc
+    {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_preprocessing_private_circuit_inputs_match_statement(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    inputs: &PreprocessingPrivateCircuitInputs,
+) -> Result<(), PreprocessError> {
+    if inputs.coeff_count != statement.coeff_count
+        || inputs.carry_compare_public_input_hash != statement.carry_compare_public_input_hash
+        || inputs.cef_bcc_public_input_hash != statement.cef_bcc_public_input_hash
+        || inputs.carry_compare_private_circuit_label_hash
+            != statement.carry_compare_private_circuit_label_hash
+        || inputs.cef_bcc_private_circuit_label_hash != statement.cef_bcc_private_circuit_label_hash
+        || inputs.carry_compare_private_handle_hash == [0u8; 32]
+        || inputs.cef_correction_private_handle_hash == [0u8; 32]
+        || inputs.cef_bcc_private_handle_hash == [0u8; 32]
+    {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    Ok(())
+}
+
+fn hash_preprocessing_optional_absent_private_handles(
+    domain: &[u8],
+    statement: &PreprocessingCertificationRuntimeStatement,
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing absent optional private bit handle graph v1");
+    hasher.update(domain);
+    hasher.update(statement.session_id.0);
+    hasher.update(statement.transcript_hash.0);
+    hasher.update((statement.coeff_count as u32).to_le_bytes());
+    hasher.update(statement.cef_bcc_private_circuit_label_hash);
+    hasher.finalize().into()
+}
+
+fn hash_preprocessing_private_bit_handles(
+    domain: &[u8],
+    statement: &PreprocessingCertificationRuntimeStatement,
+    bits: &[ProductionBitShareVec],
+) -> Result<[u8; 32], PreprocessError> {
+    if bits.is_empty() {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing private bit handle graph v1");
+    hasher.update(domain);
+    hasher.update(statement.session_id.0);
+    hasher.update(statement.transcript_hash.0);
+    hasher.update((statement.coeff_count as u32).to_le_bytes());
+    hasher.update(statement.carry_compare_public_input_hash);
+    hasher.update(statement.cef_bcc_public_input_hash);
+    hasher.update(statement.carry_compare_private_circuit_label_hash);
+    hasher.update(statement.cef_bcc_private_circuit_label_hash);
+    for bit in bits {
+        if bit.len() != statement.coeff_count {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        let id = bit.id();
+        hasher.update(id.label_hash);
+        hasher.update((id.lane_count as u32).to_le_bytes());
+        hasher.update(bit.holder().0.to_le_bytes());
+        hasher.update(bit.point().to_le_bytes());
+    }
+    Ok(hasher.finalize().into())
+}
+
+#[allow(dead_code)]
+fn ensure_preprocessing_statement_wire_markers<L: PrimeFieldMpcWireMessageLog>(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    wire_log: &L,
+) -> Result<(), PreprocessError> {
+    let root = preprocessing_certification_runtime_label(statement);
+    let expected_senders = &statement.signer_set;
+    let expected = [
+        (
+            PrimeFieldMpcRoundKind::Open,
+            PrimeFieldMpcPhase::PreprocessingMaskedBroadcast,
+            root.child("masked_broadcast")
+                .child("preprocessing_masked_broadcast"),
+            preprocessing_statement_marker_lanes(
+                b"masked-broadcast",
+                statement,
+                statement
+                    .signer_set
+                    .len()
+                    .saturating_mul(statement.coeff_count),
+            ),
+        ),
+        (
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCarryCompare,
+            root.child("carry_compare")
+                .child("preprocessing_carry_compare"),
+            preprocessing_statement_marker_lanes(
+                b"carry-compare",
+                statement,
+                statement.coeff_count,
+            ),
+        ),
+        (
+            PrimeFieldMpcRoundKind::AssertZero,
+            PrimeFieldMpcPhase::PreprocessingCefBcc,
+            root.child("cef_bcc").child("preprocessing_cef_bcc"),
+            preprocessing_statement_marker_lanes(b"cef-bcc", statement, statement.coeff_count),
+        ),
+    ];
+    for (kind, phase, label, values) in expected {
+        ensure_prime_field_mpc_wire_log_contains_broadcast_vec(
+            wire_log,
+            kind,
+            phase,
+            &label,
+            expected_senders,
+            &values,
+        )
+        .map_err(map_preprocessing_runtime_dkg_error)?;
+    }
+    Ok(())
+}
+
+fn preprocessing_statement_private_circuit_mul_labels<P: MlDsaParams>(
+    statement: &PreprocessingCertificationRuntimeStatement,
+) -> (
+    Vec<Power2RoundTranscriptLabel>,
+    Vec<Power2RoundTranscriptLabel>,
+) {
+    let root = preprocessing_certification_runtime_label(statement);
+    let carry_root = root.child("carry_compare_private").child("rho_gt_t");
+    let carry_width = bit_width_for_preprocessing_public_value(P::alpha() as u32);
+    let mut carry_labels = Vec::with_capacity(carry_width.saturating_mul(3));
+    for bit_idx in 0..carry_width {
+        for step in ["candidate", "comparison_update", "eq_update"] {
+            carry_labels.push(
+                carry_root
+                    .child(format!("bit_{bit_idx}/{step}"))
+                    .child("bit_and")
+                    .child("mul_layer"),
+            );
+        }
+    }
+
+    let cef_correction_root = root
+        .child("cef_bcc_private")
+        .child("cef_correction_sum_leq");
+    let bcc_root = root.child("cef_bcc_private").child("bcc_sum_leq");
+    let mut cef_labels = Vec::new();
+    for cef_root in [&cef_correction_root, &bcc_root] {
+        cef_labels.extend([
+            cef_root
+                .child("add_input_0/bit_0/carry")
+                .child("bit_and")
+                .child("mul_layer"),
+            cef_root
+                .child("sum_gt_threshold/bit_0/candidate")
+                .child("bit_and")
+                .child("mul_layer"),
+            cef_root
+                .child("sum_gt_threshold/bit_0/comparison_update")
+                .child("bit_and")
+                .child("mul_layer"),
+            cef_root
+                .child("sum_gt_threshold/bit_0/eq_update")
+                .child("bit_and")
+                .child("mul_layer"),
+        ]);
+    }
+    (carry_labels, cef_labels)
+}
+
+fn bit_width_for_preprocessing_public_value(value: u32) -> usize {
+    let mut width = 1usize;
+    let mut capacity = 2u32;
+    while capacity <= value {
+        width += 1;
+        capacity = capacity.saturating_mul(2);
+    }
+    width
+}
+
+fn preprocessing_statement_marker_lanes(
+    domain: &[u8],
+    statement: &PreprocessingCertificationRuntimeStatement,
+    lane_count: usize,
+) -> Vec<Coeff> {
+    (0..lane_count)
+        .map(|lane| {
+            let mut hasher = Sha3_256::new();
+            hasher.update(b"TALUS preprocessing runtime marker lane v1");
+            hasher.update(domain);
+            hasher.update(statement.session_id.0);
+            hasher.update(statement.transcript_hash.0);
+            hasher.update((statement.signer_set.len() as u32).to_le_bytes());
+            hasher.update((statement.coeff_count as u32).to_le_bytes());
+            hasher.update(statement.masked_broadcast_runtime_transcript);
+            for binding in &statement.masked_broadcast_bindings {
+                hasher.update(binding.party.0.to_le_bytes());
+                hasher.update(binding.statement_hash);
+                hasher.update(binding.runtime_transcript_hash);
+            }
+            hasher.update(statement.carry_compare_evidence_hash);
+            hasher.update(statement.bcc_evidence_hash);
+            hasher.update(statement.w1_hash);
+            hasher.update(statement.carry_compare_public_input_hash);
+            hasher.update(statement.cef_bcc_public_input_hash);
+            hasher.update(statement.carry_compare_private_circuit_label_hash);
+            hasher.update(statement.cef_bcc_private_circuit_label_hash);
+            hasher.update((lane as u32).to_le_bytes());
+            let bytes = hasher.finalize();
+            let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            (value % 8_380_417) as Coeff
+        })
+        .collect()
+}
+
+fn masked_broadcast_runtime_transcript_hash_from_vector_runtime_evidence(
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_count: usize,
+    coeff_count: usize,
+    statement_hash: [u8; 32],
+    party: PartyId,
+    vector_runtime_transcript_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS masked-broadcast vector-runtime binding v1");
+    hasher.update(session_id.0);
+    hasher.update(transcript_hash.0);
+    hasher.update((signer_count as u32).to_le_bytes());
+    hasher.update((coeff_count as u32).to_le_bytes());
+    hasher.update(party.0.to_le_bytes());
+    hasher.update(statement_hash);
+    hasher.update(vector_runtime_transcript_hash);
+    hasher.finalize().into()
+}
+
+fn validate_masked_broadcast_bindings_for_vector_runtime<P: MlDsaParams>(
+    statement: &PreprocessingCertificationRuntimeStatement,
+    vector_runtime_transcript_hash: [u8; 32],
+) -> Result<(), PreprocessError> {
+    if statement.masked_broadcast_bindings.len() != statement.signer_set.len()
+        || vector_runtime_transcript_hash == [0u8; 32]
+    {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    let mut seen = Vec::with_capacity(statement.masked_broadcast_bindings.len());
+    for binding in &statement.masked_broadcast_bindings {
+        if !statement.signer_set.contains(&binding.party)
+            || seen.contains(&binding.party)
+            || binding.statement_hash == [0u8; 32]
+            || binding.runtime_transcript_hash == [0u8; 32]
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+        seen.push(binding.party);
+        let vector_expected = masked_broadcast_runtime_transcript_hash_from_vector_runtime_evidence(
+            statement.session_id,
+            statement.transcript_hash,
+            statement.signer_set.len(),
+            statement.coeff_count,
+            binding.statement_hash,
+            binding.party,
+            vector_runtime_transcript_hash,
+        );
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"TALUS masked broadcast vector runtime transcript binding v1");
+        hasher.update(P::NAME.as_bytes());
+        hasher.update(binding.statement_hash);
+        hasher.update(statement.session_id.0);
+        hasher.update((statement.coeff_count as u32).to_le_bytes());
+        hasher.update((statement.signer_set.len() as u32).to_le_bytes());
+        let statement_expected: [u8; 32] = hasher.finalize().into();
+        if binding.runtime_transcript_hash != vector_expected
+            && binding.runtime_transcript_hash != statement_expected
+        {
+            return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+        }
+    }
+    let derived = masked_broadcast_runtime_transcript_hash(
+        statement.session_id,
+        statement.transcript_hash,
+        statement.signer_set.len(),
+        statement.coeff_count,
+        &statement
+            .masked_broadcast_bindings
+            .iter()
+            .map(|binding| binding.runtime_transcript_hash)
+            .collect::<Vec<_>>(),
+    );
+    if derived != statement.masked_broadcast_runtime_transcript {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    Ok(())
+}
+
+fn expected_preprocessing_stage_runtime_proof_parts<P: MlDsaParams>(
+    stage: PreprocessingCertificationStage,
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_count: usize,
+    coeff_count: usize,
+    evidence_hash: [u8; 32],
+    runtime_transcript_hash: [u8; 32],
+) -> PreprocessingStageRuntimeProofParts {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing stage runtime statement v1");
+    hasher.update(P::NAME.as_bytes());
+    hasher.update(stage.domain());
+    hasher.update(session_id.0);
+    hasher.update(transcript_hash.0);
+    hasher.update((signer_count as u32).to_le_bytes());
+    hasher.update((coeff_count as u32).to_le_bytes());
+    hasher.update(evidence_hash);
+    PreprocessingStageRuntimeProofParts {
+        stage,
+        statement_hash: hasher.finalize().into(),
+        runtime_transcript_hash,
+        coeff_count,
+        signer_count,
+    }
+}
+
+fn decode_preprocessing_stage_runtime_proof(
+    proof: &PreprocessingCertificationStageRuntimeProof,
+) -> Option<PreprocessingStageRuntimeProofParts> {
+    const LEN: usize = 6 + 1 + 32 + 32 + 4 + 4;
+    if proof.bytes.len() != LEN {
+        return None;
+    }
+    if &proof.bytes[..6] != PREPROCESSING_STAGE_RUNTIME_PROOF_PREFIX {
+        return None;
+    }
+    let stage = match proof.bytes[6] {
+        1 => PreprocessingCertificationStage::CarryCompare,
+        2 => PreprocessingCertificationStage::Bcc,
+        _ => return None,
+    };
+    let mut statement_hash = [0u8; 32];
+    statement_hash.copy_from_slice(&proof.bytes[7..39]);
+    let mut runtime_transcript_hash = [0u8; 32];
+    runtime_transcript_hash.copy_from_slice(&proof.bytes[39..71]);
+    let coeff_count = u32::from_le_bytes(proof.bytes[71..75].try_into().ok()?) as usize;
+    let signer_count = u32::from_le_bytes(proof.bytes[75..79].try_into().ok()?) as usize;
+    Some(PreprocessingStageRuntimeProofParts {
+        stage,
+        statement_hash,
+        runtime_transcript_hash,
+        coeff_count,
+        signer_count,
+    })
+}
+
+fn verify_preprocessing_stage_runtime_proof<P: MlDsaParams>(
+    stage: PreprocessingCertificationStage,
+    session_id: SessionId,
+    transcript_hash: TranscriptHash,
+    signer_count: usize,
+    coeff_count: usize,
+    evidence_hash: [u8; 32],
+    proof: &PreprocessingCertificationStageRuntimeProof,
+) -> Result<[u8; 32], PreprocessError> {
+    let parts = decode_preprocessing_stage_runtime_proof(proof)
+        .ok_or(PreprocessError::PreprocessingRuntimeCertificateMismatch)?;
+    let expected = expected_preprocessing_stage_runtime_proof_parts::<P>(
+        stage,
+        session_id,
+        transcript_hash,
+        signer_count,
+        coeff_count,
+        evidence_hash,
+        parts.runtime_transcript_hash,
+    );
+    if parts != expected || parts.runtime_transcript_hash == [0u8; 32] {
+        return Err(PreprocessError::PreprocessingRuntimeCertificateMismatch);
+    }
+    Ok(parts.runtime_transcript_hash)
+}
+
+fn preprocessing_runtime_token_binding_hash(
+    token: &CertifiedToken,
+    runtime_evidence: &ProductionVectorItMpcRuntimeEvidence,
+) -> [u8; 32] {
+    let counters = PreprocessingCertificationCounters::from_token(token);
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"TALUS preprocessing runtime-token binding v1");
+    hasher.update(token.session_id.0);
+    hasher.update(token.transcript_hash.0);
+    hasher.update((token.signer_set.len() as u32).to_le_bytes());
+    for party in &token.signer_set {
+        hasher.update(party.0.to_le_bytes());
+    }
+    hasher.update((token.w1.len() as u32).to_le_bytes());
+    hasher.update((token.nonce_commitments.len() as u32).to_le_bytes());
+    hasher.update((token.broadcasts.len() as u32).to_le_bytes());
+    if let Some(evidence) = token.certification_evidence.masked_broadcast {
+        hasher.update(evidence.evidence_hash);
+        hasher.update(evidence.runtime_transcript_hash);
+    }
+    if let Some(evidence) = token.certification_evidence.carry_compare {
+        hasher.update(evidence.evidence_hash);
+        hasher.update(evidence.runtime_transcript_hash);
+    }
+    if let Some(evidence) = token.certification_evidence.bcc {
+        hasher.update(evidence.evidence_hash);
+        hasher.update(evidence.runtime_transcript_hash);
+    }
+    if let Some(evidence) = token.certification_evidence.persistence {
+        hasher.update(evidence.evidence_hash);
+    }
+    if let Some(evidence) = token.certification_evidence.nonce_reveal_policy {
+        hasher.update(evidence.evidence_hash);
+    }
+    hasher.update((counters.token_count as u64).to_le_bytes());
+    hasher.update((counters.signer_count as u64).to_le_bytes());
+    hasher.update((counters.coeff_count as u64).to_le_bytes());
+    hasher.update((counters.vector_lanes as u64).to_le_bytes());
+    hasher.update((counters.masked_broadcasts as u64).to_le_bytes());
+    hasher.update((counters.carry_compare_lanes as u64).to_le_bytes());
+    hasher.update((counters.cef_correction_lanes as u64).to_le_bytes());
+    hasher.update((counters.bcc_lanes as u64).to_le_bytes());
+    hasher.update(runtime_evidence.transcript_hash);
+    hasher.update(runtime_evidence.counters.rounds.to_le_bytes());
+    hasher.update(runtime_evidence.counters.private_messages.to_le_bytes());
+    hasher.update(runtime_evidence.counters.broadcasts.to_le_bytes());
+    hasher.update(runtime_evidence.counters.wire_bytes.to_le_bytes());
+    hasher.update(runtime_evidence.counters.durable_log_bytes.to_le_bytes());
+    hasher.update(runtime_evidence.counters.vector_lanes.to_le_bytes());
+    hasher.update(
+        runtime_evidence
+            .counters
+            .multiplication_layers
+            .to_le_bytes(),
+    );
+    hasher.update(runtime_evidence.counters.scalar_mul_gates.to_le_bytes());
+    hasher.update(runtime_evidence.counters.scalar_openings.to_le_bytes());
+    hasher.update(runtime_evidence.counters.scalar_assert_zero.to_le_bytes());
+    hasher.update(runtime_evidence.counters.vector_mul_lanes.to_le_bytes());
+    hasher.update(runtime_evidence.counters.vector_opening_lanes.to_le_bytes());
+    hasher.update(
+        runtime_evidence
+            .counters
+            .vector_assert_zero_lanes
+            .to_le_bytes(),
+    );
+    hasher.update(runtime_evidence.counters.random_bits.to_le_bytes());
+    hasher.update(
+        runtime_evidence
+            .counters
+            .local_public_mul_lanes
+            .to_le_bytes(),
+    );
+    hasher.update([runtime_evidence.coverage.open_many_checked as u8]);
+    hasher.update([runtime_evidence.coverage.assert_zero_vec as u8]);
+    hasher.update([runtime_evidence.coverage.assert_bit_vec as u8]);
+    hasher.update([runtime_evidence.coverage.random_bit_vec as u8]);
+    hasher.update([runtime_evidence.coverage.mul_vec as u8]);
+    hasher.update([runtime_evidence.coverage.comparison_to_public as u8]);
+    hasher.update([runtime_evidence.coverage.equality_to_public as u8]);
+    hasher.update([runtime_evidence.coverage.bit_sum_or_threshold_check as u8]);
+    hasher.update([runtime_evidence.coverage.private_one_hot_selection as u8]);
+    hasher.update([runtime_evidence.coverage.preprocessing_masked_broadcast as u8]);
+    hasher.update([runtime_evidence.coverage.preprocessing_carry_compare as u8]);
+    hasher.update([runtime_evidence.coverage.preprocessing_cef_bcc as u8]);
     hasher.finalize().into()
 }
 
@@ -3633,13 +7470,13 @@ mod tests {
                 broadcasts: 3,
                 wire_bytes: 512,
                 durable_log_bytes: 1024,
-                vector_lanes: 128,
+                vector_lanes: 10_000,
                 multiplication_layers: 4,
-                vector_mul_lanes: 64,
-                vector_opening_lanes: 16,
-                vector_assert_zero_lanes: 16,
-                random_bits: 16,
-                local_public_mul_lanes: 16,
+                vector_mul_lanes: 10_000,
+                vector_opening_lanes: 10_000,
+                vector_assert_zero_lanes: 10_000,
+                random_bits: 10_000,
+                local_public_mul_lanes: 10_000,
                 ..talus_dkg::PrimeFieldMpcCounters::default()
             },
             coverage: talus_dkg::ProductionVectorItMpcRuntimeCoverage {
@@ -3652,8 +7489,1203 @@ mod tests {
                 equality_to_public: true,
                 bit_sum_or_threshold_check: true,
                 private_one_hot_selection: true,
+                preprocessing_masked_broadcast: true,
+                preprocessing_carry_compare: true,
+                preprocessing_cef_bcc: true,
             },
             transcript_hash: [0x5a; 32],
+        }
+    }
+
+    fn release_vector_runtime_evidence_for_token(
+        token: &CertifiedToken,
+    ) -> ProductionVectorItMpcRuntimeEvidence {
+        let mut evidence = release_vector_runtime_evidence();
+        evidence.transcript_hash = preprocessing_certification_runtime_transcript_hash(token)
+            .expect("preprocessing runtime transcript");
+        evidence
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    type TestProductionVectorPrimeFieldRuntime = ProductionVectorPrimeFieldMpcRuntime<
+        talus_wire::InMemoryTransport,
+        talus_dkg::InMemoryPrimeFieldMpcWireMessageLog,
+        talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog,
+    >;
+
+    #[cfg(feature = "scaffold-dev")]
+    #[derive(Clone, Debug, Default)]
+    struct TestProductionVectorEntropy {
+        next: u64,
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    impl ProductionVectorItMpcEntropy for TestProductionVectorEntropy {
+        fn fill_field_coefficients<P: MlDsaParams>(
+            &mut self,
+            _label: &Power2RoundTranscriptLabel,
+            count: usize,
+        ) -> Result<Vec<Coeff>, DkgError> {
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                self.next = self.next.saturating_add(1);
+                out.push((self.next % P::Q as u64) as Coeff);
+            }
+            Ok(out)
+        }
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    fn test_production_vector_prime_field_runtimes(
+        config: &DkgConfig,
+    ) -> Vec<TestProductionVectorPrimeFieldRuntime> {
+        let party_ids = config
+            .parties
+            .iter()
+            .map(|party| party.0)
+            .collect::<Vec<_>>();
+        config
+            .parties
+            .iter()
+            .map(|&party| {
+                let transport = talus_wire::InMemoryTransport::new(party.0, party_ids.clone())
+                    .expect("in-memory transport");
+                let state = talus_dkg::TransportPrimeFieldMpcStateMachine::new(
+                    config.clone(),
+                    party,
+                    transport,
+                )
+                .expect("state machine");
+                let party_runtime = talus_dkg::TransportPrimeFieldMpcPartyRuntime::new(
+                    state,
+                    talus_dkg::InMemoryPrimeFieldMpcWireMessageLog::default(),
+                );
+                ProductionVectorPrimeFieldMpcRuntime::new(
+                    talus_dkg::CursoredTransportPrimeFieldMpcPartyRuntime::new(
+                        party_runtime,
+                        talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog::default(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    fn route_production_vector_messages(runtimes: &mut [TestProductionVectorPrimeFieldRuntime]) {
+        let mut private_deliveries = Vec::new();
+        let mut broadcast_deliveries = Vec::new();
+        for runtime in runtimes.iter() {
+            let local_party = runtime.inner().runtime().local_party().0;
+            private_deliveries.extend(
+                runtime
+                    .inner()
+                    .runtime()
+                    .state()
+                    .transport()
+                    .private_messages()
+                    .iter()
+                    .filter(|delivery| delivery.sender_party_id == local_party)
+                    .cloned(),
+            );
+            broadcast_deliveries.extend(
+                runtime
+                    .inner()
+                    .runtime()
+                    .state()
+                    .transport()
+                    .broadcast_deliveries()
+                    .iter()
+                    .filter(|delivery| delivery.message.header.sender_party_id == local_party)
+                    .cloned(),
+            );
+        }
+        for delivery in private_deliveries {
+            let receiver = runtimes
+                .iter_mut()
+                .find(|runtime| {
+                    runtime.inner().runtime().local_party().0 == delivery.receiver_party_id
+                })
+                .expect("receiver runtime");
+            if receiver.inner().runtime().local_party().0 == delivery.sender_party_id {
+                continue;
+            }
+            receiver
+                .inner_mut()
+                .runtime_mut()
+                .state_mut()
+                .transport_mut()
+                .inject_private(
+                    delivery.sender_party_id,
+                    delivery.receiver_party_id,
+                    delivery.message,
+                )
+                .expect("route private message");
+        }
+        for delivery in broadcast_deliveries {
+            for runtime in runtimes.iter_mut() {
+                if runtime.inner().runtime().local_party().0
+                    == delivery.message.header.sender_party_id
+                {
+                    continue;
+                }
+                runtime
+                    .inner_mut()
+                    .runtime_mut()
+                    .state_mut()
+                    .transport_mut()
+                    .inject_broadcast_delivery(delivery.observer_party_id, delivery.message.clone())
+                    .expect("route broadcast message");
+            }
+        }
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    fn clear_production_vector_message_queues(
+        runtimes: &mut [TestProductionVectorPrimeFieldRuntime],
+    ) {
+        for runtime in runtimes {
+            runtime
+                .inner_mut()
+                .runtime_mut()
+                .state_mut()
+                .transport_mut()
+                .clear_queued_messages();
+        }
+    }
+
+    #[test]
+    fn masked_broadcast_runtime_bindings_must_match_vector_runtime_evidence() {
+        let session_id = session(81);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let evidence = release_vector_runtime_evidence();
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope_with_vector_runtime_evidence::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    &evidence,
+                )
+                .expect("runtime-derived envelope")
+            })
+            .collect::<Vec<_>>();
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<MlDsa65>(
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+        )
+        .expect("runtime statement");
+
+        assert_eq!(
+            validate_masked_broadcast_bindings_for_vector_runtime::<MlDsa65>(
+                &statement,
+                evidence.transcript_hash
+            ),
+            Ok(())
+        );
+
+        let mismatched_envelopes = inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| {
+                prepare_masked_broadcast_envelope_with_runtime_transcript::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    [0x40u8.wrapping_add(idx as u8); 32],
+                )
+                .expect("arbitrary runtime envelope")
+            })
+            .collect::<Vec<_>>();
+        let mismatched_statement = preprocessing_certification_runtime_statement_from_envelopes::<
+            MlDsa65,
+        >(session_id, inputs, mismatched_envelopes, transcript)
+        .expect("mismatched runtime statement still decodes");
+
+        assert_eq!(
+            validate_masked_broadcast_bindings_for_vector_runtime::<MlDsa65>(
+                &mismatched_statement,
+                evidence.transcript_hash
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+    }
+
+    fn preprocessing_statement_phase_cursors(
+        statement: &PreprocessingCertificationRuntimeStatement,
+    ) -> Vec<PrimeFieldMpcPhaseCursor> {
+        let root = preprocessing_certification_runtime_label(statement);
+        [
+            (
+                PrimeFieldMpcRoundKind::Open,
+                PrimeFieldMpcPhase::PreprocessingMaskedBroadcast,
+                root.child("masked_broadcast")
+                    .child("preprocessing_masked_broadcast"),
+            ),
+            (
+                PrimeFieldMpcRoundKind::AssertZero,
+                PrimeFieldMpcPhase::PreprocessingCarryCompare,
+                root.child("carry_compare")
+                    .child("preprocessing_carry_compare"),
+            ),
+            (
+                PrimeFieldMpcRoundKind::AssertZero,
+                PrimeFieldMpcPhase::PreprocessingCefBcc,
+                root.child("cef_bcc").child("preprocessing_cef_bcc"),
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, phase, label)| PrimeFieldMpcPhaseCursor {
+            kind,
+            phase,
+            receiver: None,
+            label_hash: power2round_label_hash(&label),
+            state: PrimeFieldMpcPhaseCursorState::Collected,
+            expected: statement.signer_set.len(),
+            got: statement.signer_set.len(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn preprocessing_runtime_statement_requires_collected_statement_phase_cursors() {
+        let session_id = session(82);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let evidence = release_vector_runtime_evidence();
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope_with_vector_runtime_evidence::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    &evidence,
+                )
+                .expect("runtime-derived envelope")
+            })
+            .collect::<Vec<_>>();
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<MlDsa65>(
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+        )
+        .expect("runtime statement");
+        let cursors = preprocessing_statement_phase_cursors(&statement);
+
+        assert_eq!(
+            ensure_preprocessing_statement_phase_cursors(&statement, &cursors),
+            Ok(())
+        );
+
+        let mut missing = cursors.clone();
+        missing.pop();
+        assert_eq!(
+            ensure_preprocessing_statement_phase_cursors(&statement, &missing),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+
+        let mut wrong_state = cursors;
+        wrong_state[0].state = PrimeFieldMpcPhaseCursorState::WaitingBroadcast;
+        assert_eq!(
+            ensure_preprocessing_statement_phase_cursors(&statement, &wrong_state),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+    }
+
+    #[test]
+    fn preprocessing_runtime_statement_binds_private_circuit_label_roots() {
+        let session_id = session(84);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let evidence = release_vector_runtime_evidence();
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope_with_vector_runtime_evidence::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    &evidence,
+                )
+                .expect("runtime-derived envelope")
+            })
+            .collect::<Vec<_>>();
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<MlDsa65>(
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+        )
+        .expect("runtime statement");
+        let (expected_carry, expected_cef_bcc) =
+            preprocessing_private_circuit_label_hashes(session_id, transcript);
+
+        assert_eq!(
+            statement.carry_compare_private_circuit_label_hash,
+            expected_carry
+        );
+        assert_eq!(
+            statement.cef_bcc_private_circuit_label_hash,
+            expected_cef_bcc
+        );
+        assert_eq!(
+            ensure_preprocessing_statement_private_label_hashes(&statement),
+            Ok(())
+        );
+
+        let raw_runtime_transcript = [0x42; 32];
+        let carry_stage_hash =
+            preprocessing_stage_runtime_transcript_hash_from_vector_runtime_evidence(
+                PreprocessingCertificationStage::CarryCompare,
+                &statement,
+                raw_runtime_transcript,
+            );
+        let mut mutated = statement.clone();
+        mutated.carry_compare_private_circuit_label_hash[0] ^= 0x80;
+        assert_eq!(
+            ensure_preprocessing_statement_private_label_hashes(&mutated),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        assert_ne!(
+            carry_stage_hash,
+            preprocessing_stage_runtime_transcript_hash_from_vector_runtime_evidence(
+                PreprocessingCertificationStage::CarryCompare,
+                &mutated,
+                raw_runtime_transcript,
+            )
+        );
+    }
+
+    #[test]
+    fn preprocessing_runtime_statement_binds_public_circuit_inputs() {
+        let session_id = session(85);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let evidence = release_vector_runtime_evidence();
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope_with_vector_runtime_evidence::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    &evidence,
+                )
+                .expect("runtime-derived envelope")
+            })
+            .collect::<Vec<_>>();
+        let broadcasts =
+            open_broadcasts(session_id, &envelopes, transcript).expect("opened broadcasts");
+        let expected = preprocessing_public_circuit_input_hashes::<MlDsa65>(
+            session_id,
+            transcript,
+            &signer_set,
+            &broadcasts,
+        )
+        .expect("public input hashes");
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<MlDsa65>(
+            session_id, inputs, envelopes, transcript,
+        )
+        .expect("runtime statement");
+
+        assert_eq!(statement.carry_compare_public_input_hash, expected.0);
+        assert_eq!(statement.cef_bcc_public_input_hash, expected.1);
+        assert_eq!(
+            ensure_preprocessing_statement_public_input_hashes(&statement),
+            Ok(())
+        );
+
+        let raw_runtime_transcript = [0x43; 32];
+        let bcc_stage_hash =
+            preprocessing_stage_runtime_transcript_hash_from_vector_runtime_evidence(
+                PreprocessingCertificationStage::Bcc,
+                &statement,
+                raw_runtime_transcript,
+            );
+        let mut mutated = statement.clone();
+        mutated.cef_bcc_public_input_hash[0] ^= 0x11;
+        assert_ne!(
+            bcc_stage_hash,
+            preprocessing_stage_runtime_transcript_hash_from_vector_runtime_evidence(
+                PreprocessingCertificationStage::Bcc,
+                &mutated,
+                raw_runtime_transcript,
+            )
+        );
+        mutated.carry_compare_public_input_hash = [0u8; 32];
+        assert_eq!(
+            ensure_preprocessing_statement_public_input_hashes(&mutated),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+    }
+
+    #[test]
+    fn preprocessing_private_circuit_inputs_must_match_statement() {
+        let session_id = session(86);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let evidence = release_vector_runtime_evidence();
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope_with_vector_runtime_evidence::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    &evidence,
+                )
+                .expect("runtime-derived envelope")
+            })
+            .collect::<Vec<_>>();
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<MlDsa65>(
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+        )
+        .expect("runtime statement");
+
+        let config = talus_dkg::DkgConfig::new::<MlDsa65>(
+            2,
+            vec![PartyId(1), PartyId(2), PartyId(3)],
+            talus_dkg::KeygenEpoch(86),
+        )
+        .expect("dkg config");
+        let transport = talus_wire::InMemoryTransport::new(1, vec![1, 2, 3]).expect("transport");
+        let state = talus_dkg::TransportPrimeFieldMpcStateMachine::new(
+            config.clone(),
+            PartyId(1),
+            transport,
+        )
+        .expect("state machine");
+        let party_runtime = talus_dkg::TransportPrimeFieldMpcPartyRuntime::new(
+            state,
+            talus_dkg::InMemoryPrimeFieldMpcWireMessageLog::default(),
+        );
+        let runtime = talus_dkg::ProductionVectorPrimeFieldMpcRuntime::new(
+            talus_dkg::CursoredTransportPrimeFieldMpcPartyRuntime::new(
+                party_runtime,
+                talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog::default(),
+            ),
+        );
+        let root = preprocessing_certification_runtime_label(&statement);
+        let carry_bit = runtime
+            .bit_share_vec_from_local_lanes::<MlDsa65>(
+                &config,
+                &root
+                    .child("carry_compare_private")
+                    .child("rho_gt_t")
+                    .child("rho_bit_0"),
+                vec![0; statement.coeff_count],
+            )
+            .expect("carry bit handle");
+        let cef_bit = runtime
+            .bit_share_vec_from_local_lanes::<MlDsa65>(
+                &config,
+                &root
+                    .child("cef_bcc_private")
+                    .child("bcc_sum_leq")
+                    .child("bcc_bit_0"),
+                vec![1; statement.coeff_count],
+            )
+            .expect("cef/bcc bit handle");
+        let handles =
+            PreprocessingPrivateCircuitHandles::new(vec![carry_bit.clone()], vec![cef_bit.clone()])
+                .expect("private handle bundle");
+        let binding_from_handles = handles
+            .bind_to_statement(&statement)
+            .expect("binding from handle bundle");
+        assert_eq!(
+            ensure_preprocessing_private_circuit_inputs_match_statement(
+                &statement,
+                &binding_from_handles
+            ),
+            Ok(())
+        );
+        assert!(!format!("{handles:?}").contains("lanes: ["));
+        assert_eq!(
+            PreprocessingPrivateCircuitHandles::new(Vec::new(), vec![cef_bit.clone()]),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        let binding = PreprocessingPrivateCircuitInputs::from_runtime_bit_handles(
+            &statement,
+            core::slice::from_ref(&carry_bit),
+            &[],
+            core::slice::from_ref(&cef_bit),
+        )
+        .expect("private input binding");
+        assert_eq!(
+            ensure_preprocessing_private_circuit_inputs_match_statement(&statement, &binding),
+            Ok(())
+        );
+        assert_ne!(binding.carry_compare_private_handle_hash, [0; 32]);
+        assert_ne!(binding.cef_bcc_private_handle_hash, [0; 32]);
+        assert!(!format!("{binding:?}").contains("private_handle_hash: ["));
+
+        let mut wrong_statement = statement.clone();
+        wrong_statement.carry_compare_public_input_hash[0] ^= 0x44;
+        assert_eq!(
+            ensure_preprocessing_private_circuit_inputs_match_statement(&wrong_statement, &binding),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        let short_carry_bit = runtime
+            .bit_share_vec_from_local_lanes::<MlDsa65>(
+                &config,
+                &root.child("carry_compare_private").child("short"),
+                vec![0; statement.coeff_count - 1],
+            )
+            .expect("short carry bit handle");
+        assert_eq!(
+            PreprocessingPrivateCircuitInputs::from_runtime_bit_handles(
+                &statement,
+                &[short_carry_bit],
+                &[],
+                &[cef_bit],
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+    }
+
+    #[test]
+    fn preprocessing_private_circuit_driver_starts_from_runtime_handles() {
+        let session_id = session(87);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let evidence = release_vector_runtime_evidence();
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope_with_vector_runtime_evidence::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    &evidence,
+                )
+                .expect("runtime-derived envelope")
+            })
+            .collect::<Vec<_>>();
+        let broadcasts =
+            open_broadcasts(session_id, &envelopes, transcript).expect("opened masked broadcasts");
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<MlDsa65>(
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+        )
+        .expect("runtime statement");
+
+        let config = talus_dkg::DkgConfig::new::<MlDsa65>(
+            2,
+            vec![PartyId(1), PartyId(2), PartyId(3)],
+            talus_dkg::KeygenEpoch(87),
+        )
+        .expect("dkg config");
+        let transport = talus_wire::InMemoryTransport::new(1, vec![1, 2, 3]).expect("transport");
+        let state = talus_dkg::TransportPrimeFieldMpcStateMachine::new(
+            config.clone(),
+            PartyId(1),
+            transport,
+        )
+        .expect("state machine");
+        let party_runtime = talus_dkg::TransportPrimeFieldMpcPartyRuntime::new(
+            state,
+            talus_dkg::InMemoryPrimeFieldMpcWireMessageLog::default(),
+        );
+        let mut runtime = talus_dkg::ProductionVectorPrimeFieldMpcRuntime::new(
+            talus_dkg::CursoredTransportPrimeFieldMpcPartyRuntime::new(
+                party_runtime,
+                talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog::default(),
+            ),
+        );
+        let adapter = ProductionPreprocessingCertificationRuntime::new(&mut runtime);
+        let (started_statement, started_broadcasts, state) = adapter
+            .start_private_circuit_handles_from_envelopes::<MlDsa65>(
+                &config,
+                session_id,
+                inputs.clone(),
+                envelopes.clone(),
+                transcript,
+            )
+            .expect("start from release envelopes");
+        assert_eq!(started_statement, statement);
+        assert_eq!(started_broadcasts, broadcasts);
+        assert!(!state.is_done());
+        assert_eq!(
+            adapter.finish_private_circuit_handles(&state),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+
+        let private_material = adapter
+            .derive_private_material_handles_from_opened_preprocessing::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+            )
+            .expect("adapter-derived private material handles");
+        assert!(!format!("{private_material:?}").contains("lanes: ["));
+        let private_state = adapter
+            .derive_private_material_state_from_opened_preprocessing::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+            )
+            .expect("adapter-derived private material state");
+        assert_eq!(
+            private_state.source(),
+            PreprocessingPrivateMaterialStateSource::OpenedMaterialDerived
+        );
+        assert!(!format!("{private_state:?}").contains("lanes: ["));
+        let mut wrong_statement = statement.clone();
+        wrong_statement.carry_compare_public_input_hash[0] ^= 0x55;
+        assert_eq!(
+            adapter.derive_private_material_handles_from_opened_preprocessing::<MlDsa65>(
+                &config,
+                &wrong_statement,
+                &broadcasts,
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        assert_eq!(
+            adapter.derive_private_material_handles_from_opened_preprocessing::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts[..1],
+            ),
+            Err(PreprocessError::CoeffCountMismatch)
+        );
+        let err = adapter
+            .start_private_circuit_handles_from_state::<MlDsa65>(
+                &config,
+                &wrong_statement,
+                &broadcasts,
+                &private_state,
+            )
+            .expect_err("wrong statement rejects state");
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+        let err = adapter
+            .start_private_circuit_handles_from_state::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts[..1],
+                &private_state,
+            )
+            .expect_err("wrong broadcasts reject state");
+        assert_eq!(err, PreprocessError::CoeffCountMismatch);
+        let state = adapter
+            .start_private_circuit_handles_from_preprocessing_material::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+                &private_material,
+            )
+            .expect("private circuit state from preprocessing material");
+        assert!(!state.is_done());
+        assert_eq!(
+            adapter.finish_private_circuit_handles(&state),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+
+        let root = preprocessing_certification_runtime_label(&statement);
+        let carry_width = bit_width_for_preprocessing_public_value(MlDsa65::alpha() as u32);
+        let relation_bits = adapter
+            .start_preprocessing_masked_broadcast_consistency_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+            )
+            .expect("runtime-owned masked-broadcast relation bits");
+        let mut mismatched_broadcasts = broadcasts.clone();
+        mismatched_broadcasts[0].masked_highs[0] ^= 1;
+        assert_eq!(
+            adapter.start_preprocessing_masked_broadcast_consistency_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &mismatched_broadcasts,
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        let mut wrong_binding_statement = statement.clone();
+        wrong_binding_statement.masked_broadcast_bindings[0].statement_hash[0] ^= 0x80;
+        assert_eq!(
+            adapter.start_preprocessing_masked_broadcast_consistency_vec::<MlDsa65>(
+                &config,
+                &wrong_binding_statement,
+                &broadcasts,
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        assert_eq!(
+            adapter.start_preprocessing_masked_broadcast_consistency_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts[..1],
+            ),
+            Err(PreprocessError::CoeffCountMismatch)
+        );
+        let derived_carry_bits = adapter
+            .start_preprocessing_carry_compare_rho_sum_bits_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+            )
+            .expect("runtime-owned rho-sum bits");
+        assert_eq!(derived_carry_bits.len(), carry_width);
+        assert_eq!(
+            adapter.start_preprocessing_carry_compare_rho_sum_bits_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &mismatched_broadcasts,
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        let mut wrong_transcript_broadcasts = broadcasts.clone();
+        wrong_transcript_broadcasts[0].transcript_hash.0[0] ^= 0x01;
+        assert_eq!(
+            adapter.start_preprocessing_carry_compare_rho_sum_bits_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &wrong_transcript_broadcasts,
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        let mut short_broadcasts = broadcasts.clone();
+        short_broadcasts[0].masked_lows.pop();
+        assert_eq!(
+            adapter.start_preprocessing_carry_compare_rho_sum_bits_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &short_broadcasts,
+            ),
+            Err(PreprocessError::CoeffCountMismatch)
+        );
+        let derived_bcc_bits = adapter
+            .start_preprocessing_bcc_violation_bits_vec::<MlDsa65>(&config, &statement, &broadcasts)
+            .expect("runtime-owned bcc violation bits");
+        assert_eq!(derived_bcc_bits.len(), 1);
+        let derived_cef_bits = adapter
+            .start_preprocessing_cef_correction_bits_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+            )
+            .expect("runtime-owned cef correction bits");
+        assert_eq!(derived_cef_bits.len(), 1);
+        assert_eq!(
+            adapter.start_preprocessing_cef_correction_bits_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &mismatched_broadcasts,
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        assert_eq!(
+            adapter.start_preprocessing_bcc_violation_bits_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &mismatched_broadcasts,
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        assert_eq!(
+            adapter.start_preprocessing_bcc_violation_bits_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &wrong_transcript_broadcasts,
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        assert_eq!(
+            adapter.start_preprocessing_bcc_violation_bits_vec::<MlDsa65>(
+                &config,
+                &statement,
+                &short_broadcasts,
+            ),
+            Err(PreprocessError::CoeffCountMismatch)
+        );
+        let runtime_private_state = adapter
+            .derive_private_material_state_from_runtime_private_mpc_handles::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+            )
+            .expect("runtime-private mpc state");
+        assert_eq!(
+            runtime_private_state.source(),
+            PreprocessingPrivateMaterialStateSource::RuntimePrivateMpc
+        );
+        adapter
+            .start_private_circuit_handles_from_state::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+                &runtime_private_state,
+            )
+            .expect("runtime-private state starts private circuits");
+        let unfinished_runtime_state = adapter
+            .start_private_circuit_handles_from_state::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+                &runtime_private_state,
+            )
+            .expect("runtime-private state starts private circuits");
+        assert_eq!(
+            adapter
+                .finish_runtime_masked_broadcast_output::<MlDsa65>(
+                    &statement,
+                    &unfinished_runtime_state,
+                )
+                .expect_err("unfinished masked-broadcast output rejects"),
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+        assert_eq!(
+            adapter
+                .finish_runtime_carry_compare_output::<MlDsa65>(
+                    &statement,
+                    &unfinished_runtime_state,
+                )
+                .expect_err("unfinished CarryCompare output rejects"),
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+        let fake_carry_output = RuntimeCarryCompareOutput {
+            coeff_count: statement.coeff_count,
+            evidence_hash: statement.carry_compare_evidence_hash,
+            runtime_transcript_hash: statement.masked_broadcast_runtime_transcript,
+        };
+        assert_eq!(
+            adapter
+                .finish_runtime_cef_bcc_output::<MlDsa65>(
+                    &statement,
+                    &unfinished_runtime_state,
+                    fake_carry_output,
+                )
+                .expect_err("unfinished CEF/BCC output rejects"),
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+        let runtime_private_input = PreprocessingRuntimePrivateMpcStateInput::new::<MlDsa65>(
+            &statement,
+            relation_bits.clone(),
+            derived_carry_bits.clone(),
+            derived_cef_bits.clone(),
+            derived_bcc_bits.clone(),
+        )
+        .expect("runtime-private mpc input");
+        assert!(!format!("{runtime_private_input:?}").contains("lanes: ["));
+        assert_eq!(
+            PreprocessingRuntimePrivateMpcStateInput::new::<MlDsa65>(
+                &statement,
+                Vec::new(),
+                derived_carry_bits.clone(),
+                derived_cef_bits.clone(),
+                derived_bcc_bits.clone(),
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        let mut wrong_relation_bits = relation_bits.clone();
+        wrong_relation_bits[0] = adapter
+            .runtime
+            .bit_share_vec_from_local_lanes::<MlDsa65>(
+                &config,
+                &root
+                    .child("masked_broadcast_private")
+                    .child("wrong_relation"),
+                vec![0; statement.coeff_count],
+            )
+            .expect("wrong relation bit");
+        assert_eq!(
+            PreprocessingRuntimePrivateMpcStateInput::new::<MlDsa65>(
+                &statement,
+                wrong_relation_bits,
+                derived_carry_bits.clone(),
+                derived_cef_bits.clone(),
+                derived_bcc_bits.clone(),
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        let mut short_carry_bits = derived_carry_bits.clone();
+        short_carry_bits[0] = adapter
+            .runtime
+            .bit_share_vec_from_local_lanes::<MlDsa65>(
+                &config,
+                &root
+                    .child("carry_compare_private")
+                    .child("rho_sum_bits")
+                    .child("bit_0"),
+                vec![0; statement.coeff_count - 1],
+            )
+            .expect("short carry bit");
+        assert_eq!(
+            PreprocessingRuntimePrivateMpcStateInput::new::<MlDsa65>(
+                &statement,
+                relation_bits.clone(),
+                short_carry_bits,
+                derived_cef_bits.clone(),
+                derived_bcc_bits.clone(),
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        let mut wrong_label_bits = derived_carry_bits.clone();
+        wrong_label_bits[0] = adapter
+            .runtime
+            .bit_share_vec_from_local_lanes::<MlDsa65>(
+                &config,
+                &root.child("wrong_rho_sum_bit_0"),
+                vec![0; statement.coeff_count],
+            )
+            .expect("wrong-label carry bit");
+        assert_eq!(
+            adapter.private_material_handles_from_runtime_bits::<MlDsa65>(
+                &statement,
+                relation_bits.clone(),
+                wrong_label_bits,
+                derived_cef_bits.clone(),
+                derived_bcc_bits.clone(),
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        let mut short_bcc_bits = derived_bcc_bits.clone();
+        short_bcc_bits[0] = adapter
+            .runtime
+            .bit_share_vec_from_local_lanes::<MlDsa65>(
+                &config,
+                &root
+                    .child("cef_bcc_private")
+                    .child("bcc_violation_bits")
+                    .child("violation"),
+                vec![0; statement.coeff_count - 1],
+            )
+            .expect("short bcc bit");
+        assert_eq!(
+            adapter.private_material_handles_from_runtime_bits::<MlDsa65>(
+                &statement,
+                relation_bits,
+                derived_carry_bits,
+                derived_cef_bits,
+                short_bcc_bits,
+            ),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+
+        let err = adapter
+            .start_private_circuit_handles_from_preprocessing_material::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts[..1],
+                &private_material,
+            )
+            .expect_err("wrong broadcast material rejects");
+        assert_eq!(err, PreprocessError::CoeffCountMismatch);
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[test]
+    fn production_release_rejects_opened_material_private_state_source() {
+        let session_id = session(187);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let evidence = release_vector_runtime_evidence();
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope_with_vector_runtime_evidence::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    &evidence,
+                )
+                .expect("runtime-derived envelope")
+            })
+            .collect::<Vec<_>>();
+        let broadcasts =
+            open_broadcasts(session_id, &envelopes, transcript).expect("opened masked broadcasts");
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<MlDsa65>(
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+        )
+        .expect("runtime statement");
+        let config = talus_dkg::DkgConfig::new::<MlDsa65>(
+            2,
+            vec![PartyId(1), PartyId(2), PartyId(3)],
+            talus_dkg::KeygenEpoch(187),
+        )
+        .expect("dkg config");
+        let transport = talus_wire::InMemoryTransport::new(1, vec![1, 2, 3]).expect("transport");
+        let state = talus_dkg::TransportPrimeFieldMpcStateMachine::new(
+            config.clone(),
+            PartyId(1),
+            transport,
+        )
+        .expect("state machine");
+        let party_runtime = talus_dkg::TransportPrimeFieldMpcPartyRuntime::new(
+            state,
+            talus_dkg::InMemoryPrimeFieldMpcWireMessageLog::default(),
+        );
+        let mut runtime = talus_dkg::ProductionVectorPrimeFieldMpcRuntime::new(
+            talus_dkg::CursoredTransportPrimeFieldMpcPartyRuntime::new(
+                party_runtime,
+                talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog::default(),
+            ),
+        );
+        let adapter = ProductionPreprocessingCertificationRuntime::new(&mut runtime);
+        let private_state = adapter
+            .derive_private_material_state_from_opened_preprocessing::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+            )
+            .expect("opened-material state is derivable");
+
+        let err = adapter
+            .start_private_circuit_handles_from_state::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+                &private_state,
+            )
+            .expect_err("production-release rejects transitional source");
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+
+        let runtime_state = adapter
+            .derive_private_material_state_from_runtime_private_mpc_handles::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+            )
+            .expect("runtime-private state is derivable");
+        assert_eq!(
+            runtime_state.source(),
+            PreprocessingPrivateMaterialStateSource::RuntimePrivateMpc
+        );
+        adapter
+            .start_private_circuit_handles_from_state::<MlDsa65>(
+                &config,
+                &statement,
+                &broadcasts,
+                &runtime_state,
+            )
+            .expect("production-release accepts runtime-private source");
+
+        let (started_statement, started_broadcasts, started_state) = adapter
+            .start_private_circuit_handles_from_envelopes::<MlDsa65>(
+                &config, session_id, inputs, envelopes, transcript,
+            )
+            .expect("production-release starts envelopes from runtime-private source");
+        assert_eq!(started_statement, statement);
+        assert_eq!(started_broadcasts, broadcasts);
+        assert!(!started_state.is_done());
+    }
+
+    fn runtime_proofs_from_envelopes_and_preview<P: MlDsaParams>(
+        session_id: SessionId,
+        transcript_hash: TranscriptHash,
+        signer_count: usize,
+        coeff_count: usize,
+        envelopes: &[BroadcastEnvelope],
+        preview: &CertifiedToken,
+    ) -> PreprocessingCertificationRuntimeProofs {
+        let masked_hashes = envelopes
+            .iter()
+            .map(|envelope| {
+                decode_masked_broadcast_runtime_proof(&envelope.consistency_proof)
+                    .expect("typed masked-broadcast runtime proof")
+                    .runtime_transcript_hash
+            })
+            .collect::<Vec<_>>();
+        let carry_hash = preview
+            .certification_evidence
+            .carry_compare
+            .expect("carry evidence")
+            .evidence_hash;
+        let bcc_hash = preview
+            .certification_evidence
+            .bcc
+            .expect("bcc evidence")
+            .evidence_hash;
+        let carry_runtime_transcript = [0xc1; 32];
+        let bcc_runtime_transcript = [0xb1; 32];
+        let masked_broadcast = masked_broadcast_runtime_transcript_hash(
+            session_id,
+            transcript_hash,
+            signer_count,
+            coeff_count,
+            &masked_hashes,
+        );
+        PreprocessingCertificationRuntimeProofs {
+            masked_broadcast,
+            carry_compare: preprocessing_certification_stage_runtime_proof::<P>(
+                PreprocessingCertificationStage::CarryCompare,
+                session_id,
+                transcript_hash,
+                signer_count,
+                coeff_count,
+                carry_hash,
+                carry_runtime_transcript,
+            )
+            .expect("carry runtime proof"),
+            bcc: preprocessing_certification_stage_runtime_proof::<P>(
+                PreprocessingCertificationStage::Bcc,
+                session_id,
+                transcript_hash,
+                signer_count,
+                coeff_count,
+                bcc_hash,
+                bcc_runtime_transcript,
+            )
+            .expect("bcc runtime proof"),
+            outputs: PreprocessingCertificationRuntimeOutputs {
+                masked_broadcast: RuntimeMaskedBroadcastOutput {
+                    signer_count,
+                    coeff_count,
+                    runtime_transcript_hash: masked_broadcast,
+                    material_state_hash: [0xa5; 32],
+                },
+                carry_compare: RuntimeCarryCompareOutput {
+                    coeff_count,
+                    evidence_hash: carry_hash,
+                    runtime_transcript_hash: carry_runtime_transcript,
+                },
+                cef_bcc: RuntimeCefBccOutput {
+                    coeff_count,
+                    w1_hash: hash_runtime_w1_output::<P>(
+                        session_id,
+                        transcript_hash,
+                        &preview.signer_set,
+                        &preview.w1,
+                    ),
+                    carry_compare_evidence_hash: carry_hash,
+                    bcc_evidence_hash: bcc_hash,
+                    runtime_transcript_hash: bcc_runtime_transcript,
+                    token_admitted: true,
+                },
+            },
         }
     }
 
@@ -3846,6 +8878,12 @@ mod tests {
             assert!(
                 !payload.consistency_proof.is_empty(),
                 "production preprocessing open must carry a private consistency certificate"
+            );
+            assert!(
+                payload
+                    .consistency_proof
+                    .starts_with(MASKED_BROADCAST_RUNTIME_PROOF_PREFIX),
+                "production preprocessing proof must carry a typed runtime transcript binding"
             );
             let broadcast = MaskedBroadcast {
                 party,
@@ -4259,11 +9297,89 @@ mod tests {
             inputs,
             vec![envelope, envelope2],
             transcript,
+            None,
         )
         .expect_err("tampered private certificate rejects");
         assert_eq!(
             err,
             PreprocessError::MaskedBroadcastProofBackendUnavailable(PartyId(1))
+        );
+    }
+
+    #[test]
+    fn production_consistency_verifier_rejects_legacy_hash_only_certificate() {
+        let session_id = session(33);
+        let signer_set = vec![PartyId(1), PartyId(2)];
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let mut envelope = prepare_masked_broadcast_envelope::<MlDsa65>(
+            session_id,
+            &signer_set,
+            &inputs[0],
+            transcript,
+        )
+        .expect("masked envelope");
+        envelope.consistency_proof = MaskedBroadcastConsistencyProof {
+            bytes: {
+                let mut bytes = Vec::with_capacity(38);
+                bytes.extend_from_slice(b"TMBCC1");
+                bytes.extend_from_slice(&[0x42; 32]);
+                bytes
+            },
+        };
+        let envelope2 = prepare_masked_broadcast_envelope::<MlDsa65>(
+            session_id,
+            &signer_set,
+            &inputs[1],
+            transcript,
+        )
+        .expect("masked envelope");
+        let mut registry = SessionRegistry::new();
+        let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let err = certify_opened_masked_broadcasts_with_consistency::<MlDsa65, _>(
+            &mut verifier,
+            &mut registry,
+            session_id,
+            inputs,
+            vec![envelope, envelope2],
+            transcript,
+            None,
+        )
+        .expect_err("legacy hash-only private certificate rejects");
+        assert_eq!(
+            err,
+            PreprocessError::MaskedBroadcastProofBackendUnavailable(PartyId(1))
+        );
+    }
+
+    #[test]
+    fn production_consistency_verifier_accepts_external_runtime_transcript_hash() {
+        let session_id = session(35);
+        let signer_set = vec![PartyId(1), PartyId(2)];
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let envelope = prepare_masked_broadcast_envelope_with_runtime_transcript::<MlDsa65>(
+            session_id,
+            &signer_set,
+            &inputs[0],
+            transcript,
+            [0xa5; 32],
+        )
+        .expect("external-runtime envelope");
+        let statement = MaskedBroadcastConsistencyStatement {
+            session_id,
+            signer_set,
+            broadcast: envelope.message.clone(),
+            coeff_count: inputs[0].highs.len(),
+        };
+        let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+        assert_eq!(
+            verifier.verify_masked_broadcast::<MlDsa65>(
+                &statement,
+                &envelope.consistency_proof,
+                None,
+            ),
+            Ok(())
         );
     }
 
@@ -4292,6 +9408,7 @@ mod tests {
             &inputs,
             core::slice::from_ref(&broadcast),
             &[rhos],
+            None,
         )
         .expect("vector CEF certifies");
         assert_eq!(
@@ -4738,8 +9855,14 @@ mod tests {
                     ],
                 )
                 .expect("token certifies");
-                assert!(token.is_certified());
-                pool.insert_certified_with_inventory(token, &mut inventory)
+                let certificate = PreprocessingVectorRuntimeCertificate::for_token(
+                    &token,
+                    release_vector_runtime_evidence_for_token(&token),
+                )
+                .expect("release vector runtime certificate");
+                let token = token.with_vector_runtime_certificate(certificate);
+                assert!(token.is_release_certified());
+                pool.insert_release_certified_with_inventory(token, &mut inventory)
                     .expect("insert with inventory");
                 tokens.push(pool.take_certified(session_id).expect("take for counter"));
                 assert_eq!(inventory.state(session_id), TokenInventoryState::Reserved);
@@ -4812,12 +9935,1276 @@ mod tests {
             "release tokens must carry vector runtime evidence"
         );
 
-        let certificate =
-            PreprocessingVectorRuntimeCertificate::new(release_vector_runtime_evidence())
-                .expect("release vector runtime certificate");
+        let certificate = PreprocessingVectorRuntimeCertificate::for_token(
+            &token,
+            release_vector_runtime_evidence_for_token(&token),
+        )
+        .expect("release vector runtime certificate");
         let token = token.with_vector_runtime_certificate(certificate.clone());
         assert_eq!(token.vector_runtime_certificate(), Some(&certificate));
         assert!(token.is_certified());
+    }
+
+    #[test]
+    fn release_token_validation_requires_runtime_certificate_in_normal_build() {
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(65),
+            vec![input(1, &[1], &[3]), input(2, &[5], &[7])],
+        )
+        .expect("valid preprocessing certifies");
+
+        assert_eq!(
+            ensure_certified_token_release_valid(&token),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMissing)
+        );
+        assert!(!token.is_release_certified());
+
+        let mut pool = TokenPool::new();
+        assert_eq!(
+            pool.insert_release_certified(token),
+            Err(TokenPoolError::NotCertified(session(65)))
+        );
+    }
+
+    #[test]
+    fn release_token_validation_rejects_detached_runtime_certificate() {
+        let mut registry = SessionRegistry::new();
+        let token_a = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(65),
+            vec![input(1, &[1], &[3]), input(2, &[5], &[7])],
+        )
+        .expect("first preprocessing token certifies");
+        let token_b = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(67),
+            vec![input(1, &[2], &[4]), input(2, &[6], &[8])],
+        )
+        .expect("second preprocessing token certifies");
+        let certificate = PreprocessingVectorRuntimeCertificate::for_token(
+            &token_a,
+            release_vector_runtime_evidence_for_token(&token_a),
+        )
+        .expect("runtime certificate for token a");
+        let token_b = token_b.with_vector_runtime_certificate(certificate);
+
+        assert_eq!(
+            ensure_certified_token_release_valid(&token_b),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        assert!(!token_b.is_release_certified());
+    }
+
+    #[cfg(feature = "production-release-checks")]
+    #[test]
+    fn production_release_checks_make_is_certified_require_release_valid_certificate() {
+        let mut registry = SessionRegistry::new();
+        let token_a = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(165),
+            vec![input(1, &[1], &[3]), input(2, &[5], &[7])],
+        )
+        .expect("first preprocessing token certifies");
+        let token_b = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(167),
+            vec![input(1, &[2], &[4]), input(2, &[6], &[8])],
+        )
+        .expect("second preprocessing token certifies");
+        let detached_certificate = PreprocessingVectorRuntimeCertificate::for_token(
+            &token_a,
+            release_vector_runtime_evidence_for_token(&token_a),
+        )
+        .expect("runtime certificate for token a");
+        let token_b = token_b.with_vector_runtime_certificate(detached_certificate);
+
+        assert!(!token_b.is_release_certified());
+        assert!(!token_b.is_certified());
+
+        let mut pool = TokenPool::new();
+        assert_eq!(
+            pool.insert_certified(token_b),
+            Err(TokenPoolError::NotCertified(session(167)))
+        );
+    }
+
+    #[test]
+    fn release_token_validation_rejects_runtime_transcript_mismatch() {
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(69),
+            vec![input(1, &[1], &[3]), input(2, &[5], &[7])],
+        )
+        .expect("valid preprocessing certifies");
+        let certificate = PreprocessingVectorRuntimeCertificate::for_token(
+            &token,
+            release_vector_runtime_evidence(),
+        )
+        .expect("runtime certificate with mismatched transcript");
+        let token = token.with_vector_runtime_certificate(certificate);
+
+        assert_eq!(
+            ensure_certified_token_release_valid(&token),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        assert!(!token.is_release_certified());
+    }
+
+    #[test]
+    fn release_token_validation_rejects_mutated_runtime_evidence_surface() {
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(75),
+            vec![input(1, &[1], &[3]), input(2, &[5], &[7])],
+        )
+        .expect("valid preprocessing certifies");
+        let mut certificate = PreprocessingVectorRuntimeCertificate::for_token(
+            &token,
+            release_vector_runtime_evidence_for_token(&token),
+        )
+        .expect("runtime certificate");
+        certificate
+            .runtime_evidence_mut_for_test()
+            .counters
+            .wire_bytes += 1;
+        let token = token.with_vector_runtime_certificate(certificate);
+
+        assert_eq!(
+            ensure_certified_token_release_valid(&token),
+            Err(PreprocessError::PreprocessingRuntimeCertificateMismatch)
+        );
+        assert!(!token.is_release_certified());
+    }
+
+    #[test]
+    fn release_token_validation_rejects_runtime_counters_below_token_lanes() {
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(68),
+            vec![
+                input(1, &[1, 2, 3], &[3, 4, 5]),
+                input(2, &[5, 6, 7], &[7, 8, 9]),
+            ],
+        )
+        .expect("valid preprocessing certifies");
+        let mut evidence = release_vector_runtime_evidence();
+        evidence.transcript_hash = token
+            .certification_evidence
+            .masked_broadcast
+            .expect("masked-broadcast evidence")
+            .runtime_transcript_hash;
+        evidence.counters.vector_lanes = 1;
+        evidence.counters.vector_mul_lanes = 1;
+        evidence.counters.vector_opening_lanes = 1;
+        evidence.counters.vector_assert_zero_lanes = 1;
+        evidence.counters.random_bits = 1;
+        evidence.counters.local_public_mul_lanes = 1;
+        let certificate = PreprocessingVectorRuntimeCertificate::for_token(&token, evidence)
+            .expect("runtime evidence still passes generic Phase 3 gate");
+        let token = token.with_vector_runtime_certificate(certificate);
+
+        assert_eq!(
+            ensure_certified_token_release_valid(&token),
+            Err(PreprocessError::PreprocessingCountersNotVectorized)
+        );
+        assert!(!token.is_release_certified());
+    }
+
+    #[test]
+    fn release_token_validation_rejects_runtime_opening_lanes_below_masked_broadcast_lanes() {
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token::<MlDsa65>(
+            &mut registry,
+            session(76),
+            vec![
+                input(1, &[1, 2, 3], &[3, 4, 5]),
+                input(2, &[5, 6, 7], &[7, 8, 9]),
+            ],
+        )
+        .expect("valid preprocessing certifies");
+        let mut evidence = release_vector_runtime_evidence_for_token(&token);
+        let counters = PreprocessingCertificationCounters::from_token(&token);
+        evidence.counters.vector_lanes = (counters.vector_lanes
+            + counters.carry_compare_lanes
+            + counters.cef_correction_lanes
+            + counters.bcc_lanes) as u64;
+        evidence.counters.vector_opening_lanes = counters.vector_lanes as u64 - 1;
+        let certificate = PreprocessingVectorRuntimeCertificate::for_token(&token, evidence)
+            .expect("generic Phase 3 evidence still passes");
+        let token = token.with_vector_runtime_certificate(certificate);
+
+        assert_eq!(
+            ensure_certified_token_release_valid(&token),
+            Err(PreprocessError::PreprocessingCountersNotVectorized)
+        );
+        assert!(!token.is_release_certified());
+    }
+
+    #[test]
+    fn release_token_constructor_attaches_runtime_certificate_to_pool_output() {
+        let inputs = vec![input(1, &[1], &[3]), input(2, &[5], &[7])];
+        let mut preview_registry = SessionRegistry::new();
+        let preview = certify_preprocessing_token::<MlDsa65>(
+            &mut preview_registry,
+            session(66),
+            inputs.clone(),
+        )
+        .expect("preview token certifies");
+        let evidence = release_vector_runtime_evidence_for_token(&preview);
+        let mut registry = SessionRegistry::new();
+        let token = certify_preprocessing_token_release_validated::<MlDsa65>(
+            &mut registry,
+            session(66),
+            inputs,
+            evidence,
+        )
+        .expect("release token certifies");
+
+        assert!(token.vector_runtime_certificate().is_some());
+        assert!(token.is_release_certified());
+        assert_eq!(ensure_certified_token_release_valid(&token), Ok(()));
+
+        let mut pool = TokenPool::new();
+        let mut inventory = TokenInventory::new();
+        pool.insert_release_certified_with_inventory(token, &mut inventory)
+            .expect("release token enters release pool");
+        assert_eq!(inventory.state(session(66)), TokenInventoryState::Reserved);
+    }
+
+    #[test]
+    fn release_token_from_runtime_envelopes_attaches_certificate() {
+        let session_id = session(70);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let envelopes = inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| {
+                prepare_masked_broadcast_envelope_with_runtime_transcript::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    [0x90u8.wrapping_add(idx as u8); 32],
+                )
+                .expect("runtime envelope")
+            })
+            .collect::<Vec<_>>();
+
+        let mut preview_registry = SessionRegistry::new();
+        let mut preview_verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let preview = certify_opened_masked_broadcasts_with_consistency::<MlDsa65, _>(
+            &mut preview_verifier,
+            &mut preview_registry,
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+            None,
+        )
+        .expect("preview token certifies");
+        let runtime_proofs = runtime_proofs_from_envelopes_and_preview::<MlDsa65>(
+            session_id,
+            transcript,
+            signer_set.len(),
+            inputs[0].highs.len(),
+            &envelopes,
+            &preview,
+        );
+        let mut evidence = release_vector_runtime_evidence();
+        let runtime_transcripts = runtime_proofs
+            .transcripts()
+            .expect("runtime proof transcripts");
+        evidence.transcript_hash = preprocessing_runtime_transcript_aggregate_hash(
+            session_id,
+            transcript,
+            runtime_transcripts,
+        )
+        .expect("aggregate preprocessing runtime transcript");
+
+        let mut registry = SessionRegistry::new();
+        let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let token = certify_preprocessing_token_release_validated_from_envelopes::<MlDsa65, _>(
+            &mut verifier,
+            &mut registry,
+            session_id,
+            inputs,
+            envelopes,
+            transcript,
+            runtime_proofs,
+            evidence,
+        )
+        .expect("release token from envelopes certifies");
+
+        assert!(token.is_release_certified());
+        assert!(token.vector_runtime_certificate().is_some());
+    }
+
+    #[test]
+    fn release_token_from_runtime_envelopes_rejects_mismatched_runtime_transcripts() {
+        let session_id = session(71);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let envelopes = inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| {
+                prepare_masked_broadcast_envelope_with_runtime_transcript::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    [0xa0u8.wrapping_add(idx as u8); 32],
+                )
+                .expect("runtime envelope")
+            })
+            .collect::<Vec<_>>();
+        let mut preview_registry = SessionRegistry::new();
+        let mut preview_verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let preview = certify_opened_masked_broadcasts_with_consistency::<MlDsa65, _>(
+            &mut preview_verifier,
+            &mut preview_registry,
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+            None,
+        )
+        .expect("preview token certifies");
+        let mut runtime_proofs = runtime_proofs_from_envelopes_and_preview::<MlDsa65>(
+            session_id,
+            transcript,
+            signer_set.len(),
+            inputs[0].highs.len(),
+            &envelopes,
+            &preview,
+        );
+        runtime_proofs.masked_broadcast = [0x55; 32];
+        runtime_proofs
+            .outputs
+            .masked_broadcast
+            .runtime_transcript_hash = [0x55; 32];
+        let mut evidence = release_vector_runtime_evidence();
+        let runtime_transcripts = runtime_proofs
+            .transcripts()
+            .expect("runtime proof transcripts");
+        evidence.transcript_hash = preprocessing_runtime_transcript_aggregate_hash(
+            session_id,
+            transcript,
+            runtime_transcripts,
+        )
+        .expect("aggregate preprocessing runtime transcript");
+
+        let mut registry = SessionRegistry::new();
+        let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let err = certify_preprocessing_token_release_validated_from_envelopes::<MlDsa65, _>(
+            &mut verifier,
+            &mut registry,
+            session_id,
+            inputs,
+            envelopes,
+            transcript,
+            runtime_proofs,
+            evidence,
+        )
+        .expect_err("mismatched masked-broadcast runtime transcript rejects");
+
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    #[test]
+    fn release_token_from_runtime_envelopes_rejects_tampered_stage_runtime_proof() {
+        let session_id = session(72);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let envelopes = inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| {
+                prepare_masked_broadcast_envelope_with_runtime_transcript::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    [0xb0u8.wrapping_add(idx as u8); 32],
+                )
+                .expect("runtime envelope")
+            })
+            .collect::<Vec<_>>();
+        let mut preview_registry = SessionRegistry::new();
+        let mut preview_verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let preview = certify_opened_masked_broadcasts_with_consistency::<MlDsa65, _>(
+            &mut preview_verifier,
+            &mut preview_registry,
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+            None,
+        )
+        .expect("preview token certifies");
+        let mut runtime_proofs = runtime_proofs_from_envelopes_and_preview::<MlDsa65>(
+            session_id,
+            transcript,
+            signer_set.len(),
+            inputs[0].highs.len(),
+            &envelopes,
+            &preview,
+        );
+        runtime_proofs.carry_compare.bytes[7] ^= 0x44;
+        let mut evidence = release_vector_runtime_evidence();
+        let runtime_transcripts = runtime_proofs
+            .transcripts()
+            .expect("runtime proof transcripts remain decodable");
+        evidence.transcript_hash = preprocessing_runtime_transcript_aggregate_hash(
+            session_id,
+            transcript,
+            runtime_transcripts,
+        )
+        .expect("aggregate preprocessing runtime transcript");
+
+        let mut registry = SessionRegistry::new();
+        let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let err = certify_preprocessing_token_release_validated_from_envelopes::<MlDsa65, _>(
+            &mut verifier,
+            &mut registry,
+            session_id,
+            inputs,
+            envelopes,
+            transcript,
+            runtime_proofs,
+            evidence,
+        )
+        .expect_err("tampered CarryCompare runtime proof rejects");
+
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    #[test]
+    fn release_token_with_finished_runtime_driver_rejects_unfinished_state() {
+        let session_id = session(102);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let evidence = release_vector_runtime_evidence();
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope_with_vector_runtime_evidence::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    &evidence,
+                )
+                .expect("runtime-derived envelope")
+            })
+            .collect::<Vec<_>>();
+        let config = talus_dkg::DkgConfig::new::<MlDsa65>(
+            2,
+            vec![PartyId(1), PartyId(2), PartyId(3)],
+            talus_dkg::KeygenEpoch(102),
+        )
+        .expect("dkg config");
+        let transport = talus_wire::InMemoryTransport::new(1, vec![1, 2, 3]).expect("transport");
+        let state = talus_dkg::TransportPrimeFieldMpcStateMachine::new(
+            config.clone(),
+            PartyId(1),
+            transport,
+        )
+        .expect("state machine");
+        let party_runtime = talus_dkg::TransportPrimeFieldMpcPartyRuntime::new(
+            state,
+            talus_dkg::InMemoryPrimeFieldMpcWireMessageLog::default(),
+        );
+        let mut vector_runtime = talus_dkg::ProductionVectorPrimeFieldMpcRuntime::new(
+            talus_dkg::CursoredTransportPrimeFieldMpcPartyRuntime::new(
+                party_runtime,
+                talus_dkg::InMemoryPrimeFieldMpcPhaseCursorLog::default(),
+            ),
+        );
+        let mut adapter = ProductionPreprocessingCertificationRuntime::new(&mut vector_runtime);
+        let (_, _, unfinished_state) = adapter
+            .start_private_circuit_handles_from_envelopes::<MlDsa65>(
+                &config,
+                session_id,
+                inputs.clone(),
+                envelopes.clone(),
+                transcript,
+            )
+            .expect("start from release envelopes");
+
+        let mut registry = SessionRegistry::new();
+        let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let err = certify_preprocessing_token_release_validated_with_finished_runtime_driver::<
+            MlDsa65,
+            _,
+            _,
+            _,
+            _,
+        >(
+            &mut verifier,
+            &mut registry,
+            session_id,
+            inputs,
+            envelopes,
+            transcript,
+            &mut adapter,
+            &unfinished_state,
+        )
+        .expect_err("unfinished private runtime driver must reject");
+
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    fn runtime_release_tokens_for_inputs(
+        config: &DkgConfig,
+        session_id: SessionId,
+        inputs: Vec<PartyPreprocessInput>,
+    ) -> Result<(Vec<CertifiedToken>, Vec<BroadcastEnvelope>, TranscriptHash), PreprocessError>
+    {
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                )
+                .expect("masked-broadcast envelope")
+            })
+            .collect::<Vec<_>>();
+        runtime_release_tokens_from_envelopes(config, session_id, inputs, envelopes, transcript)
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    fn runtime_release_tokens_from_envelopes(
+        config: &DkgConfig,
+        session_id: SessionId,
+        inputs: Vec<PartyPreprocessInput>,
+        envelopes: Vec<BroadcastEnvelope>,
+        transcript: TranscriptHash,
+    ) -> Result<(Vec<CertifiedToken>, Vec<BroadcastEnvelope>, TranscriptHash), PreprocessError>
+    {
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<MlDsa65>(
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+        )?;
+        let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+        let mut states = Vec::new();
+
+        for runtime in &mut runtimes {
+            let adapter = ProductionPreprocessingCertificationRuntime::new(runtime);
+            let (started_statement, _, state) = adapter
+                .start_private_circuit_handles_from_envelopes::<MlDsa65>(
+                    &config,
+                    session_id,
+                    inputs.clone(),
+                    envelopes.clone(),
+                    transcript,
+                )
+                .map_err(|err| err)?;
+            assert_eq!(started_statement, statement);
+            states.push(state);
+        }
+
+        let mut round = 0u64;
+        while states.iter().any(|state| !state.is_done()) {
+            for (idx, runtime) in runtimes.iter_mut().enumerate() {
+                if states[idx].is_done() {
+                    continue;
+                }
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 90_000 + round * 10_000 + idx as u64 * 1_000,
+                };
+                let mut adapter = ProductionPreprocessingCertificationRuntime::new(runtime);
+                adapter
+                    .drive_private_circuit_handles_step::<MlDsa65, _>(
+                        &config,
+                        &mut states[idx],
+                        &mut entropy,
+                    )
+                    .map_err(|err| err)?;
+            }
+            route_production_vector_messages(&mut runtimes);
+            for (idx, runtime) in runtimes.iter_mut().enumerate() {
+                if states[idx].is_done() {
+                    continue;
+                }
+                let mut adapter = ProductionPreprocessingCertificationRuntime::new(runtime);
+                match adapter
+                    .collect_private_circuit_handles_step::<MlDsa65>(&config, &mut states[idx])
+                    .map_err(|err| err)?
+                {
+                    ProductionVectorItMpcCollectResult::Collected { .. } => {}
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        panic!("private preprocessing step did not complete: {status:?}")
+                    }
+                }
+            }
+            clear_production_vector_message_queues(&mut runtimes);
+            round = round.saturating_add(1);
+            assert!(
+                round < 256,
+                "private preprocessing circuits did not converge"
+            );
+        }
+
+        let mut tokens = Vec::new();
+        for (idx, runtime) in runtimes.iter_mut().enumerate() {
+            let mut adapter = ProductionPreprocessingCertificationRuntime::new(runtime);
+            let mut registry = SessionRegistry::new();
+            let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+            let token =
+                certify_preprocessing_token_release_validated_with_finished_runtime_driver::<
+                    MlDsa65,
+                    _,
+                    _,
+                    _,
+                    _,
+                >(
+                    &mut verifier,
+                    &mut registry,
+                    session_id,
+                    inputs.clone(),
+                    envelopes.clone(),
+                    transcript,
+                    &mut adapter,
+                    &states[idx],
+                )
+                .map_err(|err| err)?;
+            assert!(token.is_release_certified());
+            tokens.push(token);
+        }
+
+        Ok((tokens, envelopes, transcript))
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    #[test]
+    fn all_party_runtime_driven_preprocessing_builds_release_tokens() {
+        let config = talus_dkg::DkgConfig::new::<MlDsa65>(
+            2,
+            vec![PartyId(1), PartyId(2), PartyId(3)],
+            talus_dkg::KeygenEpoch(103),
+        )
+        .expect("dkg config");
+        let rho = [0x77; 32];
+        let signer_set = config.parties.clone();
+        let mut accepted = None;
+
+        for attempt in 0..24u8 {
+            let session_id = session(103u8.wrapping_add(attempt));
+            let nonce =
+                generate_distributed_nonce_shares::<MlDsa65>(DistributedNonceGenerationOptions {
+                    session_id,
+                    dkg_config: config.clone(),
+                    rho,
+                    nonce_entropy: [0x71u8.wrapping_add(attempt); 32],
+                    it_vss_entropy: [0x91u8.wrapping_add(attempt); 32],
+                    it_vss_security: talus_dkg::ProductionItVssSecurityParams {
+                        audit_tags: 1,
+                        retained_tags: 1,
+                        consistency_rounds: 1,
+                        max_vector_lanes_per_chunk: 32_000,
+                        max_private_delivery_bytes: 16 * 1024 * 1024,
+                    },
+                })
+                .expect("distributed nonce generation");
+            let inputs = nonce
+                .shares
+                .iter()
+                .map(|share| {
+                    party_preprocess_input_from_distributed_nonce_share::<MlDsa65>(
+                        session_id,
+                        &signer_set,
+                        &rho,
+                        share,
+                    )
+                    .expect("nonce-backed preprocessing input")
+                })
+                .collect::<Vec<_>>();
+            match runtime_release_tokens_for_inputs(&config, session_id, inputs) {
+                Ok((tokens, _, _)) => {
+                    accepted = Some((session_id, nonce, tokens));
+                    break;
+                }
+                Err(err) if err.is_retryable_pre_challenge() => continue,
+                Err(err) => panic!("unexpected runtime-driven preprocessing error: {err:?}"),
+            }
+        }
+
+        let (session_id, nonce, tokens) =
+            accepted.expect("BCC-cleared nonce preprocessing release token");
+        assert_eq!(nonce.shares.len(), signer_set.len());
+
+        for token in &tokens {
+            assert_eq!(token.w1, tokens[0].w1);
+            assert_eq!(token.signer_set, signer_set);
+            assert_eq!(token.broadcasts.len(), signer_set.len());
+            assert!(token.vector_runtime_certificate().is_some());
+            assert_eq!(token.session_id, session_id);
+            assert!(token.y_share.is_empty());
+        }
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    #[test]
+    fn runtime_release_preprocessing_rejects_replayed_masked_broadcast() {
+        let session_id = session(136);
+        let inputs = vec![
+            input(1, &[1, 2], &[3, 4]),
+            input(2, &[5, 6], &[7, 8]),
+            input(3, &[9, 10], &[11, 12]),
+        ];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let config = talus_dkg::DkgConfig::new::<MlDsa65>(
+            2,
+            signer_set.clone(),
+            talus_dkg::KeygenEpoch(136),
+        )
+        .expect("dkg config");
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let mut envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                )
+                .expect("envelope")
+            })
+            .collect::<Vec<_>>();
+        envelopes[1] = envelopes[0].clone();
+
+        let err = runtime_release_tokens_from_envelopes(
+            &config, session_id, inputs, envelopes, transcript,
+        )
+        .expect_err("replayed masked broadcast rejects");
+        assert!(matches!(
+            err,
+            PreprocessError::MaskedBroadcastConsistencyMismatch(_)
+                | PreprocessError::PreprocessingRuntimeCertificateMismatch
+        ));
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    #[test]
+    fn runtime_release_preprocessing_rejects_wrong_transcript_and_signer_set() {
+        let session_id = session(137);
+        let inputs = vec![
+            input(1, &[1, 2], &[3, 4]),
+            input(2, &[5, 6], &[7, 8]),
+            input(3, &[9, 10], &[11, 12]),
+        ];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let config = talus_dkg::DkgConfig::new::<MlDsa65>(
+            2,
+            signer_set.clone(),
+            talus_dkg::KeygenEpoch(137),
+        )
+        .expect("dkg config");
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                )
+                .expect("envelope")
+            })
+            .collect::<Vec<_>>();
+        let wrong_transcript = TranscriptHash([0x44; 32]);
+        let err = runtime_release_tokens_from_envelopes(
+            &config,
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            wrong_transcript,
+        )
+        .expect_err("wrong transcript rejects");
+        assert!(matches!(
+            err,
+            PreprocessError::TranscriptMismatch(_)
+                | PreprocessError::MaskedBroadcastConsistencyMismatch(_)
+                | PreprocessError::PreprocessingRuntimeCertificateMismatch
+        ));
+
+        let wrong_signer_set = vec![PartyId(1), PartyId(2)];
+        let wrong_envelopes = inputs
+            .iter()
+            .map(|input| {
+                prepare_masked_broadcast_envelope::<MlDsa65>(
+                    session_id,
+                    &wrong_signer_set,
+                    input,
+                    transcript,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>();
+        assert!(wrong_envelopes.is_err());
+    }
+
+    #[cfg(feature = "scaffold-dev")]
+    #[test]
+    fn release_preprocessing_inventory_blocks_reused_nonce_token_after_restart() {
+        let session_id = session(138);
+        let inputs = vec![
+            input(1, &[1, 2], &[3, 4]),
+            input(2, &[5, 6], &[7, 8]),
+            input(3, &[9, 10], &[11, 12]),
+        ];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let config =
+            talus_dkg::DkgConfig::new::<MlDsa65>(2, signer_set, talus_dkg::KeygenEpoch(138))
+                .expect("dkg config");
+        let (mut tokens, _, _) =
+            runtime_release_tokens_for_inputs(&config, session_id, inputs).expect("release tokens");
+        let token = tokens.remove(0);
+
+        let mut pool = TokenPool::new();
+        let mut inventory = TokenInventory::new();
+        pool.insert_release_certified_with_inventory(token, &mut inventory)
+            .expect("insert release token");
+        assert_eq!(inventory.state(session_id), TokenInventoryState::Reserved);
+
+        let duplicate = tokens.remove(0);
+        assert_eq!(
+            pool.insert_release_certified_with_inventory(duplicate, &mut inventory),
+            Err(TokenPoolError::InvalidInventoryTransition {
+                session_id,
+                from: TokenInventoryState::Reserved,
+                to: TokenInventoryState::Reserved,
+            })
+        );
+    }
+
+    #[cfg(all(feature = "std", feature = "scaffold-dev"))]
+    #[test]
+    fn file_inventory_blocks_release_token_reuse_across_restart() {
+        let session_id = session(139);
+        let inputs = vec![
+            input(1, &[1, 2], &[3, 4]),
+            input(2, &[5, 6], &[7, 8]),
+            input(3, &[9, 10], &[11, 12]),
+        ];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let config =
+            talus_dkg::DkgConfig::new::<MlDsa65>(2, signer_set, talus_dkg::KeygenEpoch(139))
+                .expect("dkg config");
+        let (mut tokens, _, _) =
+            runtime_release_tokens_for_inputs(&config, session_id, inputs).expect("release tokens");
+        let token = tokens.remove(0);
+        let duplicate = tokens.remove(0);
+        let path = std::env::temp_dir().join(format!(
+            "talus-mpc-preprocessing-token-inventory-{}-{}.log",
+            std::process::id(),
+            Hex32(session_id.0)
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let inventory = FileTokenInventory::open(&path).expect("open empty inventory");
+            assert_eq!(inventory.state(session_id), TokenInventoryState::Fresh);
+        }
+        {
+            let mut pool = TokenPool::new();
+            let mut inventory = FileTokenInventory::open(&path).expect("reopen before insert");
+            pool.insert_release_certified_with_inventory(token, &mut inventory)
+                .expect("insert release token");
+            assert_eq!(inventory.state(session_id), TokenInventoryState::Reserved);
+        }
+        {
+            let mut pool = TokenPool::new();
+            let mut inventory = FileTokenInventory::open(&path).expect("reopen after insert");
+            assert_eq!(inventory.state(session_id), TokenInventoryState::Reserved);
+            assert_eq!(
+                pool.insert_release_certified_with_inventory(duplicate, &mut inventory),
+                Err(TokenPoolError::InvalidInventoryTransition {
+                    session_id,
+                    from: TokenInventoryState::Reserved,
+                    to: TokenInventoryState::Reserved,
+                })
+            );
+            inventory
+                .consume(session_id)
+                .expect("consume reserved token");
+        }
+        {
+            let inventory = FileTokenInventory::open(&path).expect("reopen consumed inventory");
+            assert_eq!(inventory.state(session_id), TokenInventoryState::Consumed);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn release_token_with_runtime_boundary_attaches_certificate() {
+        let session_id = session(73);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let envelopes = inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| {
+                prepare_masked_broadcast_envelope_with_runtime_transcript::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    [0xc0u8.wrapping_add(idx as u8); 32],
+                )
+                .expect("runtime envelope")
+            })
+            .collect::<Vec<_>>();
+
+        let mut preview_registry = SessionRegistry::new();
+        let mut preview_verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let preview = certify_opened_masked_broadcasts_with_consistency::<MlDsa65, _>(
+            &mut preview_verifier,
+            &mut preview_registry,
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+            None,
+        )
+        .expect("preview token certifies");
+        let runtime_proofs = runtime_proofs_from_envelopes_and_preview::<MlDsa65>(
+            session_id,
+            transcript,
+            signer_set.len(),
+            inputs[0].highs.len(),
+            &envelopes,
+            &preview,
+        );
+        let mut evidence = release_vector_runtime_evidence();
+        evidence.transcript_hash = preprocessing_runtime_transcript_aggregate_hash(
+            session_id,
+            transcript,
+            runtime_proofs
+                .transcripts()
+                .expect("runtime proof transcripts"),
+        )
+        .expect("aggregate preprocessing runtime transcript");
+
+        let mut registry = SessionRegistry::new();
+        let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let token = certify_preprocessing_token_release_validated_from_envelopes::<MlDsa65, _>(
+            &mut verifier,
+            &mut registry,
+            session_id,
+            inputs,
+            envelopes,
+            transcript,
+            runtime_proofs,
+            evidence,
+        )
+        .expect("release token certifies through internal runtime boundary");
+
+        assert!(token.is_release_certified());
+        assert!(token.vector_runtime_certificate().is_some());
+    }
+
+    #[test]
+    fn release_token_with_runtime_boundary_rejects_wrong_stage_statement() {
+        let session_id = session(74);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let envelopes = inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| {
+                prepare_masked_broadcast_envelope_with_runtime_transcript::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    [0xd0u8.wrapping_add(idx as u8); 32],
+                )
+                .expect("runtime envelope")
+            })
+            .collect::<Vec<_>>();
+
+        let statement = preprocessing_certification_runtime_statement_from_envelopes::<MlDsa65>(
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+        )
+        .expect("runtime statement");
+        let mut wrong_carry_hash = statement.carry_compare_evidence_hash;
+        wrong_carry_hash[0] ^= 0x7a;
+        let carry_runtime_transcript = [0xe1; 32];
+        let bcc_runtime_transcript = [0xe2; 32];
+        let runtime_proofs = PreprocessingCertificationRuntimeProofs {
+            masked_broadcast: statement.masked_broadcast_runtime_transcript,
+            carry_compare: preprocessing_certification_stage_runtime_proof::<MlDsa65>(
+                PreprocessingCertificationStage::CarryCompare,
+                statement.session_id,
+                statement.transcript_hash,
+                statement.signer_set.len(),
+                statement.coeff_count,
+                wrong_carry_hash,
+                carry_runtime_transcript,
+            )
+            .expect("wrong carry runtime proof"),
+            bcc: preprocessing_certification_stage_runtime_proof::<MlDsa65>(
+                PreprocessingCertificationStage::Bcc,
+                statement.session_id,
+                statement.transcript_hash,
+                statement.signer_set.len(),
+                statement.coeff_count,
+                statement.bcc_evidence_hash,
+                bcc_runtime_transcript,
+            )
+            .expect("bcc runtime proof"),
+            outputs: PreprocessingCertificationRuntimeOutputs {
+                masked_broadcast: RuntimeMaskedBroadcastOutput {
+                    signer_count: statement.signer_set.len(),
+                    coeff_count: statement.coeff_count,
+                    runtime_transcript_hash: statement.masked_broadcast_runtime_transcript,
+                    material_state_hash: [0xa7; 32],
+                },
+                carry_compare: RuntimeCarryCompareOutput {
+                    coeff_count: statement.coeff_count,
+                    evidence_hash: wrong_carry_hash,
+                    runtime_transcript_hash: carry_runtime_transcript,
+                },
+                cef_bcc: RuntimeCefBccOutput {
+                    coeff_count: statement.coeff_count,
+                    w1_hash: statement.w1_hash,
+                    carry_compare_evidence_hash: wrong_carry_hash,
+                    bcc_evidence_hash: statement.bcc_evidence_hash,
+                    runtime_transcript_hash: bcc_runtime_transcript,
+                    token_admitted: true,
+                },
+            },
+        };
+        let mut evidence = release_vector_runtime_evidence();
+        evidence.transcript_hash = preprocessing_runtime_transcript_aggregate_hash(
+            statement.session_id,
+            statement.transcript_hash,
+            runtime_proofs
+                .transcripts()
+                .expect("runtime proof transcripts"),
+        )
+        .expect("aggregate preprocessing runtime transcript");
+
+        let mut registry = SessionRegistry::new();
+        let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let err = certify_preprocessing_token_release_validated_from_envelopes::<MlDsa65, _>(
+            &mut verifier,
+            &mut registry,
+            session_id,
+            inputs,
+            envelopes,
+            transcript,
+            runtime_proofs,
+            evidence,
+        )
+        .expect_err("wrong CarryCompare statement proof rejects");
+
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    fn release_token_with_mutated_runtime_outputs(
+        name: &'static str,
+        mutate: impl FnOnce(&mut PreprocessingCertificationRuntimeProofs),
+    ) -> PreprocessError {
+        let session_id = session(83);
+        let inputs = vec![input(1, &[1, 2], &[3, 4]), input(2, &[5, 6], &[7, 8])];
+        let signer_set = inputs.iter().map(|input| input.party).collect::<Vec<_>>();
+        let transcript = transcript_hash::<MlDsa65>(session_id, &inputs);
+        let envelopes = inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| {
+                prepare_masked_broadcast_envelope_with_runtime_transcript::<MlDsa65>(
+                    session_id,
+                    &signer_set,
+                    input,
+                    transcript,
+                    [0xe0u8.wrapping_add(idx as u8); 32],
+                )
+                .expect("runtime envelope")
+            })
+            .collect::<Vec<_>>();
+        let mut preview_registry = SessionRegistry::new();
+        let mut preview_verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let preview = certify_opened_masked_broadcasts_with_consistency::<MlDsa65, _>(
+            &mut preview_verifier,
+            &mut preview_registry,
+            session_id,
+            inputs.clone(),
+            envelopes.clone(),
+            transcript,
+            None,
+        )
+        .expect("preview token certifies");
+        let mut runtime_proofs = runtime_proofs_from_envelopes_and_preview::<MlDsa65>(
+            session_id,
+            transcript,
+            signer_set.len(),
+            inputs[0].highs.len(),
+            &envelopes,
+            &preview,
+        );
+        mutate(&mut runtime_proofs);
+        let mut evidence = release_vector_runtime_evidence();
+        evidence.transcript_hash = preprocessing_runtime_transcript_aggregate_hash(
+            session_id,
+            transcript,
+            runtime_proofs
+                .transcripts()
+                .expect("runtime proof transcripts"),
+        )
+        .expect("aggregate preprocessing runtime transcript");
+
+        let mut registry = SessionRegistry::new();
+        let mut verifier = ProductMaskedBroadcastConsistencyVerifier;
+        let err = certify_preprocessing_token_release_validated_from_envelopes::<MlDsa65, _>(
+            &mut verifier,
+            &mut registry,
+            session_id,
+            inputs,
+            envelopes,
+            transcript,
+            runtime_proofs,
+            evidence,
+        )
+        .expect_err(name);
+        err
+    }
+
+    #[test]
+    fn release_token_rejects_forged_runtime_owned_cef_bcc_output() {
+        let err = release_token_with_mutated_runtime_outputs(
+            "forged runtime-owned w1 output rejects",
+            |runtime_proofs| {
+                runtime_proofs.outputs.cef_bcc.w1_hash[0] ^= 0x5a;
+            },
+        );
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    #[test]
+    fn release_token_rejects_forged_runtime_owned_carry_output() {
+        let err = release_token_with_mutated_runtime_outputs(
+            "forged runtime-owned CarryCompare output rejects",
+            |runtime_proofs| {
+                runtime_proofs.outputs.carry_compare.evidence_hash[0] ^= 0x33;
+            },
+        );
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    #[test]
+    fn release_token_rejects_runtime_output_transcript_mismatch() {
+        let err = release_token_with_mutated_runtime_outputs(
+            "runtime output transcript mismatch rejects",
+            |runtime_proofs| {
+                runtime_proofs.outputs.cef_bcc.runtime_transcript_hash[0] ^= 0x44;
+            },
+        );
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    #[test]
+    fn release_token_rejects_forged_runtime_owned_masked_broadcast_output() {
+        let err = release_token_with_mutated_runtime_outputs(
+            "forged runtime-owned masked-broadcast output rejects",
+            |runtime_proofs| {
+                runtime_proofs.outputs.masked_broadcast.signer_count += 1;
+            },
+        );
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    #[test]
+    fn release_token_rejects_runtime_output_token_not_admitted() {
+        let err = release_token_with_mutated_runtime_outputs(
+            "runtime output token admission false rejects",
+            |runtime_proofs| {
+                runtime_proofs.outputs.cef_bcc.token_admitted = false;
+            },
+        );
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    #[test]
+    fn release_token_rejects_forged_cef_correction_output() {
+        let err = release_token_with_mutated_runtime_outputs(
+            "forged CEF correction transcript rejects",
+            |runtime_proofs| {
+                runtime_proofs.outputs.cef_bcc.runtime_transcript_hash[1] ^= 0xa5;
+            },
+        );
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
+    }
+
+    #[test]
+    fn release_token_rejects_forged_bcc_admission_output() {
+        let err = release_token_with_mutated_runtime_outputs(
+            "forged BCC admission rejects",
+            |runtime_proofs| {
+                runtime_proofs.outputs.cef_bcc.token_admitted = false;
+            },
+        );
+        assert_eq!(
+            err,
+            PreprocessError::PreprocessingRuntimeCertificateMismatch
+        );
     }
 
     #[test]
