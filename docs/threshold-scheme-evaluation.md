@@ -394,33 +394,112 @@ Initial public-source findings:
 - ePrint abstract says the protocol is MPC-friendly, supports all three ML-DSA
   security levels, and in the honest-majority setting avoids additional public
   key assumptions.
-- ePrint abstract says online communication can be as little as about 100 kB per
+- ePrint abstract says online communication can be as little as about 150 kB per
   party per rejection-sampling round.
 - NIST MPTS page says Quorus includes DKG, offline preprocessing, UC-style strong
   guarantees, scalability to medium-sized groups such as up to 64 under honest
   majority, and low online signing latency.
 ```
 
+Full-paper read summary:
+
+```text
+Quorus is not a TALUS patch. It is a separate threshold ML-DSA profile.
+
+Key generation:
+  rho <- Coin
+  [s] <- bounded secret shares
+  [e] <- bounded error shares
+  [t] = A[s] + [e]
+  open full t
+  (t1,t0) = Power2Round(t,d)
+  external pk = (rho,t1)
+  protocol-public material includes t and t0
+  parties retain shares [s] and [e]
+
+Preprocessing:
+  [y]  <- nonce/mask shares
+  [ew] <- fresh error/noise shares
+  [w]  = A[y] + [ew]
+  privately decompose w into w1/w0 material
+
+Online signing:
+  open w1
+  c = H(mu,w1)
+  [z]     = c[s] + [y]
+  [wbar0] = [w0] - c[e]
+  private RejSamp checks [z] and [wbar0]
+
+Early reject:
+  if private RejSamp fails, z is not opened.
+  The protocol returns an incomplete internal transcript (w1,c,bottom,bottom).
+
+Late reject:
+  after RejSamp passes, z is opened.
+  Hint/correctness failures may produce (w1,c,z,bottom) internally.
+  This is a different security case because z passed rejection and t0 is already
+  protocol-public in the Quorus model.
+
+Performance:
+  online signing is moderate-round MPC, not one-round TALUS.
+  The paper reports 16-round and 29-round online variants and low single-thread
+  local compute for one rejection-sampling round.
+```
+
+Product interpretation:
+
+```text
+QuorusProfile must be separate from TALUS strict signing.
+
+Use:
+  - public/protocol-public t and t0;
+  - shares [s] and [e];
+  - Quorus RejSamp/decomposition protocols exactly;
+  - final FIPS verifier gate;
+  - external API that exposes only final signatures, RetryExhausted, or Abort.
+
+Do not mix with:
+  - TALUS BCC;
+  - TALUS CEF;
+  - TALUS s1-only key package;
+  - public A*s_i commitments;
+  - public A*nonce commitments;
+  - paper-fast rejected-z behavior.
+```
+
+Open audit points:
+
+```text
+- Public t/t0 is an intentional Quorus security-model change and must be a
+  product decision, not an accidental implementation detail.
+- ML-DSA-44 needs the paper's special preprocessing/decomposition path; do not
+  reuse the ML-DSA-65/87 power-of-two shortcut.
+- The product API should not expose incomplete internal transcripts unless an
+  explicit debug/evaluation feature is enabled.
+- Implementation availability, license, provenance, and fail-closed behavior
+  still need inspection before prototype integration.
+```
+
 Evaluation tasks:
 
 ```text
-[ ] Read ePrint 2025/1163 fully.
-[ ] Extract exact honest-majority model:
+[x] Read ePrint 2025/1163 full PDF.
+[x] Extract exact honest-majority model at paper level:
     - n/f/T threshold constraints;
     - malicious vs semi-honest components;
     - abort/fairness/output-delivery claims;
     - UC theorem assumptions.
-[ ] Extract DKG protocol:
+[x] Extract DKG protocol at paper level:
     - public/private channels;
     - preprocessing requirements;
     - whether it aligns with our IT-VSS/IT-MPC direction.
-[ ] Extract signing protocol:
+[x] Extract signing protocol at paper level:
     - online rounds;
     - offline rounds;
     - rejection sampling behavior;
     - whether rejected candidate material is public or hidden;
     - final verifier/fail-closed behavior.
-[ ] Compute expected latency:
+[~] Compute expected latency:
     - LAN with 1 ms RTT;
     - regional WAN with 20-50 ms RTT;
     - global WAN with 100-200 ms RTT;
@@ -462,16 +541,17 @@ FIPS 204 verifier compatibility    yes                    TBD       claimed
 All ML-DSA suites                  yes                    TBD       claimed
 N > 6                              intended               likely no claimed up to ~64
 Honest-majority fit                yes                    TBD       yes
-Dishonest-majority fit             no                     TBD       TBD
-DKG included                       yes                    TBD       claimed
-Key import                         planned/partial         TBD       TBD
-Online rounds                      too high currently      claimed 3 TBD
-WAN latency                        not acceptable yet      claimed <1s TBD
-Rejected-z hidden                  yes                    TBD       TBD
-No public A-secret image           yes                    TBD       TBD
-Fail-closed final verify           yes                    claimed   TBD
+Dishonest-majority fit             no                     TBD       no
+DKG included                       yes                    TBD       yes
+Key import                         planned/partial         TBD       separate profile
+Online rounds                      too high currently      claimed 3 16 or 29
+WAN latency                        not acceptable yet      claimed <1s promising
+Rejected-z hidden                  yes                    TBD       early reject yes
+No public A-secret image           yes                    TBD       yes
+Public t/t0 protocol material      no                     TBD       yes
+Fail-closed final verify           yes                    claimed   yes
 Implementation public              yes                    Go/Rust   TBD
-Production audit status            no external audit       no        TBD
+Production audit status            no external audit       no        paper only
 ```
 
 ## Sources Checked

@@ -36,13 +36,18 @@ pub mod preprocessing {
     pub use crate::local::{
         certify_preprocessing_token,
         certify_preprocessing_token_release_validated_with_finished_runtime_driver,
+        certify_preprocessing_token_release_validated_with_finished_runtime_driver_strict_material_and_nonce_share,
+        certify_preprocessing_token_release_validated_with_fused_private_batch_strict_inventory_and_nonce_share,
         certify_preprocessing_token_release_validated_with_runtime,
         certify_preprocessing_token_with_consistency, ensure_certified_token_release_valid,
         ensure_pre_challenge_certification_evidence, ensure_pre_challenge_certification_policy,
-        ensure_preprocessing_counters_vectorized_for_release, generate_distributed_nonce_shares,
-        masked_broadcast_commitment, open_broadcasts,
+        ensure_preprocessing_counters_vectorized_for_release,
+        ensure_preprocessing_release_token_batch_log_for_release,
+        ensure_preprocessing_release_token_log_text_public_for_release,
+        generate_distributed_nonce_shares, masked_broadcast_commitment, open_broadcasts,
         party_preprocess_input_from_distributed_nonce_share, prepare_masked_broadcast_envelope,
         prepare_masked_broadcast_envelope_with_vector_runtime_evidence,
+        preprocessing_best_shape_performance_report, preprocessing_release_token_log_entry,
         preprocessing_runtime_transcript_aggregate_hash,
         talus_performance_counters_from_preprocessing, BccCertificationEvidence, BroadcastEnvelope,
         CarryCompareCertificationEvidence, CertifiedToken, Commitment,
@@ -54,34 +59,54 @@ pub mod preprocessing {
         MaskedBroadcastConsistencyStatement, MaskedBroadcastConsistencyVerifier,
         MaskedBroadcastRuntimeBinding, NonceCommitment, NonceRevealPolicyEvidence,
         PartyPreprocessInput, PreChallengeCertificationEvidence, PreChallengeCertificationPolicy,
-        PreprocessError, PreprocessingCertificationCounters,
-        PreprocessingCertificationRuntimeProofs, PreprocessingCertificationRuntimeStatement,
-        PreprocessingCertificationRuntimeTranscripts, PreprocessingCertificationStage,
-        PreprocessingCertificationStageRuntimeProof, PreprocessingOutbound,
-        PreprocessingPrivateCircuitDriverState, PreprocessingPrivateCircuitHandles,
-        PreprocessingPrivateMaterialHandles, PreprocessingPrivateMaterialState,
-        PreprocessingPrivateMaterialStateSource, PreprocessingSession, PreprocessingSessionOptions,
+        PreprocessError, PreprocessingBestShapePerformanceReport,
+        PreprocessingBestShapePhaseTiming, PreprocessingBestShapeProfileTotals,
+        PreprocessingCertificationCounters, PreprocessingCertificationRuntimeProofs,
+        PreprocessingCertificationRuntimeStatement, PreprocessingCertificationRuntimeTranscripts,
+        PreprocessingCertificationStage, PreprocessingCertificationStageRuntimeProof,
+        PreprocessingOutbound, PreprocessingPrivateCircuitBatchDriverState,
+        PreprocessingPrivateCircuitBatchMember, PreprocessingPrivateCircuitDriverState,
+        PreprocessingPrivateCircuitHandles, PreprocessingPrivateMaterialHandles,
+        PreprocessingPrivateMaterialState, PreprocessingPrivateMaterialStateSource,
+        PreprocessingReleaseBatchDriver, PreprocessingReleaseDriver,
+        PreprocessingReleaseDriverPhase, PreprocessingReleaseSessionCursor,
+        PreprocessingReleaseSessionCursorMemoryStore, PreprocessingReleaseSessionCursorStore,
+        PreprocessingReleaseSessionPhase, PreprocessingReleaseTokenLogEntry, PreprocessingSession,
+        PreprocessingSessionOptions, PreprocessingTokenBatchFillReport,
         PreprocessingVectorRuntimeCertificate, ProductMaskedBroadcastConsistencyVerifier,
         ProductZkMaskedBroadcastVerifier, ProductionPreprocessingCertificationRuntime,
         SessionCounter, SessionCounterStore, SessionId, SessionRegistry, SessionStore,
-        TokenCandidate, TokenInventory, TokenInventoryState, TokenInventoryStore,
-        TokenPersistenceEvidence, TokenPool, TokenPoolError, TranscriptHash,
+        StrictSigningCanonicalMaskBatchMember, StrictSigningCanonicalMaskInventory,
+        StrictSigningCanonicalMaskProvenance, StrictSigningHelperMaterialInventory,
+        StrictSigningHelperMaterialProvenance, TokenCandidate, TokenInventory, TokenInventoryState,
+        TokenInventoryStore, TokenPersistenceEvidence, TokenPool, TokenPoolError, TranscriptHash,
     };
 
+    #[cfg(any(test, feature = "scaffold-dev"))]
+    pub use crate::local::dev_certify_preprocessing_token_with_opened_material_w_for_tests;
+
     #[cfg(feature = "std")]
-    pub use crate::local::{FileSessionCounter, FileSessionRegistry, FileTokenInventory};
+    pub use crate::local::{
+        FilePreprocessingReleaseSessionCursorStore, FilePreprocessingReleaseTokenBatchLog,
+        FileSessionCounter, FileSessionRegistry, FileTokenInventory,
+    };
 }
 
 pub use preprocessing::{
     certify_preprocessing_token,
     certify_preprocessing_token_release_validated_with_finished_runtime_driver,
+    certify_preprocessing_token_release_validated_with_finished_runtime_driver_strict_material_and_nonce_share,
+    certify_preprocessing_token_release_validated_with_fused_private_batch_strict_inventory_and_nonce_share,
     certify_preprocessing_token_release_validated_with_runtime,
     certify_preprocessing_token_with_consistency, ensure_certified_token_release_valid,
     ensure_pre_challenge_certification_evidence, ensure_pre_challenge_certification_policy,
-    ensure_preprocessing_counters_vectorized_for_release, generate_distributed_nonce_shares,
-    masked_broadcast_commitment, open_broadcasts,
+    ensure_preprocessing_counters_vectorized_for_release,
+    ensure_preprocessing_release_token_batch_log_for_release,
+    ensure_preprocessing_release_token_log_text_public_for_release,
+    generate_distributed_nonce_shares, masked_broadcast_commitment, open_broadcasts,
     party_preprocess_input_from_distributed_nonce_share, prepare_masked_broadcast_envelope,
     prepare_masked_broadcast_envelope_with_vector_runtime_evidence,
+    preprocessing_best_shape_performance_report, preprocessing_release_token_log_entry,
     preprocessing_runtime_transcript_aggregate_hash, talus_performance_counters_from_preprocessing,
     BccCertificationEvidence, BroadcastEnvelope, CarryCompareCertificationEvidence, CertifiedToken,
     Commitment, DistributedNonceGenerationBroadcast, DistributedNonceGenerationEvidence,
@@ -92,33 +117,50 @@ pub use preprocessing::{
     MaskedBroadcastConsistencyStatement, MaskedBroadcastConsistencyVerifier,
     MaskedBroadcastRuntimeBinding, NonceCommitment, NonceRevealPolicyEvidence,
     PartyPreprocessInput, PreChallengeCertificationEvidence, PreChallengeCertificationPolicy,
-    PreprocessError, PreprocessingCertificationCounters, PreprocessingCertificationRuntimeProofs,
-    PreprocessingCertificationRuntimeStatement, PreprocessingCertificationRuntimeTranscripts,
-    PreprocessingCertificationStage, PreprocessingCertificationStageRuntimeProof,
-    PreprocessingOutbound, PreprocessingPrivateCircuitDriverState,
-    PreprocessingPrivateCircuitHandles, PreprocessingPrivateMaterialHandles,
-    PreprocessingPrivateMaterialState, PreprocessingPrivateMaterialStateSource,
-    PreprocessingSession, PreprocessingSessionOptions, PreprocessingVectorRuntimeCertificate,
-    ProductMaskedBroadcastConsistencyVerifier, ProductZkMaskedBroadcastVerifier,
-    ProductionPreprocessingCertificationRuntime, SessionCounter, SessionCounterStore, SessionId,
-    SessionRegistry, SessionStore, TokenCandidate, TokenInventory, TokenInventoryState,
+    PreprocessError, PreprocessingBestShapePerformanceReport, PreprocessingBestShapePhaseTiming,
+    PreprocessingBestShapeProfileTotals, PreprocessingCertificationCounters,
+    PreprocessingCertificationRuntimeProofs, PreprocessingCertificationRuntimeStatement,
+    PreprocessingCertificationRuntimeTranscripts, PreprocessingCertificationStage,
+    PreprocessingCertificationStageRuntimeProof, PreprocessingOutbound,
+    PreprocessingPrivateCircuitBatchDriverState, PreprocessingPrivateCircuitBatchMember,
+    PreprocessingPrivateCircuitDriverState, PreprocessingPrivateCircuitHandles,
+    PreprocessingPrivateMaterialHandles, PreprocessingPrivateMaterialState,
+    PreprocessingPrivateMaterialStateSource, PreprocessingReleaseBatchDriver,
+    PreprocessingReleaseDriver, PreprocessingReleaseDriverPhase, PreprocessingReleaseSessionCursor,
+    PreprocessingReleaseSessionCursorMemoryStore, PreprocessingReleaseSessionCursorStore,
+    PreprocessingReleaseSessionPhase, PreprocessingReleaseTokenLogEntry, PreprocessingSession,
+    PreprocessingSessionOptions, PreprocessingTokenBatchFillReport,
+    PreprocessingVectorRuntimeCertificate, ProductMaskedBroadcastConsistencyVerifier,
+    ProductZkMaskedBroadcastVerifier, ProductionPreprocessingCertificationRuntime, SessionCounter,
+    SessionCounterStore, SessionId, SessionRegistry, SessionStore,
+    StrictSigningCanonicalMaskBatchMember, StrictSigningCanonicalMaskInventory,
+    StrictSigningCanonicalMaskProvenance, StrictSigningHelperMaterialInventory,
+    StrictSigningHelperMaterialProvenance, TokenCandidate, TokenInventory, TokenInventoryState,
     TokenInventoryStore, TokenPersistenceEvidence, TokenPool, TokenPoolError, TranscriptHash,
 };
 
+#[cfg(any(test, feature = "scaffold-dev"))]
+pub use preprocessing::dev_certify_preprocessing_token_with_opened_material_w_for_tests;
+
 pub use online::{
-    compute_challenge_material, sign_strict_no_rejected_z, strict_build_selected_signature_output,
-    strict_candidate_metadata, strict_candidate_metadata_batch, strict_candidate_priority,
-    strict_collect_selected_h_opening, strict_collect_selected_share_products,
-    strict_collect_selected_z_opening, strict_drive_selected_h_opening,
-    strict_drive_selected_share_products, strict_drive_selected_z_opening,
-    strict_encode_selected_signature, strict_polyvec_to_runtime_lanes,
-    strict_prepare_runtime_z_share, strict_production_signing_backend, strict_runtime_az_share,
-    strict_runtime_hint_approx_share, strict_signature_hash, strict_signing_request_hash,
-    strict_signing_session_id, talus_performance_counters_from_strict_signing,
-    validate_sign_request, validate_strict_sign_request, BccCertifiedTokenBatch, ChallengeMaterial,
+    compute_challenge_material, consume_strict_signing_helpers_for_batch,
+    consume_strict_signing_masks_for_batch, sign_strict_no_rejected_z,
+    strict_build_selected_signature_output, strict_candidate_metadata,
+    strict_candidate_metadata_batch, strict_candidate_priority, strict_collect_selected_h_opening,
+    strict_collect_selected_share_products, strict_collect_selected_z_opening,
+    strict_drive_selected_h_opening, strict_drive_selected_share_products,
+    strict_drive_selected_z_opening, strict_encode_selected_signature,
+    strict_polyvec_to_runtime_lanes, strict_prepare_runtime_z_share,
+    strict_production_signing_backend, strict_runtime_az_share,
+    strict_runtime_candidate_input_from_token_and_key_state, strict_runtime_hint_approx_share,
+    strict_runtime_hint_approx_share_from_precomputed, strict_signature_hash,
+    strict_signing_request_hash, strict_signing_session_id,
+    talus_performance_counters_from_strict_signing, validate_sign_request,
+    validate_strict_sign_request, BccCertifiedTokenBatch, ChallengeMaterial,
     ConsumedBccCertifiedTokenBatch, ConsumedTokenStore, DirectStrictSigningComponentRuntime,
-    FinalSignature, FinalVerifier, FipsFinalVerifier, NoopStrictSigningRuntimeObserver,
-    OnlineError, ProductionStrictLiveVectorMpcArtifactSource,
+    FinalSignature, FinalVerifier, FipsFinalVerifier, InMemoryStrictSigningHelperUseLog,
+    InMemoryStrictSigningMaskUseLog, NoopStrictSigningRuntimeObserver, OnlineError,
+    ProductionStrictLiveVectorMpcArtifactSource,
     ProductionStrictRuntimeSelectedOpeningArtifactBackend,
     ProductionStrictRuntimeSelectedOpeningBackend, ProductionStrictSigningBackend,
     ProductionStrictSigningVectorMpcRuntimeBackend, ProductionVectorHintCheckBackend,
@@ -133,10 +175,12 @@ pub use online::{
     StrictRuntimeAllBitsTrueState, StrictRuntimeCandidateHandle, StrictRuntimeCandidateShareInput,
     StrictRuntimeHintBitsCheckState, StrictRuntimeHintWeightCheckState,
     StrictRuntimePrioritySelectionState, StrictRuntimeSelectedOpeningArtifact,
-    StrictRuntimeSelectedOpeningArtifactSource, StrictRuntimeValidBitState,
-    StrictRuntimeZBoundCheckState, StrictSelectedOpeningBackend, StrictSelectedOpeningEvidence,
-    StrictSelectedSignature, StrictSignRequest, StrictSigningCursorMemoryStore,
-    StrictSigningCursorPhase, StrictSigningDistributedRuntime, StrictSigningEvidence,
+    StrictRuntimeSelectedOpeningArtifactSource, StrictRuntimeSigningKeyState,
+    StrictRuntimeValidBitState, StrictRuntimeZBoundCheckState, StrictSelectedOpeningBackend,
+    StrictSelectedOpeningEvidence, StrictSelectedSignature, StrictSignRequest,
+    StrictSigningCursorMemoryStore, StrictSigningCursorPhase, StrictSigningDistributedRuntime,
+    StrictSigningEvidence, StrictSigningHelperInventoryId, StrictSigningHelperKind,
+    StrictSigningHelperUseLog, StrictSigningMaskInventoryId, StrictSigningMaskUseLog,
     StrictSigningOutbound, StrictSigningPhase, StrictSigningPhaseDriver, StrictSigningRuntime,
     StrictSigningRuntimeCertificateSource, StrictSigningRuntimeObserver, StrictSigningRuntimeSlot,
     StrictSigningRuntimeSlotProgress, StrictSigningRuntimeStep, StrictSigningSession,
@@ -149,7 +193,10 @@ pub use online::{
 #[cfg(any(test, feature = "scaffold-dev"))]
 pub use online::ProductionStrictVectorMpcArtifactSource;
 #[cfg(feature = "std")]
-pub use preprocessing::{FileSessionCounter, FileSessionRegistry, FileTokenInventory};
+pub use preprocessing::{
+    FilePreprocessingReleaseSessionCursorStore, FilePreprocessingReleaseTokenBatchLog,
+    FileSessionCounter, FileSessionRegistry, FileTokenInventory,
+};
 
 /// Test/dev-only compatibility backends and paper-fast helpers.
 ///
@@ -177,7 +224,10 @@ pub mod dev_backends {
 }
 
 #[cfg(feature = "std")]
-pub use online::{FileConsumedTokenStore, FileStrictSigningSessionStore};
+pub use online::{
+    FileConsumedTokenStore, FileStrictSigningHelperUseLog, FileStrictSigningMaskUseLog,
+    FileStrictSigningSessionStore,
+};
 
 /// Crate status marker for docs/tests.
 ///
@@ -223,8 +273,12 @@ mod production_api_scan_tests {
             "preprocessing_certification_stage_runtime_proof",
             "certify_preprocessing_token_release_validated_from_envelopes",
             "certify_preprocessing_token_release_validated,",
+            "certify_preprocessing_token_release_validated_with_finished_runtime_driver_and_strict_material",
             "prepare_masked_broadcast_envelope_with_runtime_transcript",
             "finish_release_validated",
+            "pub fn start_release_validated(",
+            "pub fn new_release_validated(",
+            "pub fn new_release_validated_with_log(",
         ] {
             assert!(
                 !production_exports.contains(forbidden),

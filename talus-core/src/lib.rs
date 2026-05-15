@@ -39,7 +39,8 @@ pub use fips204_verify::{verify_fips204_signature, Fips204Verifier, VerifyError}
 pub use params::{MlDsa44, MlDsa65, MlDsa87, MlDsaParams};
 pub use performance::{
     ensure_performance_counters_within_envelope, PerformanceGateError, ProductionBatchSizingPolicy,
-    TalusPerformanceCounters, TalusPerformanceEnvelope,
+    StrictTokenBatchSizingDecision, TalusPerformanceCounters, TalusPerformanceEnvelope,
+    TokenPassProbabilityEstimate,
 };
 pub use poly::{
     aggregate_z_shares, aggregate_z_shares_lagrange, infinity_norm, lagrange_coefficients_at_zero,

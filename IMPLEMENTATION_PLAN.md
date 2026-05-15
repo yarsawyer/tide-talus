@@ -105,11 +105,25 @@ Current status:
 [ ] Mithril signatures verified with an independent FIPS 204 verifier.
 [ ] Mithril DKG/key-import and malicious/fail-closed behavior assessed.
 
-[ ] Quorus paper review complete.
-[ ] Quorus honest-majority production model extracted.
-[ ] Quorus round count and WAN latency evaluated.
+[x] Quorus paper review complete.
+[x] Quorus honest-majority production model extracted.
+[~] Quorus round count and WAN latency evaluated.
 [ ] Quorus implementation availability checked.
-[ ] Quorus compared against the current IT-VSS/IT-MPC direction.
+[x] Quorus compared against the current IT-VSS/IT-MPC direction at design level.
+```
+
+Current Quorus conclusion:
+
+```text
+Quorus should be treated as a separate QuorusProfile, not merged into TALUS
+strict signing. It keeps the external FIPS ML-DSA public key shape pk=(rho,t1),
+but the threshold protocol opens full t and stores protocol-public t0. It uses
+shares [s] and [e], Quorus preprocessing, and private RejSamp instead of TALUS
+BCC/CEF and s1-only signing.
+
+This makes Quorus a strong candidate for the no-TEE honest-majority production
+path, but adopting it is an architectural pivot. It requires a separate
+prototype and tests, not partial grafting onto the current TALUS BCC/CEF path.
 ```
 
 Decision rule:
@@ -921,8 +935,34 @@ Remaining production tasks:
   runtime evidence. Power2Round restart cursors still exist for resumability,
   but release-capable `ProductionPower2RoundOutput` requires durable vector
   runtime evidence and state-owned nonlinear markers.
-- [ ] Add ML-DSA-44/65/87 performance envelopes with maximum rounds, messages,
-  bytes, lanes, and wall-clock budgets.
+- [x] Add preprocessing ML-DSA-44/65/87 best-shape performance reports with
+  measured records, private/broadcast split, bytes, durable bytes, lanes,
+  wall-clock time, and no-scalarized-release counters.
+  Current representative release-mode results:
+  ```text
+  ML-DSA-44: 72 records, 70 private / 2 broadcast, 569,344 lanes,
+             1,719,552 wire bytes, 3,439,824 durable log bytes,
+             setup/private/masks/cert = 10/23/56/12 ms,
+             chunk_policy_ok=true, no_scalarized_release_profile=true.
+
+  ML-DSA-65: 76 records, 74 private / 2 broadcast, 819,200 lanes,
+             2,469,760 wire bytes, 4,940,280 durable log bytes,
+             setup/private/masks/cert = 18/41/114/27 ms,
+             chunk_policy_ok=true, no_scalarized_release_profile=true.
+
+  ML-DSA-87: 78 records, 76 private / 2 broadcast, 1,107,968 lanes,
+             3,336,384 wire bytes, 6,673,548 durable log bytes,
+             setup/private/masks/cert = 15/51/120/26 ms,
+             chunk_policy_ok=true, no_scalarized_release_profile=true.
+  ```
+  The strict-mask generic `< q` comparison has been replaced with the ML-DSA
+  special-form predicate `!(high_10_bits_all_one && low_13_bits_any_one)`,
+  reducing the strict-mask comparison circuit from 23 generic comparison
+  layers to reduction layers plus one final AND. The current bottlenecks are
+  now `RandomBitShare`, specialized strict-mask `MulDegreeReductionShare`, and
+  preprocessing `CarryCompare`. ML-DSA-65/87 strict-mask random-bit phases are
+  chunked under the production per-record lane policy.
+  Strict signing and DKG best-shape reports remain separate open tasks.
 - [ ] Add malicious tests against the final runtime, not only helper/runtime
   boundaries:
   ```text
@@ -1279,8 +1319,9 @@ Phase 5 implementation notes:
 Goal: fill a durable pool of BCC-certified tokens without trusted dealer
 material or post-challenge leakage.
 
-Status: **implementation-complete for the current release path, pending
-all-suite/performance closure and external review**. The production-facing
+Status: **partially complete for the current release path, pending
+automatic production token material generation, all-suite/performance closure,
+and external review**. The production-facing
 session/API shape, token-inventory lifecycle, counters, duplicate-session
 protection, no local aggregate `A*y` witness rule, and BCC-token admission
 surface exist. Release-capable token construction now drives masked-broadcast
@@ -1290,16 +1331,32 @@ relation certification, CarryCompare, CEF correction, and BCC admission through
 output. Legacy hash-only masked-broadcast proof stubs are rejected, and
 release evidence must prove the statement-bound preprocessing phases and
 private vector circuits ran for the concrete token session/transcript.
-Remaining Phase 6 work is no longer a missing certification backend; it is
-all-suite throughput/performance gates, larger adversarial coverage, and
+Remaining Phase 6 work is no longer a missing certification backend, missing
+strict-mask release boundary, caller-supplied `[w]` handle, or coarse
+file-backed release-preprocessing cursor. It is all-suite throughput/performance
+gates, larger adversarial coverage, final multi-party runtime scheduling, and
 review-driven hardening.
 There is now a normal-build
 `ProductionPreprocessingCertificationRuntime` adapter over
 `ProductionVectorPrimeFieldMpcRuntime`; it refuses non-release vector runtime
 evidence and derives typed preprocessing stage proof transcripts from the
 durable runtime evidence. This closes the ad hoc proof-construction API
-surface, but it is not yet the full private CarryCompare/CEF/BCC circuit
-execution.
+surface. The adapter also has an app-driven
+`StrictSigningCanonicalMaskGenerationState` for z/hint canonical masks: it
+drives random-bit contribution collection, private XOR folding across dealers,
+mask-value derivation, private `mask < q` comparison, and a public threshold
+assertion. Release-capable token construction now rejects callers that only
+attach preprocessing runtime evidence without strict-signing runtime material.
+A product-shaped constructor exists for callers that have already driven the
+private preprocessing state, strict-mask state, and distributed nonce share:
+`certify_preprocessing_token_release_validated_with_finished_runtime_driver_strict_material_and_nonce_share`.
+It derives the token `[w] = [A*y]` handle from the private distributed
+nonce/runtime `[y]` handle, then binds runtime-generated strict masks and `[w]`
+into the same `PreprocessingVectorRuntimeCertificate`. The older
+opened-material `[w]` adapter is test/scaffold-only and is not exported by the
+normal production API.
+The release-check suite now also exercises full ML-DSA-44/65/87 token shapes
+through this runtime-generated strict-material path.
 
 - [x] Replace the production-facing nonce-generation boundary with an
   app-driven session facade:
@@ -1799,14 +1856,213 @@ Completion gates:
 Phase 6 remaining work after the stronger masked-broadcast backend:
 
 ```text
-- Add broader adversarial tests around malformed relation-bit handles,
+- Broader adversarial tests around malformed relation-bit handles,
   replayed relation circuit labels, and cross-session masked-broadcast
-  relation-state reuse.
-- Add all-suite ML-DSA-44/65/87 release-token throughput gates for the full
-  preprocessing path.
-- Extend durable log scanners to final token-batch logs once token batching is
-  promoted from integration tests to normal release execution.
+  relation-state reuse are now covered by focused runtime-private state tests.
+- Add explicit throughput/latency thresholds for the full all-suite
+  preprocessing path. Full-shape ML-DSA-44/65/87 release-token correctness
+  coverage exists, but it is not yet a performance gate.
+- A typed public release-token batch log scanner now exists for release-valid
+  `CertifiedToken` batches. It binds ordered token ids, signer-set hash, public
+  `w1` hash, certified `[w]` handle identity, strict mask provenance, runtime
+  transcript, token binding, and certificate hash, and a text guard rejects
+  private-material markers such as nonce shares, raw masks, rejected `z`, low
+  bits, witnesses, and pass/valid bits. `TokenPool` now has a release batch
+  admission API that replays this typed log before reserving inventory state,
+  so tampered logs leave tokens fresh/unreserved. Strict release signing also
+  has a `BccCertifiedTokenBatch::new_release_validated_with_log` constructor
+  that rejects forged token-binding/certificate metadata before online use.
+  The older `BccCertifiedTokenBatch::new_release_validated` constructor is now
+  crate-internal and documented as a lower-level validator used only after log
+  replay or by negative tests. The in-memory typed-log constructor is also
+  crate-internal now. Public release setup uses the file-backed path. The
+  file-backed log has append/read/replay support, rejects truncated/corrupt
+  records, duplicate token indexes, and private marker text, and `TokenPool`
+  can admit a batch directly from the replayed file log. The strict signing
+  release facade exposes `start_release_validated_with_file_log`, which
+  constructs the release batch only after replaying that durable file log, and
+  release session tests now exercise this file-backed setup path. Remaining
+  work is to make the final normal token-batch persistence backend use this
+  path everywhere once token batching is promoted beyond integration tests.
+- Make the final multi-party preprocessing driver own transport routing and
+  token-pool admission across all parties. Per-party runtime scheduling is now
+  owned by `PreprocessingReleaseDriver`: after the preprocessing transcript is
+  complete it drives private preprocessing circuits, strict mask generation,
+  coarse cursor persistence, release-token certification, and optional typed
+  token-log append. The in-memory scaffold batch path now starts one
+  `PreprocessingSession` per nonce share, routes commit/open, starts one
+  release driver per party, routes vector-MPC messages, certifies all tokens,
+  and appends one typed token-batch log. Applications still own actual network
+  delivery between parties and final token-pool admission policy.
 ```
+
+- [x] Add direct strict-signing `[w]` derivation from distributed nonce/runtime
+  `[y]` handles:
+  ```text
+  DistributedNonceShare.y_share
+    -> runtime weighted nonce share handle [lambda_i * y_i]
+    -> public-linear runtime A transform
+    -> strict-signing precomputed [w] handle
+  ```
+  The release-token constructor
+  `certify_preprocessing_token_release_validated_with_finished_runtime_driver_strict_material_and_nonce_share`
+  now binds this path into the same runtime certificate used by preprocessing
+  CarryCompare/CEF/BCC and strict mask material. Tests open the derived handle
+  only in test mode to prove it equals `A*y`, reject wrong-label nonce handles,
+  reject nonce shares that do not match the committed/opened preprocessing
+  transcript, and the all-suite release-token fixture now uses the nonce-share
+  path for full-shape tokens. The older opened-preprocessing derivation is
+  gated to test/scaffold code and is not part of the normal production release
+  token API.
+- [x] Promote nonce-share-derived token finalization into the app-facing
+  preprocessing session surface:
+  ```text
+  PreprocessingSession::finish_with_release_runtime(...)
+  PreprocessingSession::finish_with_release_runtime_and_cursor_store(...)
+  ```
+  This consumes the completed preprocessing transcript, a runtime-owned
+  private preprocessing driver state, runtime-generated strict mask state, and
+  local distributed nonce share, then emits a release-certified token through
+  the nonce-derived `[w]` constructor. The focused release-check test proves
+  the session facade produces a release-valid token with nonce-derived `[w]`
+  and does not require callers to invoke the low-level constructor directly.
+- [x] Add release-preprocessing coarse cursor persistence:
+  ```text
+  PreprocessingReleaseSessionCursorStore
+  PreprocessingReleaseSessionCursorMemoryStore
+  FilePreprocessingReleaseSessionCursorStore
+  ```
+  The file log replays strict text records, rejects corrupt/truncated cursor
+  lines, and records the final token-binding hash once a release-certified
+  token exists. Focused release-check tests prove the session facade persists
+  the expected phase progression, file reopen recovers the latest certified
+  cursor, cross-session cursor lookup does not replay stale state, and
+  premature driver finalization persists an aborted cursor.
+- [x] Add a release preprocessing driver:
+  ```text
+  PreprocessingSession::into_release_driver(...)
+  PreprocessingReleaseDriver::drive_runtime_step(...)
+  PreprocessingReleaseDriver::collect_runtime_step(...)
+  PreprocessingReleaseDriver::finish(...)
+  PreprocessingReleaseDriver::finish_and_append_token_log(...)
+  ```
+  The driver owns private preprocessing runtime scheduling, strict-mask
+  generation, coarse cursor updates, release-token certification, and typed
+  token-log append for one party. The focused release-check test proves the
+  driver emits a release-certified token, advances through transcript/private/
+  strict-mask/certified cursors, and writes a replayable public token log.
+- [x] Apply the release driver to the in-memory multi-party nonce-share batch
+  path:
+  ```text
+  distributed nonce shares
+    -> one PreprocessingSession per signer
+    -> routed commit/open transcript
+    -> one PreprocessingReleaseDriver per signer
+    -> routed vector-MPC runtime rounds
+    -> release-certified token batch
+    -> single typed release-token batch log
+  ```
+  The focused two-party scaffold test passes and proves the batch path no
+  longer manually calls `start_private_circuit_handles_from_envelopes` or
+  strict-mask generation. The strict-mask runtime now packs all 23 random-bit
+  vectors for one mask target into one runtime payload, packs XOR-fold layers
+  across all mask bits, and runs one combined z/hint canonical `mask < q`
+  comparison plus one packed `assert_lt_q` all-ones assertion. This reduced the
+  focused debug in-memory two-party test from roughly 93-99 seconds to about
+  46-55 seconds. The release-driver test now asserts vector random-bit,
+  comparison, and threshold coverage with no scalar fallback. The vector
+  runtime also exposes a durable-log phase profile with per-phase record counts,
+  private/broadcast split, vector lanes, maximum lanes per wire record, wire
+  bytes, and durable log bytes; the release-driver test uses this profile to
+  prove strict-mask random-bit phases remain packed, every payload respects the
+  suite chunk policy, and the remaining comparison/log hot spots are
+  measurable.
+  The public-comparison circuit now also avoids a redundant private
+  `comparison AND candidate` multiplication: after `candidate = eq AND
+  condition`, `comparison` and `candidate` are disjoint by construction, so the
+  OR update is a local addition. Focused release-driver gates now cap
+  comparison and CarryCompare profile records/labels so these circuits cannot
+  silently regress to per-bit scalarized scheduling. A follow-up comparator pass
+  then packed `candidate = eq AND condition` and
+  `eq_next = eq AND eq_condition` into one multiplication layer per bit; focused
+  profile counts dropped from
+  `ComparisonToPublicCheck records=68 labels=34` to `records=46 labels=23`,
+  and `PreprocessingCarryCompare records=76 labels=38` to `records=38
+  labels=19`.
+  Prime-field MPC vector wire payloads now use a backward-compatible compact
+  lane encoding: canonical Fq lanes are emitted as 24-bit little-endian values
+  behind a version marker, while the decoder still accepts the old `i32` vector
+  format for replay. On the focused release-driver profile this reduced the
+  dominant wire/log byte counts without changing lanes or circuit checks:
+  `ComparisonToPublicCheck wire_bytes=773312 -> 581824`,
+  `RandomBitShare wire_bytes=518784 -> 389248`,
+  `PreprocessingCarryCompare wire_bytes=473024 -> 356288`,
+  `PreprocessingCefBcc wire_bytes=87296 -> 65792`, and
+  `PreprocessingMaskedBroadcast wire_bytes=49792 -> 37504`. The release-driver
+  test now gates the dominant vector phases to ensure their wire bytes remain
+  below legacy 4-byte-per-lane encoding.
+  Phase-cursor logs now also deduplicate identical consecutive cursor records
+  for DKG setup, prime-field MPC/Power2Round, and preprocessing release
+  sessions. File-backed cursor replay tests prove duplicate cursor writes are
+  compacted without losing restart state or corrupt-log rejection.
+  Prime-field MPC wire logs now expose batched persistence for same-layer
+  records. File-backed logs write grouped durable records with compact
+  same-scope/same-direction prefixes and replay them back into the exact
+  canonical per-message records used by release verification. Existing
+  per-record replay remains backward-compatible. `talus-wire` also exposes
+  default-preserving private-send and reliable-broadcast batch hooks, and
+  prime-field MPC restart replay uses those hooks when resending grouped local
+  messages. Wider online send-path batching remains a scheduler/transport
+  optimization, not a cryptographic change.
+  Token-batch sizing is now empirical instead of hard-coded:
+  `talus-core::TokenPassProbabilityEstimate` records observed token
+  attempts/passes, `ProductionBatchSizingPolicy` derives the recommended strict
+  signing batch size for a target no-valid probability, and
+  `PreprocessingTokenBatchFillReport` converts preprocessing fill counts into
+  that estimate without exposing per-token failures. `BccCertifiedTokenBatch`
+  can enforce the resulting decision. `TokenPool` can also take and consume a
+  whole certified token batch as one fail-closed operation.
+  `PreprocessingReleaseBatchDriver` now owns a set of release preprocessing
+  drivers as one scheduler unit: drive active token drivers, route once, collect
+  active token drivers, aggregate counters, and emit a public fill report.
+  It also has a fused private-runtime scheduler:
+  `start_fused_private_runtime`, `drive_fused_private_runtime_step`,
+  `collect_fused_private_runtime_step`, and
+  `finish_fused_private_and_append_token_log` drive one wider
+  CarryCompare/CEF/BCC circuit for the token batch and then emit normal
+  per-token release certificates/log entries. This closes ad hoc one-token
+  caller orchestration. Strict-signing canonical masks now have a fused
+  multi-token generation path:
+  `start_strict_signing_canonical_mask_batch_generation` creates one larger
+  vector mask/canonicality circuit, and
+  `finish_strict_signing_canonical_mask_batch_generation` slices token-bound
+  inventories from that one runtime transcript. CarryCompare/CEF/BCC now has a
+  fused private runtime primitive:
+  `start_private_circuit_batch_from_envelopes` concatenates token statements
+  into one wider private relation/CarryCompare/CEF/BCC vector circuit.
+  Fused batch private proof state now promotes back into the normal per-token
+  release certificate format through
+  `certify_preprocessing_token_release_validated_with_fused_private_batch_strict_inventory_and_nonce_share`,
+  so token certificates remain token-bound while sharing the fused private
+  CarryCompare/CEF/BCC runtime evidence. Remaining work is all-suite
+  measurement of pass probabilities and deeper low-level circuit/log
+  optimization.
+  The remaining work is deeper performance/scheduler optimization of
+  comparison/threshold internals, token chunks, and transport/log overhead
+  rather than orchestration correctness.
+- [x] Harden the batch-driver persistence boundary:
+  ```text
+  driver token batch
+    -> typed file-backed release-token log
+    -> log replay
+    -> local TokenPool + FileTokenInventory reservation
+  ```
+  The focused scaffold test now also proves wrong log order, duplicate log
+  entries, and tampered certificate hashes fail closed before token-pool
+  admission. The positive pool-admission assertion uses the local party token
+  and a single-entry durable log because all party-local outputs from one
+  preprocessing round intentionally share the same preprocessing session id;
+  each production party owns its own local token pool.
 
 Phase 6 implementation note: production parties must not receive
 `DistributedNonceGenerationOutput` because that type contains every party's
@@ -1912,10 +2168,9 @@ path.
   artifact by sequencing:
   ```text
   canonical z/r decomposition
-  z-bound aggregate pass bit
+  z-bound coefficient failure bits
   hint-bit derivation
-  hint-weight pass bit
-  valid-bit combination
+  fused hint-weight / z-bound / BCC-admission validity threshold
   private priority selection
   selected z/h opening
   final signature encoding
@@ -2185,20 +2440,32 @@ Remaining Phase 9 implementation tasks:
   ```
 - [ ] Finish proving/vectorizing preprocessing token generation:
   ```text
-  token batches
+  token batches: scheduler, logs, pool consumption, empirical sizing, and
+    fused strict-mask generation exist
   coefficient lanes
   signer lanes
   masked-broadcast commit/open vectors
-  CarryCompare lanes
-  CEF correction lanes
-  BCC admission lanes
+  CarryCompare lanes: fused private runtime primitive exists and promotes into
+    per-token release certificates
+  CEF correction lanes: fused private runtime primitive exists and promotes into
+    per-token release certificates
+  BCC admission lanes: fused private runtime primitive exists and promotes into
+    per-token release certificates
   durable PreprocessingVectorRuntimeCertificate on each release token
+  remaining work: all-suite pass-rate/performance measurement and deeper
+    phase batching of comparison/threshold internals
   ```
   Code references:
   ```text
   talus-mpc/src/local.rs: PreprocessingSession
   talus-mpc/src/local.rs: PreprocessingCertificationCounters
   talus-mpc/src/local.rs: DistributedNonceGenerationSession
+  talus-mpc/src/local.rs: PreprocessingReleaseBatchDriver
+  talus-mpc/src/local.rs: StrictSigningCanonicalMaskBatchMember
+  talus-mpc/src/local.rs: PreprocessingPrivateCircuitBatchMember
+  talus-mpc/src/local.rs: PreprocessingReleaseBatchDriver::start_fused_private_runtime
+  talus-mpc/src/local.rs: PreprocessingReleaseBatchDriver::finish_fused_private_and_append_token_log
+  talus-mpc/src/local.rs: certify_preprocessing_token_release_validated_with_fused_private_batch_strict_inventory_and_nonce_share
   ```
 - [ ] Finish proving/vectorizing strict signing checks:
   ```text
@@ -2222,30 +2489,187 @@ Remaining Phase 9 implementation tasks:
   Optimization backlog:
   ```text
   [x] profile strict live runtime by phase
-  [ ] phase-batch all candidates/chunks
-  [ ] move z/hint canonical masks into preprocessing token inventory
-  [ ] precompute/store certified secret-shared [w] = [A*y] in each token
-  [ ] precompute/store certified secret-shared [As1] = [A*s1] in key state
-  [ ] compute online hint relation as [r] = [w] + c*[As1] - c*t1*2^d
+  [x] consume optional certified [w] = [A*y] and [As1] = [A*s1] runtime
+      handles in the live strict source
+  [x] require those [w]/[As1] handles under production-release-checks so
+      release-capable strict signing cannot fall back to online A*z
+  [x] bind strict z/hint canonical mask inventory into `CertifiedToken` and
+      preprocessing runtime certificates; release-capable batches reject tokens
+      missing this inventory, anonymous mask inventories, and cross-token mask
+      replays
+  [x] add strict signing mask inventory ids and in-memory/file-backed
+      one-time-use logs; release signing can persist mask consumption before
+      private runtime work starts, and reuse after reopen is rejected
+  [x] add strict comparison/threshold helper inventory ids and one-time-use
+      logs; release tokens now bind helper provenance into the preprocessing
+      runtime certificate and typed token-batch log, release admission rejects
+      missing or cross-token helper material, and strict signing consumes the
+      helper ids before private online response checks start
+  [x] add strict selected-opening helper inventory ids and one-time-use logs;
+      release tokens now bind selected-opening multiplication-helper
+      provenance into the preprocessing runtime certificate and typed
+      token-batch log, release admission rejects missing selected-opening
+      helper material, and strict signing consumes the helper id before private
+      online response checks start
+  [~] phase-batch all candidates/chunks
+      First live-source passes are implemented: response preparation now
+      prepares every candidate before private checks; z and hint canonical
+      decomposition are fused into one `[z || r]` decomposition state per
+      candidate and that state runs through a shared batch scheduler across
+      all candidates. Z-bound and hint interval/highbits comparisons are also
+      fused into one packed comparison schedule before their private
+      predicates split back into z-bound pass bits and hint bits. Valid-bit
+      combination is batched across candidates. Z-bound no longer runs separate lower and
+      upper comparison states: it packs `z < gamma` and `z < q-gamma+1` into
+      one less-than comparison and derives `z > q-gamma` by private NOT. Hint
+      highbits now packs `r < lower+1` and `r < upper` into one less-than
+      state, derives `r > lower` by private NOT, and reuses the single
+      `gt_lower AND lt_upper` product for both normal and wrap-around
+      intervals. The live source now runs z-bound and hint/highbits checks over
+      bounded vector chunks, then privately aggregates per-chunk pass bits
+      before candidate selection. Hint-weight now computes private chunk
+      counts, combines those private count bits, and checks the total against
+      `omega` without opening partial counts or chunk failures. Z-bound
+      all-true reductions and non-chunked threshold reductions transpose
+      candidate vectors into one threshold circuit with candidates as vector
+      lanes, rather than one threshold state per candidate. Private priority
+      selection packs the selected-bit product and prefix-update product into
+      one vector MPC layer per candidate. Selected `z` and selected `h`
+      product driving and opening now run over bounded chunks while still
+      opening only selected material; both are packed into one
+      `selected_z_h_opening_chunks` selected-opening path backed by the
+      selected-opening helper inventory. Selected-product computation uses
+      affine one-hot selection, `value_0 + sum_{j>0} selected_j *
+      (value_j - value_0)`, so a two-token batch multiplies one delta vector
+      instead of both candidate vectors. The focused regression
+      `strict_selected_share_opening_uses_affine_one_hot_products` proves this
+      shape. Selected work shares one selected-products profile stage instead
+      of separate z/h product stages, and a focused profile-contract
+      regression rejects the old
+      split/per-candidate phase names. The release-capable live source now
+      enforces this batched scheduler profile under `production-release-checks`
+      before returning a selected-opening artifact, so obsolete phase names,
+      scalar gates, duplicate/missing batch phases, excess round counts, and
+      inflated wire/log byte counts cannot satisfy release checks. Remaining
+      work is suite-specific wall-clock/throughput baselines that exercise the
+      optimized scheduler without the slow debug all-lane harness.
+  [x] optimize fused validity threshold reducer shape with public-zero padding.
+      The strict live path now pads the private hint/z-validity threshold with
+      deterministic public false bits when that improves the carry-save/ripple
+      reducer schedule. This does not change the predicate: z-bound failures
+      and hint bits remain private, and only zero-valued public inputs are
+      added. The focused regression
+      `strict_fused_validity_rejects_z_failure_after_hint_threshold` proves a
+      z-bound failure still rejects even when hint weight is valid.
+  [x] generate strict z/hint canonical masks inside production preprocessing
+      (token storage, provenance binding, certificate binding, replay
+      rejection, strict-signing consumption, durable mask-use logs, and the
+      app-driven random-bit/XOR/range-certification state machine are done;
+      a strict-material release constructor consumes that state; release
+      constructors/tests without this material now reject instead of silently
+      attaching the test placeholder)
+  [x] precompute/store certified secret-shared [w] = [A*y] in each token
+      (token storage, certificate binding, strict-signing consumption, and
+      release constructor derivation are done; final direct derivation from
+      distributed nonce/runtime [y] handles remains a later backend-hardening
+      task)
+  [x] add full-shape ML-DSA-44/65/87 release-token tests for
+      runtime-generated [w], strict masks, and runtime certificate binding
+  [x] precompute/store certified secret-shared [As1] = [A*s1] in key state
+      (DKG key packages now carry private encoded [As1] K-vector shares;
+      release package-set gates recompute [As1] from the retained s1 share and
+      rho and reject tampering; strict signing release builds construct
+      key-state from the DKG package handle, and the ad hoc from-s1 derivation
+      constructor is not compiled under production-release-checks)
+  [x] compute online hint relation as [r] = [w] + c*[As1] - c*t1*2^d
+      when certified handles are supplied
+  [x] avoid redundant online bitness proof for strict-signing derived
+      canonical `R_bits`
+      Strict signing consumes preprocessing-certified z/hint canonical mask
+      bits and derives `R_bits` by checked MPC arithmetic from those masks and
+      public masked openings. The online path still proves canonical range and
+      equality for z and hint intermediates, but it no longer repeats a
+      standalone bitness assertion for the derived bits. Power2Round is not
+      changed by this optimization; it remains a standalone circuit with
+      state-owned bitness/range/equality checks.
   [ ] avoid online recomputation of token-only BCC/CEF facts without removing
       private z-bound or hint-weight checks
-  [ ] add vector circuit scheduler
-  [ ] specialize z-bound and hint/highbits circuits where proof-compatible
-  [ ] replace hint-weight reduction with a shallower threshold circuit
+      Production optimization rule: move only message/challenge-independent
+      material into preprocessing, require transcript-bound certification and
+      one-time-use logs for every helper, and keep challenge-dependent
+      z-bound/hint-weight/selection checks online and private unless a
+      separate reviewed proof permits otherwise.
+  [x] add vector circuit scheduler
+  [~] specialize z-bound and hint/highbits circuits where proof-compatible
+      (z-bound and hint interval comparisons are packed; remaining work is
+      suite-specific wall-clock proof and any future algebraic shortcuts)
+  [x] replace per-candidate hint-weight reduction with a packed threshold
+      circuit
+  [x] replace z-bound all-coefficient pass aggregation with a packed private
+      OR tree over violation bits
+  [x] fuse z-bound, hint-weight, and BCC-admission validity aggregation
+      into one private threshold tree. Z-bound failures and missing BCC
+      admission are encoded as `omega + 1` failure units, so one such failure
+      invalidates the candidate without separate `z_bound_all_batch` and
+      `valid_bit_batch` reductions. The live ML-DSA-65 strict harness now
+      reports 94 online rounds instead of the prior 96-round profile.
+  [x] batch strict online execution across token candidates. The release live
+      harness now runs a two-token batch through one all-candidate canonical
+      decomposition state, one all-candidate z-bound/highbits comparison
+      state, one fused validity threshold, and packed selected z/h products.
+      After selected-opening helper/fusion work, the measured ML-DSA-65 K=2
+      profile was 93 online rounds. The affine selected-opening patch reduced
+      selected-open multiplication lanes from 11,264 to 5,632 and selected-open
+      wire/log bytes from about 52.4KB/105KB to 35.6KB/71KB. The public-zero
+      threshold-padding patch then reduced `HintCheck` from 59 to 49 rounds and
+      the total K=2 online profile to 83 rounds, proving extra candidates
+      mostly widen vectors instead of duplicating the full MPC round schedule.
+  [x] replace MSB-to-LSB public comparisons with a log-depth prefix comparator
+  [x] replace sequential masked canonical recovery with prefix-borrow
+      subtraction for `R = C + q*wrap - A`; the ML-DSA-65 live debug harness
+      now reports ZDecomp at 20 rounds instead of the old 133-round profile
+  [x] specialize canonical `R < q` with the ML-DSA identity
+      `q = 2^23 - 8191`; release runtime checks
+      `!(high_10_bits_all_one && low_13_bits_nonzero)` instead of a generic
+      23-bit comparator. This reduces ZDecomp vector lanes/wire bytes while
+      preserving the 20-round canonical-decomposition schedule.
+  [~] specialize gamma1/gamma2 centered interval checks beyond the current
+      fused comparator schedule. A first z-bound specialization using the
+      power-of-two `gamma1` structure and `q = 2^23 - 8191` complement bounds
+      was implemented and measured, but it increased online round count from
+      96 to 112. The release path stays on the fused generic-prefix comparator
+      until a specialization reduces depth rather than only moving lanes/bytes.
   [ ] do not implement y-margin z-bound shortcuts as production without a
       separate proof/review
-  [ ] add release-mode ML-DSA-44/65/87 signing performance gates
+  [~] add release-mode ML-DSA-44/65/87 signing performance gates
+      (batched scheduler shape and first counter/round/log envelopes are
+      release-gated; strict signing now has a full-pipeline benchmark report
+      type with per-slot timing, LAN-like RTT estimates, all-suite/3-5-7 party
+      matrix coverage, scalar-fallback gates, and an ignored live-runtime
+      ML-DSA-65 harness. Remaining work is replacing synthetic matrix fixtures
+      with real all-suite release runs and tuning envelopes from those runs.)
   ```
 - [ ] Precompute reusable certified material where safe:
   ```text
   Power2Round canonical masks
-  strict signing z/hint canonical masks
+  strict signing z/hint canonical masks (storage/provenance binding, replay
+    rejection, and one-time-use logs done; production random generation still
+    open)
+  strict signing comparison/threshold helper inventory (token binding,
+    file-backed release-log binding, cross-token rejection, and one-time-use
+    consumption across restart are done; concrete preprocessed
+    triple/helper-handle generation remains a runtime hardening task if
+    adopted)
   token-local secret-shared [w] = [A*y]
   key-state secret-shared [As1] = [A*s1]
   preprocessing nonce-mask material
   IT-MPC random bits
   multiplication/checking preprocessing
   ```
+  Rule: each precomputed item must be challenge-independent, transcript-bound,
+  certified, and consumed exactly once. Do not precompute by publishing exact
+  `A*secret` images or by exposing rejected-z material, pass bits, masks,
+  witnesses, or failure reasons.
   Each precomputed item must have a durable one-time-use log and a transcript
   binding. Reuse after crash must fail closed.
 - [ ] Remove or ignore slow scalar stress tests from default production
@@ -2255,16 +2679,21 @@ Remaining Phase 9 implementation tasks:
   scalar-per-coefficient VSS
   paper-compat/test-only signing harnesses
   ```
-- [ ] Add performance envelopes for ML-DSA-44 baseline and suite-scaled
-  envelopes for ML-DSA-65/87:
+- [x] Add preprocessing best-shape performance baseline reports for ML-DSA-44
+  and suite-scaled reports for ML-DSA-65/87:
   ```text
-  max rounds
-  max messages
-  max bytes
-  max durable bytes
-  max wall-clock time on local in-memory transport
+  measured rounds
+  measured messages
+  measured bytes
+  measured durable bytes
+  measured wall-clock time on local in-memory transport
   no scalarized release counters
   ```
+  These reports are regression/bottleneck tools, not final product acceptance
+  thresholds. The project optimizes for the best known secure execution shape
+  first, then uses release-mode data to decide the next bottleneck.
+  Strict signing and DKG reports remain open under their phase-specific
+  performance tasks.
 - [ ] Add regression tests/bench-smoke jobs that fail when a release path
   accidentally loops through scalar transport phases.
 
@@ -2276,7 +2705,8 @@ Completion gates:
 - [ ] Strict signing opens only selected signature material and reports vector
   counters for private checks.
 - [ ] Release counters prove vector/chunk execution for every production path.
-- [ ] ML-DSA-44 baseline stays within the agreed performance envelope.
+- [x] ML-DSA-44 preprocessing baseline report exists and proves no scalarized
+  release profile; later regression gates may be tightened from measured data.
 - [ ] Slow scalar correctness stress tests are marked as dev/ignored or kept out
   of production performance gates.
 
@@ -2383,7 +2813,8 @@ Completion gates:
 - [ ] No invalid signature is returned.
 - [ ] No rejected candidate material is exposed.
 - [ ] No public exact `A*secret` appears in logs, artifacts, or public output.
-- [ ] Performance counters are within the agreed target envelope.
+- [ ] Performance counters prove the production path is vectorized/chunked and
+  provide regression baselines for future optimization.
 
 ### Phase 12: Cryptographic Review Package
 

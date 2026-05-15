@@ -4418,6 +4418,133 @@ fn production_vector_runtime_computes_private_lt_gt_public_comparisons() {
 
     let evidence = lt_runtimes[0].runtime_evidence().expect("lt evidence");
     assert!(evidence.coverage.mul_vec);
+    let profile = lt_runtimes[0].runtime_phase_profile().expect("lt profile");
+    let comparison_profile = profile
+        .iter()
+        .find(|entry| {
+            entry.phase == PrimeFieldMpcPhase::ComparisonToPublicCheck
+                && entry.kind == PrimeFieldMpcRoundKind::MulDegreeReduce
+        })
+        .expect("comparison profile");
+    assert!(
+        comparison_profile.distinct_labels <= 2,
+        "3-bit public comparison should use prefix depth, not one round per bit"
+    );
+}
+
+#[test]
+fn production_vector_runtime_specializes_canonical_lt_q() {
+    let config = config_for::<MlDsa65>();
+    let root =
+        Power2RoundTranscriptLabel::root(&config, [0x4a; 32]).child("canonical_lt_q_specialized");
+    let mut runtimes = test_production_vector_prime_field_runtimes(&config);
+    let values = [
+        0u32,
+        1,
+        (MlDsa65::Q as u32) - 1,
+        MlDsa65::Q as u32,
+        (1u32 << 23) - 1,
+    ];
+    let mut bits_by_party = Vec::new();
+    for runtime in &runtimes {
+        let point = config
+            .interpolation_point::<MlDsa65>(runtime.local_party())
+            .expect("point");
+        let mut bits_by_bit = Vec::new();
+        for bit_idx in 0..23 {
+            let lanes = values
+                .iter()
+                .enumerate()
+                .map(|(lane_idx, value)| {
+                    let bit = ((value >> bit_idx) & 1) as Coeff;
+                    evaluate_shamir_polynomial::<MlDsa65>(
+                        &[bit, (17 + bit_idx as i32 + lane_idx as i32) % MlDsa65::Q],
+                        point,
+                    )
+                    .expect("bit lane")
+                })
+                .collect::<Vec<_>>();
+            bits_by_bit.push(
+                runtime
+                    .bit_share_vec_from_local_lanes::<MlDsa65>(
+                        &config,
+                        &root.child(format!("bit_{bit_idx}")),
+                        lanes,
+                    )
+                    .expect("bit handle"),
+            );
+        }
+        bits_by_party.push(bits_by_bit);
+    }
+    let mut states = runtimes
+        .iter()
+        .zip(&bits_by_party)
+        .map(|(runtime, bits)| {
+            runtime
+                .start_canonical_lt_q_vec::<MlDsa65>(
+                    &config,
+                    bits,
+                    &root.child("lt_q"),
+                    PrimeFieldMpcPhase::ComparisonToPublicCheck,
+                )
+                .expect("lt q state")
+        })
+        .collect::<Vec<_>>();
+    for _round in 0..16 {
+        if states.iter().all(ProductionCanonicalLtQVecState::is_done) {
+            break;
+        }
+        for idx in 0..runtimes.len() {
+            if !states[idx].is_done() {
+                let mut entropy = TestProductionVectorEntropy {
+                    next: 44_000 + idx as u64 * 1_000,
+                };
+                runtimes[idx]
+                    .drive_canonical_lt_q_vec_step::<MlDsa65, _>(
+                        &config,
+                        &mut states[idx],
+                        &mut entropy,
+                    )
+                    .expect("drive lt q");
+            }
+        }
+        route_production_vector_private_messages(&mut runtimes, [0usize, 1, 2], false, false);
+        for idx in 0..runtimes.len() {
+            if !states[idx].is_done() {
+                match runtimes[idx]
+                    .collect_canonical_lt_q_vec_step::<MlDsa65>(&config, &mut states[idx])
+                    .expect("collect lt q")
+                {
+                    ProductionVectorItMpcCollectResult::Collected { .. } => {}
+                    ProductionVectorItMpcCollectResult::Waiting(status) => {
+                        panic!("lt q specialization did not collect: {status:?}")
+                    }
+                }
+            }
+        }
+        clear_production_vector_prime_field_queues(&mut runtimes);
+    }
+    assert!(states.iter().all(ProductionCanonicalLtQVecState::is_done));
+    let result_shares = states
+        .iter()
+        .map(|state| state.result().expect("result").share().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reconstruct_production_share_vec::<MlDsa65>(&config, &result_shares),
+        vec![1, 1, 1, 0, 0]
+    );
+    let profile = runtimes[0].runtime_phase_profile().expect("profile");
+    let comparison_profile = profile
+        .iter()
+        .find(|entry| {
+            entry.phase == PrimeFieldMpcPhase::ComparisonToPublicCheck
+                && entry.kind == PrimeFieldMpcRoundKind::MulDegreeReduce
+        })
+        .expect("comparison profile");
+    assert!(
+        comparison_profile.distinct_labels <= 5,
+        "canonical lt-q should use reduction depth, not a 23-bit comparator"
+    );
 }
 
 #[test]
@@ -8789,7 +8916,12 @@ fn file_dkg_setup_phase_cursor_log_survives_reopen_and_rejects_corrupt_log() {
         let mut log = FileDkgSetupPhaseCursorLog::open(&path).expect("open cursor log");
         log.persist_setup_phase_cursor(&cursor)
             .expect("persist cursor");
+        log.persist_setup_phase_cursor(&cursor)
+            .expect("duplicate cursor is compacted");
+        assert_eq!(log.cursors(), std::slice::from_ref(&cursor));
     }
+    let persisted = std::fs::read_to_string(&path).expect("read cursor log");
+    assert_eq!(persisted.lines().count(), 1);
     let reopened = FileDkgSetupPhaseCursorLog::open(&path).expect("reopen cursor log");
     assert_eq!(reopened.cursors(), std::slice::from_ref(&cursor));
 
@@ -9207,9 +9339,16 @@ fn file_prime_field_mpc_phase_cursor_log_survives_reopen_and_rejects_corrupt_log
         let mut log = FilePrimeFieldMpcPhaseCursorLog::open(&path).expect("open cursor log");
         log.persist_phase_cursor(&waiting)
             .expect("persist waiting cursor");
+        log.persist_phase_cursor(&waiting)
+            .expect("duplicate waiting cursor is compacted");
         log.persist_phase_cursor(&collected)
             .expect("persist collected cursor");
+        log.persist_phase_cursor(&collected)
+            .expect("duplicate collected cursor is compacted");
+        assert_eq!(log.cursors(), &[waiting.clone(), collected.clone()]);
     }
+    let persisted = std::fs::read_to_string(&path).expect("read cursor log");
+    assert_eq!(persisted.lines().count(), 2);
 
     let reopened = FilePrimeFieldMpcPhaseCursorLog::open(&path).expect("reopen cursor log");
     assert_eq!(reopened.cursors(), &[waiting, collected.clone()]);
@@ -9292,6 +9431,152 @@ fn file_prime_field_mpc_wire_log_survives_reopen_and_replays_sent_messages() {
     assert_eq!(recovered_values, vec![(PartyId(1), 1)]);
 
     std::fs::write(&path, b"not a valid wire log\n").expect("write corrupt");
+    assert_eq!(
+        FilePrimeFieldMpcWireMessageLog::open(&path),
+        Err(DkgError::PrimeFieldMpcWireLogCorrupt { line: 1 })
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn file_prime_field_mpc_wire_log_batches_same_layer_records() {
+    let path = std::env::temp_dir().join(format!(
+        "talus-prime-field-wire-log-batch-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let config = config();
+    let label = Power2RoundTranscriptLabel::root(&config, [0x64; 32]).child("file_wire_log_batch");
+    let kind = PrimeFieldMpcRoundKind::MulDegreeReduce;
+    let phase = PrimeFieldMpcPhase::MulDegreeReductionShare;
+
+    let transport1 = talus_wire::InMemoryTransport::new(1, vec![1, 2, 3]).expect("transport 1");
+    let state1 = TransportPrimeFieldMpcStateMachine::new(config.clone(), PartyId(1), transport1)
+        .expect("state 1");
+    let message1 = state1
+        .wire_message_vec(kind, phase, &label, Some(PartyId(3)), &[11, 12, 13])
+        .expect("message 1");
+
+    let transport2 = talus_wire::InMemoryTransport::new(2, vec![1, 2, 3]).expect("transport 2");
+    let state2 = TransportPrimeFieldMpcStateMachine::new(config.clone(), PartyId(2), transport2)
+        .expect("state 2");
+    let message2 = state2
+        .wire_message_vec(kind, phase, &label, Some(PartyId(3)), &[21, 22, 23])
+        .expect("message 2");
+
+    {
+        let mut log = FilePrimeFieldMpcWireMessageLog::open(&path).expect("open wire log");
+        log.persist_wire_messages(&[
+            PrimeFieldMpcWireMessageRecord {
+                direction: PrimeFieldMpcWireDirection::AcceptedPrivate,
+                peer: Some(PartyId(1)),
+                message: message1,
+            },
+            PrimeFieldMpcWireMessageRecord {
+                direction: PrimeFieldMpcWireDirection::AcceptedPrivate,
+                peer: Some(PartyId(2)),
+                message: message2,
+            },
+        ])
+        .expect("persist grouped wire records");
+        assert_eq!(log.records().len(), 2);
+    }
+
+    let persisted = std::fs::read_to_string(&path).expect("read grouped wire log");
+    assert_eq!(
+        persisted.lines().count(),
+        1,
+        "same-layer batch should occupy one durable line"
+    );
+    assert!(
+        persisted.starts_with("D 2 ") || persisted.starts_with("S 2 "),
+        "grouped wire log should use a compact same-direction/same-scope prefix"
+    );
+
+    let reopened = FilePrimeFieldMpcWireMessageLog::open(&path).expect("reopen grouped wire log");
+    assert_eq!(reopened.records().len(), 2);
+    let transport3 = talus_wire::InMemoryTransport::new(3, vec![1, 2, 3]).expect("transport 3");
+    let mut recovered =
+        TransportPrimeFieldMpcStateMachine::new(config.clone(), PartyId(3), transport3)
+            .expect("state 3");
+    let recovered_values = recovered
+        .collect_directed_phase_vec_from_wire_log(&reopened, PartyId(3), kind, phase, &label)
+        .expect("recover grouped accepted vectors");
+    assert_eq!(
+        recovered_values,
+        vec![
+            (PartyId(1), vec![11, 12, 13]),
+            (PartyId(2), vec![21, 22, 23])
+        ]
+    );
+
+    let same_scope_path = std::env::temp_dir().join(format!(
+        "talus-prime-field-wire-log-same-scope-batch-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&same_scope_path);
+    let transport = talus_wire::InMemoryTransport::new(1, vec![1, 2, 3]).expect("transport");
+    let state = TransportPrimeFieldMpcStateMachine::new(config.clone(), PartyId(1), transport)
+        .expect("same-scope state");
+    let same_scope_records = (0..8)
+        .map(|idx| {
+            let message = state
+                .wire_message_vec(
+                    kind,
+                    phase,
+                    &label.child(format!("same_scope_{idx}")),
+                    None,
+                    &[(idx + 1) as Coeff, (idx + 2) as Coeff, (idx + 3) as Coeff],
+                )
+                .expect("same-scope message");
+            PrimeFieldMpcWireMessageRecord {
+                direction: PrimeFieldMpcWireDirection::SentBroadcast,
+                peer: None,
+                message,
+            }
+        })
+        .collect::<Vec<_>>();
+    let ungrouped_size = same_scope_records
+        .iter()
+        .map(|record| {
+            let encoded = talus_wire::encode_message(&record.message).expect("encode message");
+            1 + 1
+                + record.peer.map_or(0, |party| party.0).to_string().len()
+                + 1
+                + encoded.len() * 2
+                + 1
+        })
+        .sum::<usize>();
+    {
+        let mut log =
+            FilePrimeFieldMpcWireMessageLog::open(&same_scope_path).expect("same-scope log");
+        log.persist_wire_messages(&same_scope_records)
+            .expect("persist same-scope grouped records");
+    }
+    let same_scope_persisted =
+        std::fs::read_to_string(&same_scope_path).expect("read same-scope grouped wire log");
+    assert_eq!(same_scope_persisted.lines().count(), 1);
+    assert!(same_scope_persisted.starts_with("S 8 "));
+    assert!(
+        same_scope_persisted.len() < ungrouped_size,
+        "same-scope grouped log should reduce durable bytes"
+    );
+    let same_scope_reopened =
+        FilePrimeFieldMpcWireMessageLog::open(&same_scope_path).expect("reopen same-scope group");
+    assert_eq!(
+        same_scope_reopened.records().len(),
+        same_scope_records.len()
+    );
+    let _ = std::fs::remove_file(&same_scope_path);
+
+    let corrupt = if persisted.starts_with("D 2 ") {
+        persisted.replacen("D 2", "D 3", 1)
+    } else {
+        persisted.replacen("S 2", "S 3", 1)
+    };
+    std::fs::write(&path, corrupt).expect("write corrupt group");
     assert_eq!(
         FilePrimeFieldMpcWireMessageLog::open(&path),
         Err(DkgError::PrimeFieldMpcWireLogCorrupt { line: 1 })
@@ -17096,11 +17381,49 @@ fn dkg_key_package_excludes_s2_t_and_t0_material() {
         assert_eq!(package.public_key, output.public_key);
         assert_eq!(package.t1.bytes, output.t1);
         assert!(!package.s1_share.s1_share.is_empty());
+        assert_eq!(package.as1_share.party, package.party);
+        assert!(!package.as1_share.as1_share.is_empty());
+        let s1 = BoundedSecretVectorShare::decode::<MlDsa65>(&config, &package.s1_share.s1_share)
+            .expect("s1 decodes");
+        let as1 = As1SecretVectorShare::decode::<MlDsa65>(&config, &package.as1_share.as1_share)
+            .expect("as1 decodes");
+        let expected_as1 = az_from_rho::<MlDsa65>(
+            &output.rho,
+            &coeffs_to_polyvec::<MlDsa65>(&s1.coeffs, MlDsa65::L).expect("s1 polyvec"),
+        )
+        .expect("A*s1");
+        let expected_coeffs = expected_as1
+            .polys()
+            .iter()
+            .flat_map(|poly| poly.coeffs().iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(as1.coeffs, expected_coeffs);
         let debug = format!("{package:?}");
         assert!(!debug.contains("s2_share"));
         assert!(!debug.contains("t0_share"));
         assert!(!debug.contains("SharedT"));
     }
+}
+
+#[test]
+fn release_guard_rejects_tampered_dkg_as1_share() {
+    let config = config();
+    let mut packages = release_test_key_packages();
+
+    let as1 = As1SecretVectorShare::decode::<MlDsa65>(&config, &packages[0].as1_share.as1_share)
+        .expect("as1 decodes");
+    let mut tampered = as1.coeffs;
+    tampered[0] = reduce_mod_q::<MlDsa65>(tampered[0] + 1);
+    packages[0].as1_share.as1_share =
+        As1SecretVectorShare::new::<MlDsa65>(&config, packages[0].party, as1.point, tampered)
+            .expect("typed tampered as1")
+            .encode::<MlDsa65>(&config)
+            .expect("encoded tampered as1");
+
+    assert_eq!(
+        ensure_dkg_key_package_set_allowed_for_release(&packages),
+        Err(DkgError::DkgKeyPackagePublicMaterialMismatch)
+    );
 }
 
 #[test]

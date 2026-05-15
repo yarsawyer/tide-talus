@@ -96,6 +96,49 @@ pub struct ProductionBatchSizingPolicy {
     pub recommended_strict_token_batch_size: usize,
 }
 
+/// Empirical pass-rate estimate for a preprocessed token population.
+///
+/// `passed` should count tokens that reached the status being sized for. In
+/// strict signing this normally means "BCC-certified and accepted by the
+/// private online response checks in measurement runs", not merely "generated".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TokenPassProbabilityEstimate {
+    /// Number of token attempts observed.
+    pub attempted: u64,
+    /// Number of observed attempts that passed.
+    pub passed: u64,
+}
+
+impl TokenPassProbabilityEstimate {
+    /// Creates a validated estimate.
+    pub const fn new(attempted: u64, passed: u64) -> Option<Self> {
+        if attempted == 0 || passed == 0 || passed > attempted {
+            return None;
+        }
+        Some(Self { attempted, passed })
+    }
+
+    /// Observed pass probability as an `f64`.
+    pub fn probability(self) -> f64 {
+        self.passed as f64 / self.attempted as f64
+    }
+}
+
+/// Derived strict-signing token-batch size and modeled no-valid probability.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrictTokenBatchSizingDecision {
+    /// Empirical pass-rate estimate used for sizing.
+    pub estimate: TokenPassProbabilityEstimate,
+    /// Target upper bound for the no-valid batch probability.
+    pub target_no_valid_probability: f64,
+    /// Minimum batch size required by release policy.
+    pub min_batch_size: usize,
+    /// Recommended batch size after applying empirical sizing.
+    pub recommended_batch_size: usize,
+    /// Modeled no-valid probability at `recommended_batch_size`.
+    pub modeled_no_valid_probability: f64,
+}
+
 impl ProductionBatchSizingPolicy {
     /// Builds the default production policy for an ML-DSA suite.
     pub const fn for_suite<P: MlDsaParams>() -> Self {
@@ -120,6 +163,40 @@ impl ProductionBatchSizingPolicy {
             return 0;
         }
         lanes.div_ceil(self.max_vector_lanes_per_chunk)
+    }
+
+    /// Computes the no-valid probability `(1 - p)^batch_size`.
+    pub fn no_valid_probability(
+        self,
+        estimate: TokenPassProbabilityEstimate,
+        batch_size: usize,
+    ) -> f64 {
+        let failure_probability = 1.0 - estimate.probability();
+        failure_probability.powi(i32::try_from(batch_size).unwrap_or(i32::MAX))
+    }
+
+    /// Derives a practical strict-signing token batch size from observed token
+    /// pass probability and a target no-valid probability.
+    pub fn strict_token_batch_sizing(
+        self,
+        estimate: TokenPassProbabilityEstimate,
+        target_no_valid_probability: f64,
+    ) -> Option<StrictTokenBatchSizingDecision> {
+        if !(0.0..1.0).contains(&target_no_valid_probability) {
+            return None;
+        }
+        let mut batch_size = self.min_strict_token_batch_size;
+        while self.no_valid_probability(estimate, batch_size) > target_no_valid_probability {
+            batch_size = batch_size.checked_add(1)?;
+        }
+        batch_size = batch_size.max(self.recommended_strict_token_batch_size);
+        Some(StrictTokenBatchSizingDecision {
+            estimate,
+            target_no_valid_probability,
+            min_batch_size: self.min_strict_token_batch_size,
+            recommended_batch_size: batch_size,
+            modeled_no_valid_probability: self.no_valid_probability(estimate, batch_size),
+        })
     }
 }
 
@@ -238,6 +315,25 @@ mod tests {
         check_policy::<MlDsa44>();
         check_policy::<MlDsa65>();
         check_policy::<MlDsa87>();
+    }
+
+    #[test]
+    fn strict_token_batch_sizing_uses_empirical_pass_probability() {
+        let policy = ProductionBatchSizingPolicy::for_suite::<MlDsa65>();
+        let estimate = TokenPassProbabilityEstimate::new(100, 55).expect("valid estimate");
+        let decision = policy
+            .strict_token_batch_sizing(estimate, 1.0e-6)
+            .expect("sizing decision");
+
+        assert!(decision.recommended_batch_size >= policy.recommended_strict_token_batch_size);
+        assert!(decision.modeled_no_valid_probability <= 1.0e-6);
+        assert!(
+            policy.no_valid_probability(estimate, decision.recommended_batch_size - 1)
+                > decision.modeled_no_valid_probability
+        );
+        assert_eq!(TokenPassProbabilityEstimate::new(0, 0), None);
+        assert_eq!(TokenPassProbabilityEstimate::new(10, 11), None);
+        assert_eq!(policy.strict_token_batch_sizing(estimate, 1.0), None);
     }
 
     #[test]

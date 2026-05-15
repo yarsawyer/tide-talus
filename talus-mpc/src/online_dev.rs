@@ -1349,8 +1349,9 @@ mod tests {
         MlDsa65, NttError, Poly, PolyVec, PublicKeyDecodeError, SignatureEncodingError,
     };
     use talus_dkg::{
-        BoundedSecretVectorShare, DkgError, DkgKeyPackage, DkgS1SecretShare, KeygenEpoch,
-        Power2RoundBackendId, Power2RoundEvidence, PublicKeyAssemblyCertificate, PublicT1,
+        As1SecretVectorShare, BoundedSecretVectorShare, DkgAs1SecretShare, DkgError, DkgKeyPackage,
+        DkgS1SecretShare, KeygenEpoch, Power2RoundBackendId, Power2RoundEvidence,
+        PublicKeyAssemblyCertificate, PublicT1,
     };
 
     struct TestPartialSigner;
@@ -1632,6 +1633,31 @@ mod tests {
     }
 
     fn dkg_key_package_from_secret(config: &DkgConfig, secret: DkgSecretShare) -> DkgKeyPackage {
+        let s1_decoded = BoundedSecretVectorShare::decode::<MlDsa65>(config, &secret.s1_share)
+            .expect("decoded s1");
+        let s1_polyvec = PolyVec::new(
+            (0..MlDsa65::L)
+                .map(|row| {
+                    Poly::from_coeffs(core::array::from_fn(|index| {
+                        s1_decoded.coeffs[row * MlDsa65::N + index]
+                    }))
+                })
+                .collect(),
+        );
+        let as1 = az_from_rho::<MlDsa65>(&[0u8; 32], &s1_polyvec).expect("as1 share");
+        let mut as1_coeffs = Vec::with_capacity(MlDsa65::K * MlDsa65::N);
+        for poly in as1.polys() {
+            as1_coeffs.extend_from_slice(poly.coeffs());
+        }
+        let as1_share = As1SecretVectorShare::new::<MlDsa65>(
+            config,
+            secret.party,
+            s1_decoded.point,
+            as1_coeffs,
+        )
+        .expect("typed as1 share")
+        .encode::<MlDsa65>(config)
+        .expect("encoded as1 share");
         DkgKeyPackage {
             suite: config.suite,
             epoch: config.epoch,
@@ -1647,6 +1673,10 @@ mod tests {
                 party: secret.party,
                 s1_share: secret.s1_share,
                 pairwise_seed_shares: secret.pairwise_seed_shares,
+            },
+            as1_share: DkgAs1SecretShare {
+                party: secret.party,
+                as1_share,
             },
             certificate: PublicKeyAssemblyCertificate {
                 power2round: Power2RoundEvidence {

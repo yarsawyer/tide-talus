@@ -548,6 +548,20 @@ pub(crate) fn validate_s1_secret_share_shape(
     Ok(())
 }
 
+pub(crate) fn validate_as1_secret_share_shape(
+    config: &DkgConfig,
+    secret: &DkgAs1SecretShare,
+) -> Result<(), DkgError> {
+    if secret.as1_share.is_empty() {
+        return Err(DkgError::EmptySecretShareField {
+            party: secret.party,
+            field: "as1_share",
+        });
+    }
+    validate_encoded_as1_share(config, secret.party, &secret.as1_share)?;
+    Ok(())
+}
+
 pub(crate) fn validate_encoded_s1_share_for_params<P: MlDsaParams>(
     config: &DkgConfig,
     party: PartyId,

@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use sha3::{Digest, Sha3_256};
 use talus_core::{
     az_from_rho, lagrange_coefficients_at_zero, reduce_mod_q, Coeff, MlDsaParams, Poly, PolyVec,
-    TalusPerformanceCounters,
+    ProductionBatchSizingPolicy, TalusPerformanceCounters,
 };
 use talus_mpc_core::PartyId;
 use talus_wire::{
@@ -47,6 +47,7 @@ use talus_wire::{
 use zeroize::Zeroize;
 
 const BOUNDED_VECTOR_SHARE_MAGIC: &[u8; 8] = b"TBVS1\0\0\0";
+const AS1_VECTOR_SHARE_MAGIC: &[u8; 8] = b"TAS1V1\0\0";
 #[cfg(any(test, feature = "scaffold-dev"))]
 const IN_PROCESS_SCALAR_VSS_PUBLIC_CHECK_MAGIC: &[u8; 8] = b"TIVPC1\0\0";
 const IN_PROCESS_SCALAR_VSS_PRIVATE_SHARE_MAGIC: &[u8; 8] = b"TIVPS1\0\0";
@@ -213,6 +214,64 @@ fn coeffs_to_polyvec<P: MlDsaParams>(
             })
             .collect(),
     ))
+}
+
+fn as1_share_from_s1_share_for_params<P: MlDsaParams>(
+    config: &DkgConfig,
+    rho: &[u8; 32],
+    s1_share: &DkgS1SecretShare,
+) -> Result<DkgAs1SecretShare, DkgError> {
+    let decoded = BoundedSecretVectorShare::decode::<P>(config, &s1_share.s1_share)?;
+    if decoded.party != s1_share.party {
+        return Err(DkgError::PartyMismatch {
+            expected: s1_share.party,
+            got: decoded.party,
+        });
+    }
+    let s1_polyvec = coeffs_to_polyvec::<P>(&decoded.coeffs, P::L)?;
+    let as1 = az_from_rho::<P>(rho, &s1_polyvec)
+        .map_err(|_| DkgError::Backend("private As1 derivation failed"))?;
+    let mut coeffs = Vec::with_capacity(P::K * P::N);
+    for poly in as1.polys() {
+        coeffs.extend_from_slice(poly.coeffs());
+    }
+    let as1_share = As1SecretVectorShare::new::<P>(config, s1_share.party, decoded.point, coeffs)?
+        .encode::<P>(config)?;
+    Ok(DkgAs1SecretShare {
+        party: s1_share.party,
+        as1_share,
+    })
+}
+
+fn as1_share_from_s1_share(
+    config: &DkgConfig,
+    rho: &[u8; 32],
+    s1_share: &DkgS1SecretShare,
+) -> Result<DkgAs1SecretShare, DkgError> {
+    match config.suite {
+        DkgSuite::MlDsa44 => {
+            as1_share_from_s1_share_for_params::<talus_core::MlDsa44>(config, rho, s1_share)
+        }
+        DkgSuite::MlDsa65 => {
+            as1_share_from_s1_share_for_params::<talus_core::MlDsa65>(config, rho, s1_share)
+        }
+        DkgSuite::MlDsa87 => {
+            as1_share_from_s1_share_for_params::<talus_core::MlDsa87>(config, rho, s1_share)
+        }
+    }
+}
+
+fn validate_as1_matches_s1_share(
+    config: &DkgConfig,
+    rho: &[u8; 32],
+    s1_share: &DkgS1SecretShare,
+    as1_share: &DkgAs1SecretShare,
+) -> Result<(), DkgError> {
+    let expected = as1_share_from_s1_share(config, rho, s1_share)?;
+    if &expected != as1_share {
+        return Err(DkgError::DkgKeyPackagePublicMaterialMismatch);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -394,6 +453,91 @@ fn parse_prime_field_mpc_round_log_line(line: &str) -> Option<PrimeFieldMpcLogEn
         label_hash,
         senders,
     }))
+}
+
+#[cfg(feature = "std")]
+fn parse_prime_field_mpc_wire_log_records(
+    line: &str,
+) -> Option<Vec<PrimeFieldMpcWireMessageRecord>> {
+    let mut fields = line.split_whitespace();
+    let first = fields.next()?;
+    if first == "S" {
+        let count = fields.next()?.parse::<usize>().ok()?;
+        if count == 0 {
+            return None;
+        }
+        let direction = PrimeFieldMpcWireDirection::from_u8(fields.next()?.parse::<u8>().ok()?)?;
+        let peer = match fields.next()?.parse::<u16>().ok()? {
+            0 => None,
+            value => Some(PartyId(value)),
+        };
+        let mut records = Vec::with_capacity(count);
+        for _ in 0..count {
+            let message_bytes = parse_hex_bytes(fields.next()?)?;
+            let message = decode_message(&message_bytes).ok()?;
+            records.push(PrimeFieldMpcWireMessageRecord {
+                direction,
+                peer,
+                message,
+            });
+        }
+        if fields.next().is_some() {
+            return None;
+        }
+        return Some(records);
+    }
+    if first == "D" {
+        let count = fields.next()?.parse::<usize>().ok()?;
+        if count == 0 {
+            return None;
+        }
+        let direction = PrimeFieldMpcWireDirection::from_u8(fields.next()?.parse::<u8>().ok()?)?;
+        let mut records = Vec::with_capacity(count);
+        for _ in 0..count {
+            let peer = match fields.next()?.parse::<u16>().ok()? {
+                0 => None,
+                value => Some(PartyId(value)),
+            };
+            let message_bytes = parse_hex_bytes(fields.next()?)?;
+            let message = decode_message(&message_bytes).ok()?;
+            records.push(PrimeFieldMpcWireMessageRecord {
+                direction,
+                peer,
+                message,
+            });
+        }
+        if fields.next().is_some() {
+            return None;
+        }
+        return Some(records);
+    }
+    if first == "G" {
+        let count = fields.next()?.parse::<usize>().ok()?;
+        if count == 0 {
+            return None;
+        }
+        let mut records = Vec::with_capacity(count);
+        for _ in 0..count {
+            let direction =
+                PrimeFieldMpcWireDirection::from_u8(fields.next()?.parse::<u8>().ok()?)?;
+            let peer = match fields.next()?.parse::<u16>().ok()? {
+                0 => None,
+                value => Some(PartyId(value)),
+            };
+            let message_bytes = parse_hex_bytes(fields.next()?)?;
+            let message = decode_message(&message_bytes).ok()?;
+            records.push(PrimeFieldMpcWireMessageRecord {
+                direction,
+                peer,
+                message,
+            });
+        }
+        if fields.next().is_some() {
+            return None;
+        }
+        return Some(records);
+    }
+    Some(vec![parse_prime_field_mpc_wire_log_line(line)?])
 }
 
 #[cfg(feature = "std")]
@@ -1201,6 +1345,9 @@ impl InMemoryDkgSetupPhaseCursorLog {
 
 impl DkgSetupPhaseCursorLog for InMemoryDkgSetupPhaseCursorLog {
     fn persist_setup_phase_cursor(&mut self, cursor: &DkgSetupPhaseCursor) -> Result<(), DkgError> {
+        if self.cursors.last() == Some(cursor) {
+            return Ok(());
+        }
         self.cursors.push(cursor.clone());
         Ok(())
     }
@@ -1256,7 +1403,11 @@ impl FileDkgSetupPhaseCursorLog {
 #[cfg(feature = "std")]
 impl DkgSetupPhaseCursorLog for FileDkgSetupPhaseCursorLog {
     fn persist_setup_phase_cursor(&mut self, cursor: &DkgSetupPhaseCursor) -> Result<(), DkgError> {
+        let before = self.inner.setup_phase_cursors().len();
         self.inner.persist_setup_phase_cursor(cursor)?;
+        if self.inner.setup_phase_cursors().len() == before {
+            return Ok(());
+        }
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -11454,6 +11605,8 @@ pub fn dkg_key_packages_from_public_output(
                 pairwise_seed_shares: share.pairwise_seed_shares,
             };
             validate_s1_secret_share_shape(&output.config, &s1_share)?;
+            let as1_share = as1_share_from_s1_share(&output.config, &output.rho, &s1_share)?;
+            validate_as1_secret_share_shape(&output.config, &as1_share)?;
             Ok(DkgKeyPackage {
                 suite: output.config.suite,
                 epoch: output.config.epoch,
@@ -11466,6 +11619,7 @@ pub fn dkg_key_packages_from_public_output(
                 },
                 public_key: output.public_key.clone(),
                 s1_share,
+                as1_share,
                 certificate: certificate.clone(),
             })
         })
@@ -11494,6 +11648,24 @@ pub fn ensure_dkg_key_package_allowed_for_release(package: &DkgKeyPackage) -> Re
         || package.certificate.power2round.output_t1_hash != power2round_public_t1_hash(&package.t1)
     {
         return Err(DkgError::Power2RoundEvidenceRequired);
+    }
+    if package.s1_share.party != package.party {
+        return Err(DkgError::PartyMismatch {
+            expected: package.party,
+            got: package.s1_share.party,
+        });
+    }
+    if package.as1_share.party != package.party {
+        return Err(DkgError::PartyMismatch {
+            expected: package.party,
+            got: package.as1_share.party,
+        });
+    }
+    if package.as1_share.as1_share.is_empty() {
+        return Err(DkgError::EmptySecretShareField {
+            party: package.party,
+            field: "as1_share",
+        });
     }
     ensure_dkg_certificate_allowed_for_release(&package.certificate)
 }
@@ -11556,7 +11728,20 @@ pub fn ensure_dkg_key_package_set_allowed_for_release(
                 got: package.s1_share.party,
             });
         }
+        if package.as1_share.party != package.party {
+            return Err(DkgError::PartyMismatch {
+                expected: package.party,
+                got: package.as1_share.party,
+            });
+        }
         validate_s1_secret_share_shape(&config, &package.s1_share)?;
+        validate_as1_secret_share_shape(&config, &package.as1_share)?;
+        validate_as1_matches_s1_share(
+            &config,
+            &package.rho,
+            &package.s1_share,
+            &package.as1_share,
+        )?;
     }
 
     Ok(config)

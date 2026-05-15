@@ -345,6 +345,28 @@ impl fmt::Debug for DkgS1SecretShare {
     }
 }
 
+/// Local long-term private `[As1] = [A*s1]` share stored in a DKG key package.
+///
+/// This is not a public commitment. It is private release helper state used by
+/// strict signing so the online hint relation can use
+/// `[w] + c*[As1] - c*t1*2^d` without computing `A*[z]` online.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DkgAs1SecretShare {
+    /// Owning party.
+    pub party: PartyId,
+    /// Opaque encoded field-valued K-vector share.
+    pub as1_share: Vec<u8>,
+}
+
+impl fmt::Debug for DkgAs1SecretShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DkgAs1SecretShare")
+            .field("party", &self.party)
+            .field("as1_share", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Typed field-valued bounded-vector share stored in a `DkgSecretShare`.
 #[derive(Clone, Eq, PartialEq)]
 pub struct BoundedSecretVectorShare {
@@ -461,6 +483,122 @@ impl BoundedSecretVectorShare {
     }
 }
 
+/// Typed private field-valued `[As1] = [A*s1]` vector share.
+#[derive(Clone, Eq, PartialEq)]
+pub struct As1SecretVectorShare {
+    /// Owning receiver party.
+    pub party: PartyId,
+    /// Receiver interpolation point.
+    pub point: u32,
+    /// Field-valued coefficient shares for a K-polynomial vector.
+    pub coeffs: Vec<Coeff>,
+}
+
+impl fmt::Debug for As1SecretVectorShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("As1SecretVectorShare")
+            .field("party", &self.party)
+            .field("point", &self.point)
+            .field("coeffs", &"<redacted>")
+            .finish()
+    }
+}
+
+impl As1SecretVectorShare {
+    /// Creates and validates a typed private `[As1]` K-vector share.
+    pub fn new<P: MlDsaParams>(
+        config: &DkgConfig,
+        party: PartyId,
+        point: u32,
+        coeffs: Vec<Coeff>,
+    ) -> Result<Self, DkgError> {
+        let expected_point = config.interpolation_point::<P>(party)?;
+        if point != expected_point {
+            return Err(DkgError::InvalidSharePoint {
+                party,
+                expected: expected_point,
+                got: point,
+            });
+        }
+        validate_as1_field_vector_share::<P>(&coeffs)?;
+        Ok(Self {
+            party,
+            point,
+            coeffs,
+        })
+    }
+
+    /// Canonically encodes this private `[As1]` share for local storage.
+    pub fn encode<P: MlDsaParams>(&self, config: &DkgConfig) -> Result<Vec<u8>, DkgError> {
+        let expected_point = config.interpolation_point::<P>(self.party)?;
+        if self.point != expected_point {
+            return Err(DkgError::InvalidSharePoint {
+                party: self.party,
+                expected: expected_point,
+                got: self.point,
+            });
+        }
+        validate_as1_field_vector_share::<P>(&self.coeffs)?;
+
+        let mut out = Vec::with_capacity(8 + 1 + 2 + 4 + 4 + self.coeffs.len() * 4);
+        out.extend_from_slice(AS1_VECTOR_SHARE_MAGIC);
+        out.push(DkgSuite::for_params::<P>().as_u8());
+        out.extend_from_slice(&self.party.0.to_le_bytes());
+        out.extend_from_slice(&self.point.to_le_bytes());
+        out.extend_from_slice(&(self.coeffs.len() as u32).to_le_bytes());
+        for &coefficient in &self.coeffs {
+            out.extend_from_slice(&coefficient.to_le_bytes());
+        }
+        Ok(out)
+    }
+
+    /// Decodes a canonical private `[As1]` K-vector share.
+    pub fn decode<P: MlDsaParams>(config: &DkgConfig, bytes: &[u8]) -> Result<Self, DkgError> {
+        let min_len = 8 + 1 + 2 + 4 + 4;
+        if bytes.len() < min_len {
+            return Err(DkgError::InvalidSecretShareEncoding(
+                "as1 vector share is truncated",
+            ));
+        }
+        if &bytes[..8] != AS1_VECTOR_SHARE_MAGIC {
+            return Err(DkgError::InvalidSecretShareEncoding(
+                "as1 vector share magic mismatch",
+            ));
+        }
+        let suite = DkgSuite::from_u8(bytes[8])?;
+        if suite != config.suite || suite != DkgSuite::for_params::<P>() {
+            return Err(DkgError::InvalidSecretShareEncoding(
+                "as1 vector share suite mismatch",
+            ));
+        }
+
+        let party = PartyId(u16::from_le_bytes([bytes[9], bytes[10]]));
+        let point = u32::from_le_bytes([bytes[11], bytes[12], bytes[13], bytes[14]]);
+        let count = u32::from_le_bytes([bytes[15], bytes[16], bytes[17], bytes[18]]) as usize;
+        let expected_count = P::K * P::N;
+        if count != expected_count {
+            return Err(DkgError::InvalidBoundedSecretVectorLength {
+                expected: expected_count,
+                got: count,
+            });
+        }
+        let expected_len = min_len + count * 4;
+        if bytes.len() != expected_len {
+            return Err(DkgError::InvalidSecretShareEncoding(
+                "as1 vector share length mismatch",
+            ));
+        }
+
+        let mut coeffs = Vec::with_capacity(count);
+        for chunk in bytes[min_len..].chunks_exact(4) {
+            coeffs.push(Coeff::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3],
+            ]));
+        }
+        Self::new::<P>(config, party, point, coeffs)
+    }
+}
+
 /// One party's complete DKG result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DkgPartyOutput {
@@ -558,4 +696,58 @@ pub fn validate_encoded_s1_share(
             validate_encoded_s1_share_for_params::<talus_core::MlDsa87>(config, party, bytes)
         }
     }
+}
+
+/// Validates canonical encoded private `[As1]` share bytes for the configured suite.
+pub fn validate_encoded_as1_share(
+    config: &DkgConfig,
+    party: PartyId,
+    bytes: &[u8],
+) -> Result<(), DkgError> {
+    match config.suite {
+        DkgSuite::MlDsa44 => {
+            validate_encoded_as1_share_for_params::<talus_core::MlDsa44>(config, party, bytes)
+        }
+        DkgSuite::MlDsa65 => {
+            validate_encoded_as1_share_for_params::<talus_core::MlDsa65>(config, party, bytes)
+        }
+        DkgSuite::MlDsa87 => {
+            validate_encoded_as1_share_for_params::<talus_core::MlDsa87>(config, party, bytes)
+        }
+    }
+}
+
+fn validate_encoded_as1_share_for_params<P: MlDsaParams>(
+    config: &DkgConfig,
+    party: PartyId,
+    bytes: &[u8],
+) -> Result<(), DkgError> {
+    let decoded = As1SecretVectorShare::decode::<P>(config, bytes)?;
+    if decoded.party != party {
+        return Err(DkgError::PartyMismatch {
+            expected: party,
+            got: decoded.party,
+        });
+    }
+    Ok(())
+}
+
+fn validate_as1_field_vector_share<P: MlDsaParams>(coeffs: &[Coeff]) -> Result<(), DkgError> {
+    let expected = P::K * P::N;
+    if coeffs.len() != expected {
+        return Err(DkgError::InvalidBoundedSecretVectorLength {
+            expected,
+            got: coeffs.len(),
+        });
+    }
+    for (index, &coefficient) in coeffs.iter().enumerate() {
+        if !(0..P::Q).contains(&coefficient) {
+            return Err(DkgError::FieldShareCoefficientOutOfRange {
+                index,
+                coefficient,
+                modulus: P::Q,
+            });
+        }
+    }
+    Ok(())
 }

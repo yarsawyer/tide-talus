@@ -26,6 +26,8 @@ pub const WIRE_PROTOCOL_VERSION: u16 = 1;
 const MAGIC: &[u8; 8] = b"TALUSW1\0";
 const HEADER_LEN: usize = 8 + 2 + 1 + 1 + 2 + 32 + 32 + 2 + 32 + 4;
 const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+const PRIME_FIELD_MPC_COMPACT_VEC_MARKER: u32 = 0x8000_0000;
+const PRIME_FIELD_MPC_COMPACT_VEC_MAX_VALUE: i32 = 0x00ff_ffff;
 
 /// ML-DSA suite id used on the wire.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -847,6 +849,23 @@ pub trait AuthenticatedP2pTransport {
         message: WireMessage,
     ) -> Result<(), TransportError>;
 
+    /// Sends a batch of private messages to `receiver_party_id`.
+    ///
+    /// The default implementation preserves the single-message contract.
+    /// Production transports can override this to coalesce same-layer MPC
+    /// payloads into fewer application frames without changing the canonical
+    /// wire messages or replay keys.
+    fn send_private_batch(
+        &mut self,
+        receiver_party_id: u16,
+        messages: Vec<WireMessage>,
+    ) -> Result<(), TransportError> {
+        for message in messages {
+            self.send_private(receiver_party_id, message)?;
+        }
+        Ok(())
+    }
+
     /// Collects private messages addressed to `receiver_party_id` for one round.
     fn collect_private_round(
         &self,
@@ -866,6 +885,19 @@ pub trait AuthenticatedP2pTransport {
 pub trait EquivocationResistantBroadcast {
     /// Broadcasts one message to every configured party.
     fn broadcast(&mut self, message: WireMessage) -> Result<(), TransportError>;
+
+    /// Broadcasts a batch of messages to every configured party.
+    ///
+    /// The default implementation preserves the single-message contract.
+    /// Production transports can override this to coalesce same-layer reliable
+    /// broadcasts while retaining equivocation checks for each canonical
+    /// message.
+    fn broadcast_batch(&mut self, messages: Vec<WireMessage>) -> Result<(), TransportError> {
+        for message in messages {
+            self.broadcast(message)?;
+        }
+        Ok(())
+    }
 
     /// Collects one observer's broadcast view for one round.
     fn collect_broadcast_view(
@@ -1795,12 +1827,35 @@ pub fn encode_dkg_prime_field_mpc_payload(payload: &DkgPrimeFieldMpcPayload) -> 
     out.extend_from_slice(&payload.label_hash);
     out.extend_from_slice(&payload.value.to_le_bytes());
     if !payload.values.is_empty() {
-        out.extend_from_slice(&(payload.values.len() as u32).to_le_bytes());
-        for value in &payload.values {
+        put_prime_field_mpc_values(&mut out, &payload.values);
+    }
+    out
+}
+
+fn put_prime_field_mpc_values(out: &mut Vec<u8>, values: &[i32]) {
+    let compact = values
+        .len()
+        .try_into()
+        .ok()
+        .is_some_and(|len: u32| len < PRIME_FIELD_MPC_COMPACT_VEC_MARKER)
+        && values
+            .iter()
+            .all(|&value| (0..=PRIME_FIELD_MPC_COMPACT_VEC_MAX_VALUE).contains(&value));
+    if compact {
+        let len = values.len() as u32;
+        out.extend_from_slice(&(PRIME_FIELD_MPC_COMPACT_VEC_MARKER | len).to_le_bytes());
+        for &value in values {
+            let value = value as u32;
+            out.push((value & 0xff) as u8);
+            out.push(((value >> 8) & 0xff) as u8);
+            out.push(((value >> 16) & 0xff) as u8);
+        }
+    } else {
+        out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+        for value in values {
             out.extend_from_slice(&value.to_le_bytes());
         }
     }
-    out
 }
 
 /// Decodes a DKG prime-field MPC round payload.
@@ -1813,11 +1868,7 @@ pub fn decode_dkg_prime_field_mpc_payload(
     let receiver_party_id = cursor.take_u16()?;
     let label_hash = cursor.take_array::<32>()?;
     let value = i32::from_le_bytes(cursor.take_array::<4>()?);
-    let values = if cursor.remaining() == 0 {
-        Vec::new()
-    } else {
-        cursor.take_i32_vec()?
-    };
+    let values = cursor.take_prime_field_mpc_values()?;
     cursor.finish()?;
     Ok(DkgPrimeFieldMpcPayload {
         round_kind,
@@ -2132,15 +2183,34 @@ impl<'a> Cursor<'a> {
         Ok(out)
     }
 
-    fn take_i32_vec(&mut self) -> Result<Vec<i32>, WireError> {
-        let len = self.take_u32()? as usize;
-        let byte_len = len.checked_mul(4).ok_or(WireError::PayloadTooLarge(len))?;
+    fn take_prime_field_mpc_values(&mut self) -> Result<Vec<i32>, WireError> {
+        if self.remaining() == 0 {
+            return Ok(Vec::new());
+        }
+        let encoded_len = self.take_u32()?;
+        if encoded_len & PRIME_FIELD_MPC_COMPACT_VEC_MARKER == 0 {
+            let len = encoded_len as usize;
+            let byte_len = len.checked_mul(4).ok_or(WireError::PayloadTooLarge(len))?;
+            if byte_len > self.remaining() {
+                return Err(WireError::TruncatedPayload);
+            }
+            let mut out = Vec::with_capacity(len);
+            for _ in 0..len {
+                out.push(i32::from_le_bytes(self.take_array()?));
+            }
+            return Ok(out);
+        }
+        let len = (encoded_len & !PRIME_FIELD_MPC_COMPACT_VEC_MARKER) as usize;
+        let byte_len = len.checked_mul(3).ok_or(WireError::PayloadTooLarge(len))?;
         if byte_len > self.remaining() {
             return Err(WireError::TruncatedPayload);
         }
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
-            out.push(i32::from_le_bytes(self.take_array()?));
+            let lo = self.take_u8()? as u32;
+            let mid = self.take_u8()? as u32;
+            let hi = self.take_u8()? as u32;
+            out.push((lo | (mid << 8) | (hi << 16)) as i32);
         }
         Ok(out)
     }
@@ -2439,10 +2509,55 @@ mod tests {
             receiver_party_id: 3,
             label_hash: [0x6b; 32],
             value: 0,
-            values: vec![11, 22, 33],
+            values: vec![11, 22, PRIME_FIELD_MPC_COMPACT_VEC_MAX_VALUE],
         };
         let encoded = encode_dkg_prime_field_mpc_payload(&mpc_vec);
+        assert_eq!(encoded.len(), 40 + 4 + mpc_vec.values.len() * 3);
+        assert_eq!(
+            u32::from_le_bytes(encoded[40..44].try_into().expect("marker")),
+            PRIME_FIELD_MPC_COMPACT_VEC_MARKER | mpc_vec.values.len() as u32
+        );
         assert_eq!(decode_dkg_prime_field_mpc_payload(&encoded), Ok(mpc_vec));
+
+        let mpc_vec_legacy = DkgPrimeFieldMpcPayload {
+            round_kind: 1,
+            phase: 2,
+            receiver_party_id: 3,
+            label_hash: [0x6b; 32],
+            value: 0,
+            values: vec![-1, 22, 33],
+        };
+        let encoded = encode_dkg_prime_field_mpc_payload(&mpc_vec_legacy);
+        assert_eq!(encoded.len(), 40 + 4 + mpc_vec_legacy.values.len() * 4);
+        assert_eq!(
+            u32::from_le_bytes(encoded[40..44].try_into().expect("legacy len")),
+            mpc_vec_legacy.values.len() as u32
+        );
+        assert_eq!(
+            decode_dkg_prime_field_mpc_payload(&encoded),
+            Ok(mpc_vec_legacy)
+        );
+
+        let mut old_legacy = Vec::new();
+        old_legacy.push(7);
+        old_legacy.push(8);
+        old_legacy.extend_from_slice(&9u16.to_le_bytes());
+        old_legacy.extend_from_slice(&[0x7c; 32]);
+        old_legacy.extend_from_slice(&0i32.to_le_bytes());
+        old_legacy.extend_from_slice(&2u32.to_le_bytes());
+        old_legacy.extend_from_slice(&123i32.to_le_bytes());
+        old_legacy.extend_from_slice(&456i32.to_le_bytes());
+        assert_eq!(
+            decode_dkg_prime_field_mpc_payload(&old_legacy),
+            Ok(DkgPrimeFieldMpcPayload {
+                round_kind: 7,
+                phase: 8,
+                receiver_party_id: 9,
+                label_hash: [0x7c; 32],
+                value: 0,
+                values: vec![123, 456],
+            })
+        );
     }
 
     #[test]
